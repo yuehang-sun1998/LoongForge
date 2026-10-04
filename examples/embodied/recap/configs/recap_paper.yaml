@@ -1,0 +1,53 @@
+# RECAP — paper-aligned profile.
+#
+# Paper reward (success=0 / failure=-1 / step=-1), no discount, 201-bin
+# distributional value, task-dependent threshold, base + conditioned objective
+# and advantage dropout. This is the research target profile; it is wired through
+# the same pipeline as recap_baseline.yaml.
+
+recap:
+  mode: paper_aligned
+
+  reward:
+    mode: paper_aligned
+    success_reward: 0.0
+    failure_reward: -1.0
+    step_reward: -1.0
+    use_discount: false
+    gamma: 1.0
+
+  value:
+    backend: cnn_mlp
+    hidden_dim: 256
+    num_layers: 2
+    use_image: true
+    image_size: 32
+    distributional: true
+    num_bins: 201
+    value_min: -100.0
+    value_max: 0.0
+    lr: 1.0e-3
+    batch_size: 64
+    epochs: 5
+    device: cpu
+    seed: 0
+
+  advantage:
+    mode: paper_aligned
+    horizon: 50
+    use_discount: false
+    gamma: 1.0
+    positive_quantile: 0.5
+    task_dependent: true
+
+  condition:
+    positive_suffix: "\nAdvantage: positive"
+    negative_suffix: "\nAdvantage: negative"
+    advantage_dropout_prob: 0.1
+    positive_only_conditional: false
+    unconditional_prob: 0.0
+
+  policy:
+    alpha: 1.0
+    use_base_branch: true
+    use_advantage_dropout: true

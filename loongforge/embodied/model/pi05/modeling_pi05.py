@@ -1028,6 +1028,42 @@ class PI05Policy(nn.Module):
         loss_value = loss_map[:, :, :self.config.action_dim].mean()
         return loss_value, {"action_loss": loss_value.detach().item()}
 
+    def compute_action_loss(self, batch, advantage_condition=None) -> torch.Tensor:
+        """Advantage-conditioned flow-matching loss for RECAP CFG training.
+
+        ``advantage_condition`` is ``None`` for the base branch, or a per-sample
+        long tensor of routing codes (``-1`` base, ``0`` negative, ``1`` positive)
+        selecting between the pre-tokenized ``input_ids_{base,pos,neg}`` carried by
+        the batch. The loss itself is the unchanged flow-matching MSE — the
+        advantage only picks the language condition (see
+        ``loongforge/embodied/recap/policy_objective.py``).
+        """
+        if advantage_condition is None:
+            return self.forward(batch)[0]
+
+        from loongforge.embodied.recap.core.condition import CODE_NEGATIVE, CODE_POSITIVE
+
+        codes = advantage_condition
+        if not isinstance(codes, torch.Tensor):
+            codes = torch.tensor(list(codes), dtype=torch.long)
+        codes = codes.to(batch.input_ids_base.device)
+
+        input_ids = batch.input_ids_base.clone()
+        attention_mask = batch.attention_mask_base.clone()
+        positive = codes == CODE_POSITIVE
+        negative = codes == CODE_NEGATIVE
+        if positive.any():
+            input_ids[positive] = batch.input_ids_pos[positive]
+            attention_mask[positive] = batch.attention_mask_pos[positive]
+        if negative.any():
+            input_ids[negative] = batch.input_ids_neg[negative]
+            attention_mask[negative] = batch.attention_mask_neg[negative]
+
+        conditioned = copy.copy(batch)
+        conditioned.input_ids = input_ids
+        conditioned.attention_mask = attention_mask
+        return self.forward(conditioned)[0]
+
     @torch.no_grad()
     def predict_action_chunk(self, batch, **kwargs) -> torch.Tensor:
         """Predict an action chunk from a preprocessed PI05 batch."""

@@ -1,0 +1,44 @@
+# RECAP value critic (advantage-conditioned offline RL, step 2 of the pipeline)
+#
+# This "model" is not a policy: RecapValueTrainer builds the ported RLinf
+# SigLIP2 + Gemma3-270M value critic from these fields and trains it on the
+# normalised returns sidecar (return / |return_min| in [-1, 0]).
+#
+# Launch with:
+#   torchrun --nproc_per_node=8 loongforge/embodied/train.py \
+#       --model-name recap_value --trainer-type RecapValueTrainer ...
+#
+# See examples/embodied/recap/run_recap_value.sh.
+
+model:
+  model_type: recap_value
+
+  # Backbone assets. Point these at the local SigLIP2-so400m and Gemma3-270M
+  # checkpoints (the same ones compute_advantages loads).
+  siglip_path: ""
+  gemma3_path: ""
+  tokenizer_path: ""
+
+  # Critic geometry. gemma_1m is the upstream default (small expert, fast
+  # iteration); the 201-bin head spans the normalised return range [-1, 0].
+  critic_expert_variant: gemma_1m
+  num_bins: 201
+  v_min: -1.0
+  v_max: 0.0
+  value_dropout: 0.0
+  precision: bfloat16
+
+  # Freezing / memory. Leave the backbone trainable for a first landing; turn
+  # freeze_vlm on to shrink the optimizer state once the recipe is validated.
+  freeze_vision_encoder: false
+  freeze_vlm: false
+  stop_gradient_to_vlm: false
+  gradient_checkpointing: false
+
+  # RLinf-format checkpoint written under --output-dir at the end of training.
+  export_name: critic.pt
+
+data:
+  max_token_len: 200
+  image_size: 224
+  text_template: "Task: {prompt}."

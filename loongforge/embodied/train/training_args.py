@@ -777,8 +777,7 @@ class _DataArgs:
     robot_type: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Robot embodiment type (e.g. libero_franka); selects "
-                    "action/state layout."
+            "help": "Robot embodiment identifier used to pick normalization stats."
         },
     )
     task_name: str = field(
@@ -786,6 +785,95 @@ class _DataArgs:
         metadata={
             "help": "Language instruction used as the prompt when the dataset has "
                     "none (HDF5)."
+        },
+    )
+    recap_config: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a RECAP yaml config. Used by RecapCfgTrainer to select "
+                    "the reward/value/advantage/condition/policy profile."
+        },
+    )
+    recap_advantages_tag: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Sidecar tag for the advantages parquet "
+                    "(meta/advantages[_<tag>].parquet) read by RecapCfgTrainer."
+        },
+    )
+    recap_returns_tag: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Sidecar tag for the returns parquet "
+                    "(meta/returns[_<tag>].parquet) read by RecapValueTrainer."
+        },
+    )
+    recap_value_video_cache_size: int = field(
+        default=8,
+        metadata={
+            "help": "Episode-level decoded-frame LRU size (in episodes, holding "
+                    "every camera view) for the RecapValueTrainer dataloader when "
+                    "no offline frame cache is configured."
+        },
+    )
+    recap_frame_cache_root: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Offline frame cache root (from recap.predecode) read by "
+                    "RecapCfgTrainer instead of decoding videos."
+        },
+    )
+    recap_frame_reader_cache_size: int = field(
+        default=16,
+        metadata={
+            "help": "LRU size (in (view, episode) entries) for offline frame-cache "
+                    "readers in RecapCfgTrainer; should cover the working subset."
+        },
+    )
+    recap_dataset_compat: str = field(
+        default="auto",
+        metadata={
+            "choices": ["auto", "none", "legacy"],
+            "help": "Column-naming shim for external RECAP rollout datasets "
+                    "(auto/none/legacy); see loongforge/embodied/recap/compat.py.",
+        },
+    )
+    recap_dataset_type: str = field(
+        default="rollout",
+        metadata={
+            "choices": ["rollout", "sft"],
+            "help": "RECAP dataset semantics: 'rollout' reads the per-episode "
+                    "is_success label; 'sft' treats every episode as successful "
+                    "(upstream behaviour). Used by RecapValueTrainer.",
+        },
+    )
+    recap_max_episodes: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Limit the RECAP value-critic dataloader to the first N "
+                    "episodes (quick validation); None uses the whole dataset."
+        },
+    )
+    recap_val_episodes: int = field(
+        default=0,
+        metadata={
+            "help": "Carve the last N episodes of the working set off as a "
+                    "held-out validation split for the value critic; 0 disables "
+                    "validation."
+        },
+    )
+    recap_val_interval: int = field(
+        default=500,
+        metadata={
+            "help": "Run the value-critic validation pass every N steps "
+                    "(mirrors the upstream val_check_interval)."
+        },
+    )
+    recap_val_batches: int = field(
+        default=0,
+        metadata={
+            "help": "Cap the value-critic validation pass to N batches; "
+                    "0 evaluates the whole held-out split."
         },
     )
     per_device_batch_size: int = field(
