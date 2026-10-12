@@ -26,8 +26,10 @@
 |---|---|---|---|---|---|
 | — | 设计收敛（架构/标定/队列） | ✅ 完成（文档） | `01_architecture.md` | — | — |
 | — | 代码触点核实 | ✅ 完成 | 见 `01_architecture.md` §10 | — | — |
-| 0 | **N-吞吐验证实验**（1 server + N sim 扫 N-吞吐） | ⬜ 未开始 | — | `03_testing.md` T-01/T-02 | 需空闲 GPU |
+| 0 | **N 扫描 + 报告 + agent 决策**（CPU-sim） | 🔄 扫描/报告/决策完成；GPU-sim 待做 | 探针 + `orchestrator/calibration_report.py` | `03_testing.md` T-02 | 需空闲 GPU |
 | 0 | server 侧服务时间插桩 | ✅ 完成 | `transport/timing.py` + `rpc_server.py` | `03_testing.md` T-01 通过 | — |
+| 0 | 标定报告生成器（三件套） | ✅ 完成 | `orchestrator/calibration_report.py` | 单测 3 passed | — |
+| 0 | 配置校验 + 缓存 | ✅ 完成 | `orchestrator/calibration_config.py` | 单测 7 passed | — |
 | 1 | external server 模式 | ⬜ 未开始 | `server_manager.py:30-48` | T-03 | — |
 | 1 | 纯 client 启动 | ⬜ 未开始 | `run.py` 5 处 `_run_*_once` | T-03 | external 模式 |
 | 1 | N 标定（报告 + agent 决策 + 配置缓存） | ⬜ 未开始 | — | T-02 | 插桩 + external |
@@ -55,7 +57,7 @@
 ### M1 · 并行（1 server ↔ N sim）
 - **内容**：external server 模式 + 纯 client 启动 + GPU-sim 放置决策（同卡/异卡）。
 - **交付**：`server_manager.py` external 模式、`run.py` 纯 client、放置结论。
-- **验收**：N 个 orchestrator 共享一个 server 不冲突不误杀；CPU-sim 下 GPU util 稳定 >90%。
+- **验收**：N 个 orchestrator 共享一个 server 不冲突不误杀；CPU-sim 下 **server 忙占比逼近 100%**（或吞吐平台，**不用 `nvidia-smi util`**，见 `01` §1）。
 - 对应任务 T1-1 / T1-2 / T1-4；测试 T-03 / T-07。
 
 ### M2 · 动态任务下发
@@ -123,6 +125,25 @@
   3. **`DIFFSYNTH_MODEL_BASE_PATH`**（= `/mnt/cfs/sunyuehang`）指向本地 Wan2.2，否则 VAE 会走 modelscope 联网超时。
   4. 小分片冒烟配置在 `/tmp/eval_smoke/t0_smoke.yaml`（2 集）。
 
+### 2.4 标定报告生成器（2026-10-12）
+
+- **代码**：`orchestrator/calibration_report.py`（`build_report` / `render_markdown` 纯函数 + CLI：`--sweep` / `--timing` / `--env` → `report.json` / `report.md` / `env.json`）+ 单测 `test_calibration_report.py`（**3 passed**，ruff clean）。**未提交**。
+- **设计**：输入与扫描器**解耦**（只认 sweep/timing 的 JSON），任何 sweep harness 都能喂。
+- **报告读法**（写进 `report.md`）：主判据 = **吞吐平台 + server 忙占比**；**不用 `nvidia-smi util`**。
+
+### 2.5 T-02 标定扫描 + 报告 + agent 决策（CPU-sim，2026-10-12）
+
+- **扫描**（手动探针，N=1..16）：吞吐 1.44→6.81 ep/min（次线性，未到平台）。
+- **绑定资源 = 串行 server**（忙占比 18%→87% @ N=16）；**GPU / CPU 都不忙**（`util.gpu` 27%、`util.memory` 5%、CPU 8.9%）。
+- **恒等式**：`吞吐 = server 忙占比 × 上限`，上限 ≈ **7.9 ep/min**。
+- **agent 决策**：`n_sims_per_server = 16`；校验 PASS。产物：`report.json`/`report.md`/`env.json` + `parallel_config.yaml` + `validation.json`。
+- **待做**：GPU-sim 一路；正式流程（需 T1-1 external server 模式）。
+
+### 2.6 配置校验 + 缓存（2026-10-12）
+
+- **代码**：`orchestrator/calibration_config.py`（`validate_parallel_config` 按 `N ≤ 核数/每sim核数`、显存、`timeout ≥ N×服务时间×safety` 做边界检查；`calibration_key` / `save_calibration` / `load_calibration` 做 `(model,benchmark,gpu)` 缓存）+ 单测（**7 passed**，ruff clean）。**未提交**。
+- **实测**：对 T-02 的配置跑校验 → **PASS**（`timeout 60000ms ≥ 16×50.9×2 = 1628ms`）。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -139,7 +160,7 @@
 ### T0-2 N-吞吐验证实验 【依赖 T0-1】
 
 - **目标**：把"串行下 GPU 接近 100%"从推演变实测。
-- **步骤**：1 server + N sim，N=1/2/3/5/8，采 `nvidia-smi` 时间序列 + 吞吐曲线。
+- **步骤**：1 server + N sim，N=1/2/3/5/8，采 `utilization.memory` 时间序列 + 吞吐曲线 + server 忙占比。
 - **必须按类各跑一个**：CPU-sim 用 LIBERO；GPU-sim 用 RoboTwin/SimplerEnv/ManiSkill 之一。
 - **验收**：能画出 N-吞吐曲线并给出拐点（`03_testing.md` T-02）。
 
@@ -158,7 +179,7 @@
 ### T1-3 N 标定：报告 + agent 决策 + 配置缓存 【依赖 T0-1 + T1-1】
 
 - **目标**：扫 N 产出**标定报告**，由 agent 决策出**并行配置**，缓存 `(model, benchmark, gpu)`。
-- **方法**：`01_architecture.md` §6.2–§6.4（报告规范、agent 决策、校验/兜底）+ §5.4（配置 schema）。
+- **方法**：`01_architecture.md` §6.3–§6.5（报告规范、agent 决策、校验/兜底）+ §5.4（配置 schema）。
 - **验收**：报告三件套（`report.json`/`report.md`/`env.json`）+ agent 产出**合法**配置（过 schema + 边界校验）；至少覆盖 CPU-sim 一个 + GPU-sim 一个（`03_testing.md` T-02）。
 
 ### T1-4 GPU-sim 放置决策（同卡 vs 异卡）【依赖 T0-1，需 GPU-sim 环境】

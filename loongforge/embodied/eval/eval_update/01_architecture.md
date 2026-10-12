@@ -14,14 +14,14 @@
 T_wall = max( 仿真总时间 / 仿真并行度 , 推理总时间 / GPU 吞吐 )
 ```
 
-**手段**：让评测端（sim）排队等待，使 GPU 不再空转——即把 GPU 的**空闲**从关键路径上摘掉。这样 wall-clock 就由上面两项里真正大的那一项决定（**不预设**是仿真侧还是推理侧）。
+**手段**：让评测端（sim）排队等待，使**绑定资源**不再空转——即把**绑定资源的空闲**从关键路径上摘掉（**GPU 只是候选之一**，见 §6.1 通用方法论）。这样 wall-clock 就由 `max_r(资源时间_r / 容量_r)` 里真正大的那一项决定。
 
 **判据**：
-- 必要条件：跑评测时 `nvidia-smi` 利用率稳定 > 90%（GPU 不再空转）。
-- 充分条件：**吞吐曲线出现平台**（见 §6）。GPU util 只是必要非充分——GPU 仿真同卡时渲染也占 GPU，util 会显示 100% 但推理其实在被挤。
+- **主判据**：**吞吐曲线出现平台**（见 §6）+ **server 忙占比** = `请求数 × 平均服务时间 / wall`（从 `timing.json` 直接算）→ 逼近 100% 即 server 成为瓶颈。
+- **不要用 `nvidia-smi utilization.gpu` 当饱和度**：它报的是"过去采样周期里**有 ≥1 个 kernel 在跑的时间占比**"（NVML 定义），**不反映有多少 SM 被占用**——100% ≠ 用满，低 ≠ 空闲。GPU 侧旁证用 **`utilization.memory`**（带宽）或 **DCGM**（`DRAM_ACTIVE` / `PIPE_TENSOR_ACTIVE` / SM occupancy）/ `nvidia-smi dmon`。
 - 附加：**sim 侧无因等待超时而失败**——串行排队会让后面的 sim 每步多等 `≈(N-1)×t_infer`，可能撞客户端超时（见 §9 风险 7）。
 
-**收益的边界（Amdahl）**：只要 **GPU 侧是 max 的那一项**，降 GPU 耗时（batching / 加卡）就有收益；一旦 **CPU 侧成为 max**，降 GPU 耗时收益为零，必须压 CPU 仿真总量。目标态（§7.1）两项接近（GPU 1750s vs CPU 970~1550s，**GPU 略大**），所以 batching 在目标态**仍有收益**，只是优先级排在 M1/M2 之后（见 §7.4）。
+**收益的边界（Amdahl）**：只有降低**绑定资源**的耗时才有收益；一旦它不再是 max，继续优化它收益为零，必须转攻新的 max。**绑定资源是哪个要量出来**（§6.1），**不要预设是 GPU**。§7.1 的推演建立在"GPU 是 max"这个假设上；实测示例（§6.1）显示该 workload 实际是 **server 墙钟 + sim CPU** 绑定——所以 §7.1 只是**推演**，落地前以标定为准。
 
 ---
 
@@ -73,7 +73,7 @@ T_wall = max( 仿真总时间 / 仿真并行度 , 推理总时间 / GPU 吞吐 )
 - `_route_message`（`:71`）是**同步阻塞**调用 `policy.predict_action`，直接跑在 event loop 里 → **多客户端请求被天然串行化排队**。这既是"评测端等待"的现成实现，也顺带避免了"模型 forward 非线程安全"的坑。
 - `servers/loongforge_server.py:12` 的 `HTTPServer` **只服务 `/healthz`**（`:109`），与推理无关。
 
-**推论**：单请求 GPU 时间 ~0.5s，event loop 开销仅 ms 级 → 串行执行下 GPU 利用率已接近 100%。**并行改造的落点不在 server，在编排层。**
+**推论**：单请求 GPU 时间 ~0.5s，event loop 开销仅 ms 级 → 串行执行下 server 不再空转（请求背靠背）。**并行改造的落点不在 server，在编排层。**（注：这里说的是"server 不再等请求"，**不等于** GPU 被用满——见 §1 的 util 说明。）
 
 ### 2.4 仿真的两类资源画像
 
@@ -134,7 +134,7 @@ T_wall = max( 仿真总时间 / 仿真并行度 , 推理总时间 / GPU 吞吐 )
 
 - **server（托管方）**：由 coordinator 起，长驻；一个 server 服务同一 ckpt 的 N 个 sim。
 - **worker（纯 client）**：一个 worker = 一个 family runner 进程，跑一个 shard，**不自己起 server**，只 `wait_healthz` + 连 `ws://host:port`。
-- **coordinator**：起 worker 池、维护队列、按 `nvidia-smi` 与资源画像决定并发数、worker 死则回收其 `running/` 单元。
+- **coordinator**：起 worker 池、维护队列、按资源画像（`utilization.memory` / server 忙占比等）决定并发数、worker 死则回收其 `running/` 单元。
 
 ### 4.3 队列与抢占（动态任务下发）
 
@@ -209,7 +209,7 @@ worker                    work/                       server/sim            结�
 
 **例外：异卡（sim 主导）**：当单个 sim 的渲染就能吃满一张卡（高分辨率 + 多相机，典型 RoboTwin 3 路），再塞 server 只是抢 SM → server 挪到独立卡，退化成"1 server : N 张 sim 卡"。
 
-**判据**（实测）：量单 sim 的 GPU 占用（util% 或 ms/帧）与推理占用——
+**判据**（实测）：量单 sim 的 GPU 占用（显存 / ms/帧，**别用 `nvidia-smi util`**）与推理占用——
 - `sim_share × k + infer_share` 能共同饱和该卡、互不饿死 → **同卡**；
 - sim 自己就接近 100% → **异卡**。
 
@@ -225,14 +225,14 @@ worker                    work/                       server/sim            结�
 
 **为什么默认 1 server/卡 就够喂满算力**：server 串行，只要 sims 够多、请求背靠背，forward 一个接一个 → 算力饱和，**与模型占多少显存无关**。
 
-**反例（需要同卡并发）**：若**单个 forward 本身喂不满 SM**（模型小 / kernel 计算量低 / 访存受限），则一个串行 server 喂不满算力，util 会卡在低位。这时有两条路：
+**反例（需要同卡并发）**：若**单个 forward 本身喂不满 SM**（模型小 / kernel 计算量低 / 访存受限），则一个串行 server 喂不满算力（带宽 `utilization.memory` 会卡在低位）。这时有两条路：
 
 1. **加大 batch**（M3，一次 forward 处理 K 个）——**一份模型、一个进程**；
 2. **同卡第二副本**（两个进程各一份模型、并发跑 forward）——两份模型。
 
 两者都是"填空闲 SM"。**若只是要填空闲算力，batch 通常更优**（省显存、省管理）——但**以实测为准**（见 `03_testing.md` T-08）。
 
-**判据**：M0 扫 N 时的 **GPU util 平台**——到 ~90%+ 即 1 server/卡 足够；**加 sim 也上不去** → 单个 forward 喂不满，需 batch / 多副本。
+**判据**：M0 扫 N 时的 **吞吐平台 + server 忙占比**（**不要用 `nvidia-smi util`**，见 §1）。server 忙占比逼近 100% 即 1 server/卡 足够；若忙占比高但吞吐不涨 → 单个 forward 喂不满，需 batch / 多副本。
 
 **显存富余 ≠ 要开第二个副本**：显存富余的正当用途是 GPU-sim 加 sim、batch 的激活、放别的 ckpt 的 server。**同 ckpt 同卡多副本只在"单个 forward 喂不满 SM"时才有意义。**
 
@@ -274,7 +274,7 @@ worker                    work/                       server/sim            结�
 
 ### 5.4 并行配置 schema
 
-分**静态配置**（人写）与**标定产物**（agent 决策，见 §6.4），按 **`(ckpt) × (resource_class)` 两条轴**组织：
+分**静态配置**（人写）与**标定产物**（agent 决策，见 §6.5），按 **`(ckpt) × (resource_class)` 两条轴**组织：
 
 ```yaml
 run:      { output_dir: ..., resume: true }
@@ -310,11 +310,69 @@ vectorization: { num_envs: 1 }                                          # §7.5
 
 ---
 
-## 6. N 的标定方法（可量化，不靠盲试）
+## 6. 标定方法论
+
+> **本方案的核心方法**：对任意 `(model, benchmark, gpu, config)`，先**找出绑定资源**，再按该资源选杠杆；**不要预设**哪个资源是瓶颈——量出来。N 的标定（§6.2 起）只是其中一个环节。
+
+### 6.1 通用方法论（5 步 + 2 陷阱）
+
+**目标函数**（泛化，**不写死 GPU**）：
+```
+T_wall = max_r ( 资源时间_r / 容量_r )   r ∈ { sim-CPU, sim-GPU, server-wall, server-GPU-busy, ... }
+```
+优化 **argmax_r**（绑定资源）。"把 X 从关键路径摘掉"里的 **X 是绑定资源**，不是固定的 GPU。
+
+**Step 1 · 分解"单请求成本"**（一次 N=1 小分片）
+- `t_sim`（仿真侧）、`t_server_wall`（server 每请求墙钟 = `timing.json` 的 mean）；
+- **把 `t_server_wall` 再拆**：GPU-busy vs **non-GPU**（`utilization.memory` / DCGM 采样，或 nsys/ncu）。
+- 得到三个每请求成本：**sim / server-wall / server-GPU-busy**。
+
+**Step 2 · 算资源总量与容量**：总量 = 请求数 × 各每请求成本（CPU·s / server-wall·s / GPU-busy·s）；容量 = 核数、卡数、每卡 SM / 带宽。
+
+**每资源的吞吐上限**（取 `min` 即总上限；`argmin` = 绑定资源）：
+```
+上限_r = 容量_r / (每请求成本_r × R)        R = 每集请求数
+   server : (1 / t_service) / R
+   sim-CPU: (核数 / 每步核数) / R
+```
+> 例：`t_service=50.9ms`、`R=150` → `1/0.0509/150 ≈ 7.9 ep/min`；且恒等式 **`吞吐 = 忙占比 × 上限`**（实测 N=16：`0.87 × 7.9 ≈ 6.8` ✓）。
+> **`t_service` 取 `timing.json` 的 `mean`**——不是 max/p95，也不是 `avg_inference_latency_ms`（后者只对"真推理"平均，会高估 ~10×）。
+
+**Step 3 · 扫 N，测各资源占用率**：主判据 = **吞吐曲线**；各资源占用 = **server 忙占比**（`timing` 算）、**CPU 占用**、**GPU 带宽占用**（`utilization.memory`）、**GPU SM 占用**。
+
+**Step 4 · 找绑定资源**：随 N 增大，**哪个资源先逼近 100%** 就是瓶颈（没到平台就继续加 N）。⚠️ **同步 client 下，串行资源会靠"排队等待"先绑定**——不必等到 100% 利用率；判据用**等待时间增长**（`e2e − 服务时间`）+ **恒等式 `吞吐 = 忙占比 × 上限`**。
+> **队列是闭环的、有界的**：client 同步（发一个等一个）→ 在途请求 ≤ N → 队列深度 ≤ N−1 → **最长等待 ≈ (N−1) × t_service**。所以不会无界增长；但 N 大时会撞**客户端超时**（§10 风险 7），超时阈值要按 N 放宽。
+
+**Step 5 · 按绑定资源选杠杆**：
+
+| 绑定资源 | 杠杆 |
+|---|---|
+| **server 墙钟** | 降每请求 server 成本（batch / 更快 forward / chunk 复用）；加 server 副本或卡 |
+| **server GPU-busy** | batch（摊薄 kernel 开销）；加卡 |
+| **sim CPU** | 降 sim 成本；加核；换更快的 sim 后端 |
+| **sim GPU** | 减每卡 sim 数；向量化（§7.5） |
+
+**三个杠杆**（不是两个——别把"喂饱"和"扩容"混了）：
+
+| 杠杆 | 作用 | 吃谁的资源 | 何时有用 |
+|---|---|---|---|
+| **N**（每 server 挂几个 sim） | **喂饱**（提高利用率） | **sim 侧**（CPU；GPU-sim 吃显存） | server 没喂满时 |
+| **batch** | 提高**单卡吞吐**（降每请求成本） | **server 显存**（激活 / KV 随 batch 涨） | server 已成绑定资源时 |
+| **加卡 / server 副本** | 提高**总容量** | 更多卡 | 单卡容量到顶时 |
+
+> **正交性**：**资源维度基本正交**（N 吃 sim 侧、batch 吃 server 显存，两套资源互不挤）；**效果维度不正交**（batch 的收益依赖 N 够大——server 被喂饱才攒得出成批请求）。故 **M3(batch) 排在 M1/M2 之后**：先喂饱，再扩容。
+> 注：**"scale out"严格说指加卡**（第三行）；N 只是"加负载/喂饱"，**不增加任何容量**。
+
+**两个通用陷阱**（实测踩到，必查）：
+
+1. **`nvidia-smi utilization.gpu` ≠ 饱和度**——它报的是"过去采样周期里有 ≥1 个 kernel 在跑的时间占比"，**不反映 SM 占用**。改用 **server 忙占比 / `utilization.memory` / DCGM**。
+2. **`t_server_wall` ≠ GPU 时间**——forward 可能大部分墙钟**不在 GPU 上**（实测：GPU 只占 forward 墙钟的 ~1/3）。不拆的话，会把"**server 慢**"误判成"**GPU 忙**"，进而选错杠杆。
+
+> **示例（不是结论）**：FastWAM × LIBERO 实测（N=1..16）——GPU 与 CPU **都不忙**（`util.gpu` 5.6→26.9%，`util.memory` 1→5%，CPU 2.6→8.9% / 128 核），**绑定资源是串行 server**（忙占比 18%→87%，且满足恒等式 `吞吐 = 忙占比 × 上限`，上限 ≈ 7.9 ep/min）。**只作方法论的回归用例**，不是普适结论。
+
+### 6.2 下界与资源上界（一次 1:1 标定即可算出）
 
 `N*` 是 **(model, benchmark)** 的函数：benchmark 决定 sim 侧（`t_sim`、每 sim 核数/显存），model 决定 server 侧（`t_infer`、显存）。
-
-### 6.1 下界（一次 1:1 标定即可算出）
 
 卡要饱和，server 不能等请求：
 
@@ -330,20 +388,21 @@ GPU-sim:  N ≤ (card_vram - vram_model - kv) / vram_sim
 ```
 
 > **`N_min` 是 model + suite 相关的**：以 31s 样本算得 `N_min≈4.2`；而 libero_10 单集 ~60s（每请求 `t_sim≈4.2s`）对应 `N_min≈8.4`。所以"每卡 5~8 sim"对 libero_10 是**欠喂**——N 应按套件取，或统一取上界。
-> **`N_min` 只作"起扫种子"，不是目标值**：N 增大时 `t_sim`（CPU 争用）与 `t_infer`（GPU-sim 同卡抖动）会**同时膨胀**，真实饱和点不是这个比值。主判据只认吞吐曲线拐点（§6.2）。
+> **`N_min` 只作"起扫种子"，不是目标值**：N 增大时 `t_sim`（CPU 争用）与 `t_infer`（GPU-sim 同卡抖动）会**同时膨胀**，真实饱和点不是这个比值。主判据只认吞吐曲线拐点（§6.3）。
 
-### 6.2 标定流程（~4 次小 run，替代盲搜；**每次只跑代表性小分片，不是全量**）
+### 6.3 标定流程（~4 次小 run，替代盲搜；**每次只跑代表性小分片，不是全量**）
 
-1. **扫 N**（~4 次）：`N ∈ {1, 2, 4, 8}`（或按 §6.1 的 `N_min` 取附近点）。
+1. **扫 N**（~4 次）：`N ∈ {1, 2, 4, 8}`（或按 §6.2 的 `N_min` 取附近点）。
    - **N=1 那次就是"vanilla"**：既是无争用基线（拿 `t_sim`、`t_infer` 算 `N_min`），又是曲线的起点——**不用单独再跑一次 vanilla**。
    - N>1 的几次用来观测队列深度、争用、`t_sim` 膨胀。
+   - ⚡ **不同 N 并行跑**：每个 N 一个 server（各占一张卡），N 个值**同时**跑。**别串行——卡都空着**。串行只省显存、费时间；并行后墙钟 ≈ 最慢那档。
 2. **取拐点**（0 次）：`N*` = 达到 ≥95% 平台吞吐的最小 N（避免超订）。**可自适应**——先跑 `1` 与 `2·N_min`，见平台即收敛。
 3. **缓存**（0 次）：存成 `(model, benchmark, gpu)` 表，下次直接查。
 
 > **每次 run 的规模**：只跑一个**代表性小分片**（几十~上百集），目的是**测吞吐/延迟**，不是出分。所以是"小探针"，**不是"多次全量评测"**。
 > **不能只查一次 vanilla 的 logging 代替扫描**：N>1 的队列深度 / 争用 / 拐点，只有真的在 N>1 跑才有。
 
-### 6.3 所需指标与现状（修订：大部分已有）
+### 6.4 所需指标与现状（修订：大部分已有）
 
 | 指标 | 来源 | 现状 |
 |---|---|---|
@@ -355,32 +414,35 @@ GPU-sim:  N ≤ (card_vram - vram_model - kv) / vram_sim
 | 瞬时队列深度 | 需 **recv→队列→worker** 架构（= M3 batcher），现有串行 server 测不到 | M3 |
 | **延迟分布 p50/p95/p99** | 现只有 `avg`（`metrics/results.py`） | **待加** |
 | **server 侧服务时间 + 导出** | 无（`inference_latency_ms` 在 chunk-cache hit 时为 `None`） | **待加**（T0-1） |
-| GPU util / 显存时间序列 | `nvidia-smi` | 待采集（外部） |
+| GPU 旁证（带宽 / 显存） | `utilization.memory` / `nvidia-smi dmon` / DCGM | 待采集（外部） |
 
 > **"server 侧队列深度"测不到**：`_route_message` 同步阻塞 event loop，其它连接的 handler 进不来 → 数不到"待处理请求个数"。能拿到的是**等待时间**（`e2e - t_infer`），**平均深度**再由 **Little's Law** `L ≈ λ × W` 推导；**瞬时深度**要等 M3 的队列架构。
 > **服务时间是双峰，别用错数（T-01 实测）**：cache hit ~7.7µs vs 真推理 ~490ms（LIBERO 上 94/920 ≈ 10% 是真推理）。`avg_inference_latency_ms`（~492ms）**只反映真推理那一小撮**；server 是逐请求串行的，**`N_min` 要用平均每请求服务时间（实测 ~49ms）**——用 492ms 会把 N 算小约 10×。
-> **判饱和，等待时间比深度更直接**（直接对应"sim 被拖慢多少 / 撞不撞超时"）；**主判据**仍是吞吐曲线拐点 + GPU util。
+> **判饱和，等待时间比深度更直接**；**主判据**是**吞吐曲线平台 + server 忙占比**（见 §1）。**不要用 `nvidia-smi utilization.gpu`**——那是"有 kernel 在跑的时间占比"，不是饱和度。
 
-### 6.4 标定产物：报告 + agent 决策
+### 6.5 标定产物：报告 + agent 决策
 
 标定的产物不是"一个 `N*` 数字"，而是 **报告 → agent 决策 → 配置** 三步（配合"都是 AI agent"的用法）：
 
 **① 生成报告**（`calibration_report/`）：
 
 ```
-report.json    # 每次 run 一条：吞吐、GPU util(mean/p95)、显存峰值、
-               #   队列深度(mean/p95/max)、t_infer(p50/p95/p99)、t_sim、超时/失败次数、wall-clock
-report.md      # 叙述：曲线形状 / 拐点 / 异常（t_sim 膨胀、超时）
+report.json    # service_time_ms + 每 N 一条：吞吐、server 忙占比、utilization.memory、CPU busy、wall
+report.md      # 表格 + 读法（含"不要用 nvidia-smi util"的提示）
 env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数/显存、每 sim 显存、模型+KV 显存
 ```
 
-**② agent 决策**：agent 读报告，产出并行配置（schema 见 §5.4）。拐点往往不是干净平台，需要权衡（util 88% 够不够、加 N 会不会顶起 `t_sim`、会不会撞超时），固定规则判不了。
+> **生成器已实现**：`orchestrator/calibration_report.py`（`--sweep` / `--timing` / `--env` → 三件套；纯函数 `build_report` / `render_markdown`，含单测）。输入与扫描器解耦（只认 sweep/timing 的 JSON）。
+
+**② agent 决策**：agent 读报告，产出并行配置（schema 见 §5.4）。拐点往往不是干净平台，需要权衡（server 忙占比 88% 够不够、加 N 会不会顶起 `t_sim`、会不会撞超时），固定规则判不了。
 
 **③ 校验 + 兜底**（防 agent 编）：
 
 - 报告给**数据 + 硬约束**，别塞"推荐 N"让它复述；
-- agent 输出的配置过 **schema + 边界检查**（`N ≤ 核数/每sim核数`、显存不超、`timeout ≥ N×t_infer`），非法则拒；
+- agent 输出的配置过 **schema + 边界检查**（`N ≤ 核数/每sim核数`、显存不超、`timeout ≥ N × 服务时间 × safety`），非法则拒；
 - 兜底：agent 挂 / 输出非法 → 回落"≥95% 平台吞吐的最小 N"；`rationale` 存档可审。
+
+> **校验 + 缓存已实现**：`orchestrator/calibration_config.py`（`validate_parallel_config` / `calibration_key` / `save_calibration` / `load_calibration`，含单测；CLI：`--config --env --timing` → PASS/FAIL）。
 
 **缓存**：`(model, benchmark, gpu)` → 存**报告 + 配置**；下次直接查配置。
 
@@ -399,7 +461,7 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 
 **结论：4 套件全量 wall-clock ≈ 29~32min（现 ~2.7h，约 5.5×），系统正好落在 GPU/CPU 平衡点。全程不需要改模型、不需要 batching。**
 
-> ⚠️ 这是**理想装箱下界**——假设分片完美均衡、无冷启动/长尾；静态映射（阶段 1）达不到，需阶段 1+2 共同兑现。且上述是 **CPU-sim（LIBERO）**口径，GPU-sim 不适用。
+> ⚠️ 这是**理想装箱下界**——假设分片完美均衡、无冷启动/长尾；**且假设 GPU 侧是 max（未必，见 §6.1 实测）**。静态映射（阶段 1）达不到，需阶段 1+2 共同兑现。且上述是 **CPU-sim（LIBERO）**口径，GPU-sim 不适用。
 
 ### 7.2 阶段 1：1 server ↔ N sim（唯一有量级收益的一步）
 
@@ -445,7 +507,7 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 | 步骤 | 输入 | 输出 |
 |---|---|---|
 | A1 提交标定配置 | 标定 YAML（model + benchmark，不跑全量） | 标定任务 |
-| A2 扫 N（小分片） | `N ∈ {1,2,4,8}`、代表性小分片、1 server（+ N sim） | 原始指标：插桩 logging（`t_infer`/队列深度/延迟分布）+ `results.jsonl`（`t_sim`）+ `nvidia-smi` 序列 |
+| A2 扫 N（小分片） | `N ∈ {1,2,4,8}`、代表性小分片、1 server（+ N sim） | 原始指标：插桩 logging（`t_infer`/延迟分布）+ `results.jsonl`（`t_sim`）+ `utilization.memory`/`dmon` 序列 |
 | A3 生成报告 | A2 的原始指标 | `report.json` / `report.md` / `env.json` |
 | A4 agent 决策 | 报告三件套 | 并行配置（`calibrated` 段）+ `rationale` |
 | A5 校验 + 兜底 | agent 配置 + `env.json` 硬约束 | 合法配置（过 schema + 边界）；非法 → 回落"≥95% 平台吞吐的最小 N" |
