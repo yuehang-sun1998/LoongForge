@@ -343,16 +343,23 @@ GPU-sim:  N ≤ (card_vram - vram_model - kv) / vram_sim
 > **每次 run 的规模**：只跑一个**代表性小分片**（几十~上百集），目的是**测吞吐/延迟**，不是出分。所以是"小探针"，**不是"多次全量评测"**。
 > **不能只查一次 vanilla 的 logging 代替扫描**：N>1 的队列深度 / 争用 / 拐点，只有真的在 N>1 跑才有。
 
-### 6.3 所需插桩
+### 6.3 所需指标与现状（修订：大部分已有）
 
-| 位置 | 指标 | 现状 |
+| 指标 | 来源 | 现状 |
 |---|---|---|
-| server `_route_message` | 每次 `t_infer` 及 **per-request 延迟分布（p50/p95/p99）**、请求到达时间戳、**到达时队列深度** | **待加** |
-| sim（`results.jsonl`） | `episode_time_sec` / `reset_time_sec` | 已有 |
-| 系统 | `nvidia-smi` util + 显存时间序列、per-process CPU | 待采集 |
+| `t_infer`（纯模型调用） | `servers/loongforge_policy.py:129` → `inference_latency_ms` → runner 逐请求接住 → `metrics/results.py:100` 聚合 | **已有** |
+| `e2e` 延迟（含排队 + 传输） | `orchestrator/runners/libero_runner.py:293/307` → `e2e_latency_ms` | **已有** |
+| `t_sim` | `results.jsonl` 的 `episode_time_sec` / `reset_time_sec` | **已有** |
+| **队列等待（时间）** | `e2e - t_infer`（**不需要 server 改动**） | 可推导 |
+| **平均队列深度** | Little's Law：`L ≈ λ × W`（λ = 请求到达率，W = 上面的等待时间） | 可推导（平均） |
+| 瞬时队列深度 | 需 **recv→队列→worker** 架构（= M3 batcher），现有串行 server 测不到 | M3 |
+| **延迟分布 p50/p95/p99** | 现只有 `avg`（`metrics/results.py`） | **待加** |
+| **server 侧服务时间 + 导出** | 无（`inference_latency_ms` 在 chunk-cache hit 时为 `None`） | **待加**（T0-1） |
+| GPU util / 显存时间序列 | `nvidia-smi` | 待采集（外部） |
 
-> **队列深度**是"卡有没有喂饱"最直接的信号；**吞吐曲线拐点**才是主判据，util 只是必要非充分。
-> **延迟分布**用于发现"排队把后面的 sim 拖到撞超时"（见 §9 风险 7）。
+> **"server 侧队列深度"测不到**：`_route_message` 同步阻塞 event loop，其它连接的 handler 进不来 → 数不到"待处理请求个数"。能拿到的是**等待时间**（`e2e - t_infer`），**平均深度**再由 **Little's Law** `L ≈ λ × W` 推导；**瞬时深度**要等 M3 的队列架构。
+> **服务时间是双峰，别用错数（T-01 实测）**：cache hit ~7.7µs vs 真推理 ~490ms（LIBERO 上 94/920 ≈ 10% 是真推理）。`avg_inference_latency_ms`（~492ms）**只反映真推理那一小撮**；server 是逐请求串行的，**`N_min` 要用平均每请求服务时间（实测 ~49ms）**——用 492ms 会把 N 算小约 10×。
+> **判饱和，等待时间比深度更直接**（直接对应"sim 被拖慢多少 / 撞不撞超时"）；**主判据**仍是吞吐曲线拐点 + GPU util。
 
 ### 6.4 标定产物：报告 + agent 决策
 

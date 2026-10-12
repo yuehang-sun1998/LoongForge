@@ -27,7 +27,7 @@
 | — | 设计收敛（架构/标定/队列） | ✅ 完成（文档） | `01_architecture.md` | — | — |
 | — | 代码触点核实 | ✅ 完成 | 见 `01_architecture.md` §10 | — | — |
 | 0 | **N-吞吐验证实验**（1 server + N sim 扫 N-吞吐） | ⬜ 未开始 | — | `03_testing.md` T-01/T-02 | 需空闲 GPU |
-| 0 | server 侧插桩（`t_infer` + 队列深度） | ⬜ 未开始 | `transport/rpc_server.py::_route_message` | T-01 能出数 | — |
+| 0 | server 侧服务时间插桩 | ✅ 完成 | `transport/timing.py` + `rpc_server.py` | `03_testing.md` T-01 通过 | — |
 | 1 | external server 模式 | ⬜ 未开始 | `server_manager.py:30-48` | T-03 | — |
 | 1 | 纯 client 启动 | ⬜ 未开始 | `run.py` 5 处 `_run_*_once` | T-03 | external 模式 |
 | 1 | N 标定（报告 + agent 决策 + 配置缓存） | ⬜ 未开始 | — | T-02 | 插桩 + external |
@@ -113,18 +113,28 @@
 - `modeling_fastwam.py:349` 硬断言 `batch==1`（阶段 3 前置）。
 - 仿真后端分类核实：LIBERO/CALVIN = MuJoCo CPU（CALVIN 用 osmesa 软件渲染）；RoboTwin/SimplerEnv/ManiSkill = SAPIEN GPU。
 
+### 2.3 T0-1 实现 + 真评测验证（2026-10-12）
+
+- **代码**：新增 `transport/timing.py`、`rpc_server.py` 接线、`unit_tests/test_server_timing.py`（**9 passed**，ruff clean）。**未提交**。
+- **验证**：真评测（LIBERO `libero_10` task0 × 2 集）跑通，`timing.json` 出数、与 `inference_latency_ms` 交叉验证一致（max 554.8ms 精确相同）；**开关关/开逐集结果完全一致**（非侵入）。详见 `03_testing.md` T-01。
+- **跑评测踩到的环境坑（4 条，复现用）**：
+  1. **`env.loongforge_root` 才是有效键**（`server.loongforge_root` 是 no-op；用户脚本靠 `export PYTHONPATH` 兜住）。
+  2. **server 解释器要 `/usr/bin/python3`**（有 TransformerEngine）；**仿真侧用 venv `/workspace/venvs/libero-eval`**（有 robosuite/libero）。
+  3. **`DIFFSYNTH_MODEL_BASE_PATH`**（= `/mnt/cfs/sunyuehang`）指向本地 Wan2.2，否则 VAE 会走 modelscope 联网超时。
+  4. 小分片冒烟配置在 `/tmp/eval_smoke/t0_smoke.yaml`（2 集）。
+
 ---
 
 ## 3. 待办（按依赖排序）
 
 > 每条格式：目标 / 改动 / 验收 / 产出。
 
-### T0-1 加 server 侧插桩 【最先做，无依赖】
+### T0-1 server 侧服务时间插桩 【✅ 已完成】
 
-- **目标**：让"卡有没有喂饱"可观测。
-- **改动**：`transport/rpc_server.py::_route_message` 加：每次 `t_infer`、请求到达时间戳、到达时队列深度；聚合输出 mean/p50/p95。
-- **验收**：vanilla 1:1 跑一个分片能导出上述指标（`03_testing.md` T-01）。
-- **产出**：可复用的 timing 日志。
+- **交付**：`transport/timing.py`（`LatencyRecorder`，env 开关、mean/p50/p95/p99、原子落盘）+ `rpc_server.py::_predict_action_timed` + `unit_tests/test_server_timing.py`（8 条，9 passed）。
+- **验证**：真评测（LIBERO `libero_10` task0 × 2 集）跑通，`timing.json` 出数、与 `inference_latency_ms` 交叉验证一致（max 554.8ms 精确相同）；**开关关/开逐集结果完全一致**（非侵入）。详见 `03_testing.md` T-01。
+- **关键发现**：服务时间**双峰**（cache hit ~7.7µs vs 真推理 ~490ms）→ `N_min` 用**平均每请求 ~49ms**，非 `avg_inference_latency_ms` 的 ~492ms。
+- **未做**：server 侧"队列深度"——同步阻塞下数不到个数。改用等待时间 `e2e - t_infer`；平均深度 Little's Law `L ≈ λ×W`；瞬时深度等 M3。
 
 ### T0-2 N-吞吐验证实验 【依赖 T0-1】
 
