@@ -38,7 +38,7 @@
 
 | 用例 | 对应功能 | 阶段 | benchmark 类 | 状态 |
 |---|---|---|---|---|
-| T-01 | server 侧插桩 + vanilla 1:1 标定 | 0 | CPU-sim（LIBERO） | ⬜ 待执行 |
+| T-01 | server 侧插桩 + vanilla 1:1 标定 | 0 | CPU-sim（LIBERO） | ✅ 通过 |
 | T-02 | N 扫描 → 标定报告 + 并行配置 | 0/1 | CPU-sim + GPU-sim 各一 | ⬜ 待执行 |
 | T-03 | external server + 纯 client 启动 | 1 | CPU-sim | ⬜ 待执行 |
 | T-04 | shard/worker 契约 | 2 | 至少两个 family | ⬜ 待执行 |
@@ -69,16 +69,23 @@
 ### T-01 · server 侧插桩 + vanilla 1:1 标定
 
 - **对应功能**：T0-1（插桩）。
-- **目的**：拿到**无争用**的 `t_sim` / `t_infer`，作为 N 标定输入。
+- **目的**：拿到**无争用**的 `t_sim` / `t_infer`（+ server 侧服务时间），作为 N 标定输入。
 - **前置**：插桩已实现。
 - **步骤**：
   1. 起 1 server + **1** sim（vanilla 1:1）。
   2. 跑一个**代表性分片**（长尾套件用代表性分片，如 libero_10 取含长尾任务的片）。
-  3. 导出：每次 `t_infer`、到达时队列深度、`episode_time_sec`、`nvidia-smi` 时间序列。
-- **通过标准**：能算出 `t_sim_per_request` 与 `t_infer`（mean/p50/p95），且插桩开销 < 1%。
+  3. 导出：server 侧服务时间分布（mean/p50/p95/p99）、**等待时间 `e2e - t_infer`（平均深度可由 Little's Law `L≈λ×W` 推）**、`episode_time_sec`、`nvidia-smi` 时间序列。
+- **通过标准**：能算出 `t_sim_per_request` 与 `t_infer`（含分布），且插桩开销 < 1%；**server 侧服务时间与 `inference_latency_ms` 对得上**（交叉验证）。
 - **注**：这次 **N=1 的 run 就是 T-02 曲线的第一个点**，不必重跑。
-- **数据**：_待填_
-- **结论**：_待填_
+- **数据**（2026-10-12，A800，`libero_10` task0 × 2 集，noise seed 42）：
+  - `timing.json`（server 侧，开关开）：`count=920`，`mean=49.2ms`，`p50=0.0077ms`，`p95=490.8ms`，`p99=508.7ms`，`max=554.8ms`。
+  - trace（runner 侧，独立）：932 步 = **838 cache hit + 94 真推理**；真推理 `inference_latency_ms` `mean=492.0 / p50=490.7 / p95=511.4 / max=554.8`；全部请求 `e2e_latency_ms` `mean=50.6 / p50=0.9 / p95=491.6`。
+  - 单集：ep0 fail（700 步 / 137.6s）、ep1 success（232 步 / 50.6s）；`success_rate=0.5`；总 `elapsed=188.3s`。
+- **结论**：
+  - ✅ **出数**：`timing.json` 生成，含 count/mean/p50/p95/p99/max。
+  - ✅ **交叉验证**：服务时间 `p95/p99/max`（490.8 / 508.7 / **554.8**）↔ 真推理 `inference_latency_ms` 的 `p50/p95/max`（490.7 / 511.4 / **554.8**），**max 精确一致**。
+  - 🔑 **真发现（双峰）**：服务时间是双峰——cache hit（~7.7µs）vs 真推理（~490ms），**94/920 ≈ 10% 是真推理**。→ **`N_min` 要用平均每请求 `49ms`，不是 `avg_inference_latency_ms` 的 `492ms`（差 ~10×）**。
+  - ✅ **非侵入性**：开关关/开两次跑，**逐集结果完全一致**（ep0 fail / ep1 success）；关闭时**不写 timing 文件**。
 
 ### T-02 · N 扫描 → 标定报告 + 并行配置
 

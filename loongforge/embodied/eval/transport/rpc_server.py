@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import traceback
 from typing import Any, Dict
 
@@ -15,6 +16,7 @@ import websockets.frames
 
 from loongforge.embodied.eval.protocol import PROTOCOL_VERSION
 from . import msgpack_numpy
+from .timing import LatencyRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,9 @@ class PolicyServer:
         self._port = port
         self._metadata = metadata or getattr(policy, "metadata", {})
         self._metadata.setdefault("protocol_version", PROTOCOL_VERSION)
+        # Opt-in per-request service-time recording (see .timing). A no-op unless
+        # LOONGFORGE_EVAL_TIMING is set, so request handling is unchanged by default.
+        self._latency = LatencyRecorder.from_env()
 
     def serve_forever(self) -> None:
         """Run serve_forever."""
@@ -46,7 +51,10 @@ class PolicyServer:
             max_size=None,
         ) as server:
             logger.info("PolicyServer listening on ws://%s:%s", self._host, self._port)
-            await server.serve_forever()
+            try:
+                await server.serve_forever()
+            finally:
+                self._latency.flush()
 
     async def _handler(self, websocket: websockets.asyncio.server.ServerConnection) -> None:
         """Run _handler."""
@@ -67,6 +75,14 @@ class PolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
+
+    def _predict_action_timed(self, payload: Dict[str, Any]) -> Any:
+        """Call ``policy.predict_action`` and record its service time (opt-in)."""
+        start = time.perf_counter()
+        try:
+            return self._policy.predict_action(**payload)
+        finally:
+            self._latency.record((time.perf_counter() - start) * 1000.0)
 
     def _route_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
         """Run _route_message."""
@@ -101,7 +117,7 @@ class PolicyServer:
 
         if message_type in ("infer", "predict_action"):
             try:
-                data = self._policy.predict_action(**payload)
+                data = self._predict_action_timed(payload)
                 return {"status": "ok", "ok": True, "type": "inference_result", "request_id": request_id, "data": data}
             except Exception as exc:
                 logger.exception("Policy inference error")
