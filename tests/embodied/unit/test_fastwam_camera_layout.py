@@ -3,12 +3,21 @@
 
 """Unit tests for FastWAM multi-camera packing (``data.camera_layout``).
 
-Covers the ``robotwin_t`` T layout (RoboTwin 3-cam) and the default
-``horizontal2`` LIBERO path of :class:`FastWAMKeyMappingTransform`.
+The ``robotwin_t`` layout is checked for **bit-identical** parity against the
+official FastWAM implementation: we exec the real
+``concat_multi_camera == 'robotwin'`` source block from the FastWAM repo
+(``$FASTWAM_REPO`` or ``/workspace/FastWAM``) and compare, so the test tracks
+the official code rather than a transcription of it.
 """
+
+import os
+import re
+import textwrap
+from pathlib import Path
 
 import pytest
 import torch
+import torchvision.transforms.functional as TF
 
 from loongforge.embodied.data.datasets.fastwam.transforms.fastwam_transform import (
     FastWAMKeyMappingTransform,
@@ -20,24 +29,47 @@ def _video(value, t=2, c=3, h=240, w=320):
     return torch.full((t, c, h, w), float(value))
 
 
-def test_robotwin_t_packs_three_cams_into_t_layout():
-    # Keys sort to [cam_high, cam_left_wrist, cam_right_wrist] = [head, left, right].
-    # Constant frames survive bilinear resize, so normalize(0.5, 0.5) maps the
-    # three fill values 0.0 / 0.5 / 1.0 to -1.0 / 0.0 / 1.0 and we can read regions.
-    data = {
-        "observation.images.cam_high": _video(0.0),
-        "observation.images.cam_left_wrist": _video(0.5),
-        "observation.images.cam_right_wrist": _video(1.0),
-    }
-    out = FastWAMKeyMappingTransform(camera_layout="robotwin_t").apply(data)
+def _load_official_robotwin_pack():
+    """Return a callable running the official FastWAM robotwin packing block.
 
-    video = out["video"]
-    assert video.shape == (3, 2, 384, 320)  # [C, T, 384, 320]
-    # Top 256 rows = head; bottom 128 rows = [left | right] split at col 160.
-    # atol loosened: bilinear+antialias leaves ~1e-7 noise on constant fields.
-    assert torch.allclose(video[:, :, :256, :], torch.full_like(video[:, :, :256, :], -1.0), atol=1e-6)
-    assert torch.allclose(video[:, :, 256:, :160], torch.zeros_like(video[:, :, 256:, :160]), atol=1e-6)
-    assert torch.allclose(video[:, :, 256:, 160:], torch.ones_like(video[:, :, 256:, 160:]), atol=1e-6)
+    Extracts the exact ``cam_top ... torch.cat([cam_top, bottom], dim=-2)``
+    source from ``robot_video_dataset.py`` and execs it (video is a
+    ``[num_cameras, T, C, H, W]`` tensor, as in the official ``_get``).
+    Returns ``None`` if the official repo is not present.
+    """
+    repo = Path(os.environ.get("FASTWAM_REPO", "/workspace/FastWAM"))
+    src = repo / "src/fastwam/datasets/lerobot/robot_video_dataset.py"
+    if not src.exists():
+        return None
+    text = src.read_text()
+    m = re.search(
+        r"(?s)\n([ \t]*cam_top = transforms_F\.resize\(.*?"
+        r"video = torch\.cat\(\[cam_top, bottom\], dim=-2\))",
+        text,
+    )
+    if not m:
+        return None
+    body = textwrap.dedent(m.group(1))
+
+    def _pack(video):
+        ns = {"torch": torch, "transforms_F": TF, "video": video}
+        exec(body, ns)  # noqa: S102 - runs the official snippet verbatim
+        return ns["video"]
+
+    return _pack
+
+
+def test_robotwin_t_matches_official_fastwam_packing():
+    official = _load_official_robotwin_pack()
+    if official is None:
+        pytest.skip("official FastWAM repo not found (set $FASTWAM_REPO)")
+    torch.manual_seed(0)
+    # Raw RoboTwin-ish frames [T, C, H, W] in [0, 1], sorted [head, left, right].
+    cams = [torch.rand(2, 3, 240, 320) for _ in range(3)]
+    lf = FastWAMKeyMappingTransform(camera_layout="robotwin_t")._pack_robotwin_t(cams)
+    ref = official(torch.stack(cams, dim=0))  # official indexes video[0..2]
+    assert lf.shape == (2, 3, 384, 320)  # [T, C, 384, 320]
+    assert torch.equal(lf, ref)  # bit-identical to the official implementation
 
 
 def test_robotwin_t_requires_exactly_three_cams():
