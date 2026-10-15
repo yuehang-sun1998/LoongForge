@@ -4,7 +4,7 @@
 > **配套文档**：`01_architecture.md`（做什么、怎么做）、`03_testing.md`（怎么验）。
 > **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `511aa24`），仓库 `/workspace/LoongForge-Github`。
 > **最后更新**：2026-10-15。
-> **一句话状态**：**M0（试跑/标定）+ M1（并行）+ M2（动态下发）已实现并验证；全量实测 94.2 min / 95.65%，逐 suite 加速 2.7–4.3×、整机 1.85×（vs 1卡1server vanilla）。** M3（batching）暂缓（GPU 未成瓶颈）。M2 已提交 `588eaf4`（未 push）。
+> **一句话状态**：**M0+M1+M2 已实现并验证。** 静态 8 卡基线全量 94.2 min / 95.65%；**M2（单 coordinator 全局队列）全量 56.2 min / 96.45% → vs 基线 1.68×、vs 1卡1server vanilla 3.09×**。M3（batching）暂缓（GPU 未成瓶颈）。
 
 ---
 
@@ -37,7 +37,7 @@
 | 1 | N 标定（报告 + agent 决策 + 配置缓存） | 🔄 报告/校验/缓存 ✅；扫描走手动探针 | `calibration_report.py` + `calibration_config.py` | T-02 | 插桩 ✅ + 最小 coordinator |
 | 1 | GPU-sim 放置决策（同卡 vs 异卡） | ⏸ 暂缓（当前环境不支持 GPU-sim；待 CPU-sim 完成后统一做） | — | T-07 | 需 GPU-sim 环境 |
 | 2 | shard/worker 契约 | ✅ 完成（由 `run.py` 统一分发吸收，**无需新 adapter 层**，见 §2.11） | `run.py` + 各 `*_runner` | `03_testing.md` T-04 | — |
-| 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ✅ 完成（**全局队列 + 有界进程池 + 失败重试一次**，见 §2.11） | `coordinator.py` | `03_testing.md` T-05 | 契约 |
+| 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ✅ 完成 + 全量对照（**全局队列 + 有界进程池 + 失败重试**；56.2 min / 3.09×，见 §2.11–§2.13） | `coordinator.py` | `03_testing.md` T-05 | 契约 |
 | 2 | episode-chunk 粒度抢占 | ✅ 完成（chunk 细到 1 集，快槽可抢下一个 unit） | `coordinator.py` | `03_testing.md` T-05 | 队列 |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
@@ -183,13 +183,14 @@
   - **失败重试一次**（`MAX_ATTEMPTS=2`）：非零退出码的 unit 重新入队，第二次仍失败才记入 `failed_units`。
   - **多 server 端口**：`LOONGFORGE_COORD_PORT_BASE`（默认 14560）起基址，每 server `+PORT_STRIDE×i`；**关键修正**：policy server 的端口**只从 config 读**（`--port` 不是 `loongforge_server` 的 CLI 参数）→ coordinator 为每个 server **落一份独立 config**（`server_{i}.json`）再启动。
   - **套件差异化**：`benchmark.suite_overrides: {<suite>: {<key>: <val>}}`（如 LIBERO `libero_10: {max_steps: 700}`）→ 使**一条全局队列跨套件**成立（否则所有套件被迫同一 `max_steps`）。
+  - **episode 级重试默认开**：`_shard_config` 默认注入 `run.max_retries=2`（显式值优先）。`episode_error`（含 `ConnectionClosedError` 这类 sim↔server 断连）本就在 runner 的重试集合里（`libero_runner.py:505`），但 `--max-retries` **默认 0** → 断连会被直接记成失败（基线就吃了 16 个，见 §2.13）。模型失败（`not_successful_within_max_steps`）**不重试**。
 - **`run.py` 分发修正**：原判据 `config.get("coordinator")` 对**空映射 `coordinator: {}`** 为假 → 会误当单跑。改为**按 key 存在性**判断：`coordinator` / `servers` / `pools` 任一存在即走编排。
 - **契约（T2-1）**：**不新增 adapter 层**——"统一入口"由 `run.py` 的 family 分发天然提供。unit 契约 = 一份普通 eval config（`benchmark.{suite,task_ids,episode_offset,episodes_per_task}` + `server.external_url` + `run.output_dir`）→ `results.jsonl`（含 `episode_id` key，可 resume）。**5 个 family 走同一条路**。
 - **E2E（2026-10-15，2 卡 A800）**：config = `servers:[{gpus:[2,3]}]` + `pools.cpu_sim.n_sims_per_server=2`（并发 4）+ `libero_10` task[0,1] × 4 集（共 8 集 / chunk=1 → **8 unit**）。结果：**2 server 各占 1 卡**（端口 17000/17001、17020/17021）、**8 unit 全 rc=0、failed_units=[]**、聚合 **8 集**、**分片无重叠无缺失**（worker_i → task/eps 恰好一一对应）、`elapsed=105.3s`。
 - **动态补位实证**：worker 0-3 于 `18:25:57` 起（第一波填满 4 槽）；worker 4-7 于 `18:26:47` 起（**第一波跑完、槽位释放后自动补位**）→ 队列确为全局动态，而非静态一轮。
-- **单测**：`test_coordinator.py` **6 passed**（含 **retry 用例**：unit 首次失败→重入队→第二次成功→`failed_units=[]`；**suite_overrides 用例**）。全量 **68 passed / 1 skipped**，ruff clean。
+- **单测**：`test_coordinator.py` **7 passed**（含 **retry 用例**：unit 首次失败→重入队→第二次成功→`failed_units=[]`；**suite_overrides 用例**；**max_retries 默认用例**）。全量 **69 passed / 1 skipped**，ruff clean。
 - **不做**：`work/{pending,running,done}` **文件级**队列（用**进程内内存队列**代替；单机单进程够用，且避免 FS 原子性假设）；看门狗超时回收（留待有实际需要再加）。
-- **待做**：M2 全量对照（单 coordinator 跨套件全局队列，验证 §2.12 推算的 ~3.0×）；GPU-sim 一路。
+- **待做**：GPU-sim 一路。（M2 全量对照已完成，见 §2.13。）
 
 ### 2.12 全量实测 + 逐 suite 加速（2026-10-15，**静态 8 卡基线**）
 
@@ -202,6 +203,17 @@
 - **缺口归因**：spatial/object/goal 在 ~45 min 跑完，后 **6 卡空转**到 libero_10 收尾（91 min）→ 逐 suite ~3.5× 被摊薄成整机 1.85×。**这正是 M2 要吃的**：空卡抢 libero_10 的 chunk → 整机 ≈ `45 + 254/(8×2.74) ≈ 57 min` → **~3.0×**。
 - ⚠️ **分数未逐位一致**（object 95.80 vs vanilla 99.40 等）：vanilla 评测代码此后有更新，**待开发完 rebase 一版 vanilla 再重跑对齐**（用户 2026-10-15 决定先不追）。**速度对比也因此非严格 apples-to-apples**（episode 长度受协议项影响）。
 - ⚠️ 注：**别用 `eval_ckpt_all_parallel.sh` 的 SPG=2 结果当基线**（10-13/10-14 的 followups 全量即 SPG=2）；口径不一致。
+
+### 2.13 M2 全量对照（2026-10-15，已完成）
+
+> 同一 ckpt / 协议 / 2000 集，**唯一变量 = 调度方式**：基线是"每套件钉 2 卡"（8 个独立 coordinator），M2 是"**单 coordinator + 跨套件全局队列**"（`servers:[{gpus:[0..7]}]` + `n_sims_per_server=16`）。
+
+- **总 wall = 56.2 min**（19:33:21→20:29:30；worker 53.2 min）；**1929/2000 = 96.45%**；**520 unit 全 rc=0、`failed_units=[]`**、**0 个 `episode_error`**。
+- **vs 静态 8 卡基线 94.2 min → 1.68×**；**vs 1卡1server vanilla 173.7 min → 3.09×**。
+- **长尾被吃掉**：libero_10 的 500 集在基线里要 2 卡拖 91 min，M2 里用满 8 卡、在 56 min 的总盘子内跑完（后 6 卡不再空转）——正是 §2.12 预测的 ~3.0×。
+- **分数对齐（逐集）**：与基线比对 2000 集，**仅 16 集不同**，全在 `libero_object/task=6/episode=16..31`，且基线里**全由同一 worker 连续产出**、`failure_reason=episode_error`/`ConnectionClosedError`（websocket keepalive 超时、`steps=0`、**根本没跑**）。**剔除这 16 个 spurious 失败后两边一致（96.42% vs 96.45%）→ 模型行为逐集相同**。
+- **收获**：① 证实 M2 的全局队列确实抹平长尾（整机 1.68× / 对 vanilla 3.09×）；② 满负载下多 server 端口隔离、`suite_overrides`、unit 级重试均正常；③ 暴露"**episode 级重试默认关**"这个坑 → 已在 §2.11 修为默认 `run.max_retries=2`。
+- **待做**：GPU-sim 一路；vanilla 代码 rebase 后重跑对齐绝对分数。
 
 ---
 
@@ -271,7 +283,7 @@
 - **目标**：把 **T1-5 的最小 coordinator** 升级为动态调度（抹平长尾，卡不空转）。
 - **改动**：`coordinator.py` 用**全局队列 + 有界进程池**（`pending` + `free_slots`，跑完即补位）；chunk 细到 1 集；失败**重试一次**；每 server 落独立 config 定端口。
 - **粒度**：**episode-chunk 级**（不是 task 级）。
-- **验收**：✅ 多卡 E2E（2 server / 4 并发 / 8 unit）动态补位、无重叠无缺失、失败重试；✅ 全量对照已量化（§2.12：94.2 min / 95.65%，逐 suite 2.7–4.3×、整机 1.85× vs 1卡1server）。
+- **验收**：✅ 多卡 E2E（2 server / 4 并发 / 8 unit）动态补位、无重叠无缺失、失败重试；✅ 全量对照已量化（静态基线 §2.12 + **M2 全量 §2.13：56.2 min / 96.45%，vs 基线 1.68×、vs 1卡1server 3.09×**）。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 

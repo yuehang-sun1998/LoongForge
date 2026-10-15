@@ -43,7 +43,7 @@
 | T-02 | N 扫描 → 标定报告 + 并行配置 | 0/1 | CPU-sim + GPU-sim 各一 | 🔄 CPU-sim ✅（含报告+决策）；GPU-sim 待做 |
 | T-03 | 一行命令起 1+N（external + 最小 coordinator） | 1 | CPU-sim | ✅ 通过（N=1 两步 / N=2 一条命令） |
 | T-04 | shard/worker 契约 | 2 | 至少两个 family | ✅ 通过（由 `run.py` 分发吸收，M2 E2E 驱动多 server 分片） |
-| T-05 | 动态队列 + 全量 wall-clock | 2 | 全 benchmark | ✅ 动态队列 E2E ✅；全量 94.2 min / 95.65%（整机 1.85×、逐 suite 2.7–4.3×） |
+| T-05 | 动态队列 + 全量 wall-clock | 2 | 全 benchmark | ✅ 静态基线 94.2 min；**M2 全量 56.2 min / 96.45%**（vs 基线 1.68×、vs 1卡1server 3.09×） |
 | T-06 | 数值一致性（batch>1 vs batch=1） | 3（暂缓） | 任一 | ⏸ 暂缓 |
 | T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | ⏸ 暂缓（环境不支持 GPU-sim，待 CPU-sim 完成后统一做） |
 | T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3（暂缓） | 任一 | ⏸ 暂缓 |
@@ -169,6 +169,13 @@
 > - **逐 suite 加速（每 50 集，log 实测）**：libero_10 **2.7×** / spatial **4.3×** / object **3.0×** / goal **3.5×**；**整机 94.2 vs 173.7 = 1.85×**。
 > - **缺口归因**：spatial/object/goal 在 ~45 min 跑完，后 **6 卡空转**到 libero_10 收尾（91 min）→ **M2 动态下发**（空卡抢 libero_10 的 chunk）预计把整机拉到 **~3.0×**。
 > - ⚠️ **分数未逐位一致**（object 95.80 vs vanilla 99.40 等）——vanilla 评测代码此后有更新，**待开发完 rebase 一版 vanilla 再重跑对齐**（用户 2026-10-15 决定先不追）。
+>
+> **M2 全量对照（2026-10-15，已完成）**：**单 coordinator + 跨套件全局队列**，同 8 卡、同 ckpt、同 2000 集（`servers:[{gpus:[0..7]}]` + `n_sims_per_server=16`）。
+> - **总 wall = 56.2 min**（worker 53.2 min）；**1929/2000 = 96.45%**；**520 unit 全 rc=0、`failed_units=[]`**、**0 个 `episode_error`**。
+> - **vs 静态 8 卡基线 94.2 min → 1.68×**；**vs 1卡1server vanilla 173.7 min → 3.09×**。
+> - **长尾被吃掉**：libero_10 的 500 集在基线里 2 卡拖 91 min，M2 里用满 8 卡、在 56 min 总盘子内跑完（后 6 卡不再空转）。
+> - **分数对齐**：逐集比对，2000 集中仅 **16 集**不同，全在 `libero_object/task=6/episode=16..31`，且基线里**全由同一 worker 连续产出**、`failure_reason=episode_error`/`ConnectionClosedError`（websocket keepalive 超时、`steps=0`、**根本没跑**）。**剔除这 16 个 spurious 失败后两边一致（96.42% vs 96.45%）→ 模型行为逐集相同**。
+> - ⚠️ **retry 缺口（已修）**：`episode_error` 本就在 episode 级重试集合里（`libero_runner.py:505`），但 `--max-retries` **默认 0** → 基线没设就把它记成失败。已在 `coordinator._shard_config` 默认注入 `run.max_retries=2`（显式值优先）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 
