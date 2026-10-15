@@ -408,6 +408,7 @@ GPU-sim:  N ≤ (card_vram - vram_model - kv) / vram_sim
 
 > **每次 run 的规模**：只跑一个**代表性小分片**（几十~上百集），目的是**测吞吐/延迟**，不是出分。所以是"小探针"，**不是"多次全量评测"**。
 > **不能只查一次 vanilla 的 logging 代替扫描**：N>1 的队列深度 / 争用 / 拐点，只有真的在 N>1 跑才有。
+> **正式入口已实现**：`orchestrator/calibrate.py --config run.yaml --n 1,2,4,8,16,32`——**一条命令**跑完：每个 N 起一个 coordinator（**并行铺卡**）→ 收集吞吐 / server 忙占比 → `calibration_report` 报告 → **兜底 N**（≥95% 最佳吞吐的最小 N）→ `calibration_config` 校验 + 缓存。
 
 ### 6.4 所需指标与现状（修订：大部分已有）
 

@@ -23,6 +23,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -131,12 +132,14 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     shards = build_shards(_task_ids(config), episodes_per_task, n_workers)
     proc = start_server(server_args)
     returncodes: List[int] = []
+    started = time.time()
     try:
         wait_healthz(
             f"http://{server_args.host}:{server_args.health_port}/healthz",
             server_args.server_start_timeout_sec,
             proc,
         )
+        started = time.time()  # measure worker wall only (exclude model load)
         workers = []
         with tempfile.TemporaryDirectory() as tmp:
             for index, shard_spec in enumerate(shards):
@@ -159,11 +162,14 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    return {
+    result = {
         "benchmark": (config.get("benchmark") or {}).get("suite") or (config.get("benchmark") or {}).get("name"),
         "n_workers": len(shards),
         "external_url": external_url,
         "worker_returncodes": returncodes,
+        "elapsed_sec": round(time.time() - started, 1),
         "output_dir": str(output_dir),
         "summary": _aggregate(output_dir, len(shards)),
     }
+    (output_dir / "coordinator_result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
