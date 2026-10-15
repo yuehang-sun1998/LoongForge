@@ -30,13 +30,13 @@
 | 0 | server 侧服务时间插桩 | ✅ 完成 | `transport/timing.py` + `rpc_server.py` | `03_testing.md` T-01 通过 | — |
 | 0 | 标定报告生成器（三件套） | ✅ 完成 | `orchestrator/calibration_report.py` | 单测 3 passed | — |
 | 0 | 配置校验 + 缓存 | ✅ 完成 | `orchestrator/calibration_config.py` | 单测 7 passed | — |
-| 1 | external server 模式 | ⬜ 未开始 | `server_manager.py:30-48` | T-03 | — |
-| 1 | 纯 client 启动 | ⬜ 未开始 | `run.py` 5 处 `_run_*_once` | T-03 | external 模式 |
-| 1 | N 标定（报告 + agent 决策 + 配置缓存） | ⬜ 未开始 | — | T-02 | 插桩 + external |
+| 1 | external server 模式（+ 纯 client） | ✅ 完成 | `server_manager.py` + `config.py` | `03_testing.md` T-03 | — |
+| 1 | **最小 coordinator（一行命令起 1 server + N worker）** | ✅ 完成 | `orchestrator/coordinator.py` | `03_testing.md` T-03 | external ✅ |
+| 1 | N 标定（报告 + agent 决策 + 配置缓存） | 🔄 报告/校验/缓存 ✅；扫描走手动探针 | `calibration_report.py` + `calibration_config.py` | T-02 | 插桩 ✅ + 最小 coordinator |
 | 1 | GPU-sim 放置决策（同卡 vs 异卡） | ⬜ 未开始 | — | T-07 | 需 GPU-sim 环境 |
 | 2 | shard/worker 契约 | ⬜ 未开始 | 新增 adapter 层 | T-04 | 阶段 1 |
-| 2 | 动态队列（按 ckpt 分片 + 按资源分池） | ⬜ 未开始 | 新增 coordinator | T-05 | 契约 |
-| 2 | episode-chunk 粒度抢占 | ⬜ 未开始 | 新增 | T-05 | 队列 |
+| 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ⬜ 未开始 | `coordinator.py` | T-05 | 契约 |
+| 2 | episode-chunk 粒度抢占 | ⬜ 未开始 | `coordinator.py` | T-05 | 队列 |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -55,14 +55,14 @@
 - 对应任务 T0-1 / T0-2 / T1-3；测试 T-01 / T-02。
 
 ### M1 · 并行（1 server ↔ N sim）
-- **内容**：external server 模式 + 纯 client 启动 + GPU-sim 放置决策（同卡/异卡）。
-- **交付**：`server_manager.py` external 模式、`run.py` 纯 client、放置结论。
-- **验收**：N 个 orchestrator 共享一个 server 不冲突不误杀；CPU-sim 下 **server 忙占比逼近 100%**（或吞吐平台，**不用 `nvidia-smi util`**，见 `01` §1）。
-- 对应任务 T1-1 / T1-2 / T1-4；测试 T-03 / T-07。
+- **内容**：external server 模式 + **最小 coordinator（一行命令起 1 server + N worker）** + GPU-sim 放置决策（同卡/异卡）。
+- **交付**：`server_manager.py` external 模式、**`coordinator.py`（最小版）**、放置结论。
+- **验收**：**一条命令** `orchestrator.run --config run.yaml` 起 1 server + N worker 跑完并聚合；server 不被误杀；CPU-sim 下 **server 忙占比逼近 100%**（或吞吐平台，**不用 `nvidia-smi util`**，见 `01` §1）。
+- 对应任务 T1-1 / T1-2 / T1-4 / **T1-5**；测试 T-03 / T-07。
 
-### M2 · 动态任务下发
-- **内容**：shard/worker 契约（adapter 层）+ coordinator + 队列（按 ckpt 分片、按资源分池、episode-chunk 粒度）。
-- **交付**：契约 + coordinator + 队列。
+### M2 · 动态任务下发（把最小 coordinator 动态化）
+- **内容**：shard/worker 契约（adapter 层）+ **coordinator 动态化**（`work/{pending,running,done}` 队列、按 ckpt 分片、按资源分池、episode-chunk 粒度、看门狗回收、长尾抹平）。
+- **交付**：契约 + 动态队列 + 看门狗。
 - **验收**：全量 wall-clock 落进目标区间（长尾被抹平）；失败隔离 + 续跑可用。
 - 对应任务 T2-1 / T2-2；测试 T-04 / T-05。
 
@@ -144,6 +144,20 @@
 - **代码**：`orchestrator/calibration_config.py`（`validate_parallel_config` 按 `N ≤ 核数/每sim核数`、显存、`timeout ≥ N×服务时间×safety` 做边界检查；`calibration_key` / `save_calibration` / `load_calibration` 做 `(model,benchmark,gpu)` 缓存）+ 单测（**7 passed**，ruff clean）。**未提交**。
 - **实测**：对 T-02 的配置跑校验 → **PASS**（`timeout 60000ms ≥ 16×50.9×2 = 1628ms`）。
 
+### 2.7 T1-1/T1-2 external server 模式（2026-10-12）
+
+- **代码**：`config.py`（`server.external_url` → `external_url`，并从 URL 推 `host`/`port`）+ `server_manager.py`（`ManagedServer` external 模式下 `start`/`ensure_running`/`stop` 全 no-op）+ 单测 `test_server_manager_external.py`（5 passed）。**`run.py` 无需改动**。**未提交**。
+- **用法**：config 里加 `server.external_url: ws://host:port`；手起（或 coordinator 起）1 个 server，N 个 orchestrator 都指向它 → **1 server : N sims**。
+- **E2E 验证**：✅ 起 1 共享 server + 1 纯 client orchestrator（`external_url`）→ `rc=0`、共享 server **未被误杀**（`alive after run: True`）。见 `03_testing.md` T-03。
+- **待做**：N>1 多 client 并发（M2）；coordinator（起 server + 起 worker 池）。
+
+### 2.8 T1-5 最小 coordinator（2026-10-12）
+
+- **代码**：`orchestrator/coordinator.py`（`split_round_robin` / `_shard_config` / `run`）+ `run.py` 分发（config 有 `coordinator:` → coordinator）+ 单测 `test_coordinator.py`（3 passed）。**未提交**。
+- **用法**：config 加 `coordinator: {n_workers: N}`；`orchestrator.run --config run.yaml` **一条命令**。
+- **E2E**：✅ 2 worker 各 1 task、rc=0、聚合 2 集、分片无重叠。
+- **不做**（M2/T2-2）：队列、分池、看门狗、episode-chunk。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -164,17 +178,15 @@
 - **必须按类各跑一个**：CPU-sim 用 LIBERO；GPU-sim 用 RoboTwin/SimplerEnv/ManiSkill 之一。
 - **验收**：能画出 N-吞吐曲线并给出拐点（`03_testing.md` T-02）。
 
-### T1-1 external server 模式 【阶段 1】
+### T1-1 external server 模式 【✅ 已完成】
 
 - **目标**：server 可被多个 orchestrator 共享，且不被误杀。
-- **改动**：`server_manager.py` 加 `server.external_url`（或 `--reuse-server`）：命中则跳过 `start()`，只 `wait_healthz`，并**禁用 `ensure_running` 重启分支**。
-- **验收**：N 个 orchestrator 指向同一 `ws://host:port` 不冲突、不误杀（`03_testing.md` T-03）。
+- **改动**：`config.py` 加 `server.external_url`（→ `external_url`，并从 URL 推 `host`/`port`）；`server_manager.py` 的 `ManagedServer` 在 external 模式下 `start`/`ensure_running`/`stop` 全 no-op。
+- **验收**：✅ E2E 通过（1 共享 server + 1 纯 client orchestrator，server 未被误杀）。见 `03_testing.md` T-03。
 
-### T1-2 纯 client 启动 【依赖 T1-1】
+### T1-2 纯 client 启动 【✅ 已并入 T1-1，无需单独做】
 
-- **目标**：orchestrator 可只当 client。
-- **改动**：`run.py` 5 处 `_run_*_once` 支持不起 server、只连外部 URL。
-- **验收**：同 T1-1。
+- 原计划改 `run.py` 5 处 `_run_*_once`；实际**不需要**——external 逻辑放进 `ManagedServer`，`run.py` **一行未改**。
 
 ### T1-3 N 标定：报告 + agent 决策 + 配置缓存 【依赖 T0-1 + T1-1】
 
@@ -188,16 +200,23 @@
 - **方法**：同一 GPU-sim benchmark 分别跑同卡/异卡两种放置，比 wall-clock、`t_infer`（含抖动）、显存峰值（`03_testing.md` T-07）。
 - **验收**：给出推荐配置；若同卡显著拉长 `t_infer` → 改异卡，并回填 §4.4 与风险栏。
 
+### T1-5 最小 coordinator（一行命令）【✅ 已完成】
+
+- **目标**：**一条命令**起 1 server + N worker、跑完并聚合，**不再手起 server**。
+- **改动**：新增 `orchestrator/coordinator.py`（起 server → 按 task 轮询切 N 片 → 起 N 个 worker 子进程，每个 = `orchestrator.run --config <shard.json>` 带 `external_url` → 聚合）；`run.py` 加"**编排型 config（有 `coordinator:`）→ 分发到 coordinator**"。
+- **不做**（留 M2/T2-2）：队列、按 ckpt 分片、按资源分池、看门狗、episode-chunk 抢占。
+- **验收**：✅ 一条命令 `orchestrator.run --config run.yaml` 跑通 1 server + 2 worker（各 1 task、rc=0、聚合 2 集、分片无重叠）。见 `03_testing.md` T-03。
+
 ### T2-1 shard/worker 契约 【阶段 2】
 
 - **目标**：统一 5 个非统一 runner 的入口。
 - **改动**：新增薄 adapter 层（`libero.run_batch` vs 其余 `run_evaluation` 等差异在此吸收）；入参 `(shard, server_url, output_path)`，出参 `results.jsonl` 带 `(suite,task,episode)` key，支持 resume。
 - **验收**：任选两个 family 能走同一契约跑通（`03_testing.md` T-04）。
 
-### T2-2 动态队列 + coordinator 【依赖 T2-1】
+### T2-2 coordinator 动态化 【依赖 T2-1】
 
-- **目标**：抹平长尾，卡不空转。
-- **改动**：新增 coordinator；`work/{pending,running,done}/` 原子 `os.rename` 抢占；按 ckpt 分片、按资源分池；worker 死则回收 `running/`。
+- **目标**：把 **T1-5 的最小 coordinator** 升级为动态调度（抹平长尾，卡不空转）。
+- **改动**：`coordinator.py` 加 `work/{pending,running,done}/` 原子 `os.rename` 抢占；按 ckpt 分片、按资源分池；worker 死则回收 `running/`。
 - **粒度**：**episode-chunk 级**（不是 task 级）。
 - **验收**：全量 wall-clock 落进目标区间（`03_testing.md` T-05）。
 

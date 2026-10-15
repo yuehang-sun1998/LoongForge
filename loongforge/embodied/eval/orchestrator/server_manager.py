@@ -15,12 +15,19 @@ from urllib.request import urlopen
 
 
 class ManagedServer:
-    """Provide ManagedServer behavior."""
+    """Provide ManagedServer behavior.
+
+    In *external* mode (``server.external_url`` set) the orchestrator does not own
+    a server: it connects to a shared, already-running one. So start/ensure/stop
+    become no-ops -- in particular ``ensure_running`` must NOT restart, otherwise a
+    health blip on one sim would kill the server the other sims are using.
+    """
 
     def __init__(self, args: argparse.Namespace) -> None:
         """Run __init__."""
         self.args = args
         self.process: subprocess.Popen | None = None
+        self.external = bool(getattr(args, "external_url", ""))
 
     @property
     def health_url(self) -> str:
@@ -29,11 +36,15 @@ class ManagedServer:
 
     def start(self) -> None:
         """Run start."""
+        if self.external:
+            return
         self.process = start_server(self.args)
         wait_healthz(self.health_url, self.args.server_start_timeout_sec, self.process)
 
     def ensure_running(self) -> None:
         """Run ensure_running."""
+        if self.external:
+            return
         if self.process is None or self.process.poll() is not None:
             self.stop()
             self.start()
@@ -49,7 +60,7 @@ class ManagedServer:
 
     def stop(self) -> None:
         """Run stop."""
-        if self.process is None:
+        if self.external or self.process is None:
             return
         if self.process.poll() is None:
             try:
@@ -170,6 +181,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--health-port", type=int, default=10094)
     parser.add_argument("--server-start-timeout-sec", type=float, default=180.0)
+    parser.add_argument(
+        "--external-url",
+        default="",
+        help="ws://host:port of a shared policy server; when set, do not start one",
+    )
     parser.add_argument(
         "--server-log",
         default="/workspace/LoongForge-VLA/loongforge/embodied/eval/reports/manual/policy_server.log",

@@ -138,6 +138,8 @@ T_wall = max( 仿真总时间 / 仿真并行度 , 推理总时间 / GPU 吞吐 )
 
 ### 4.3 队列与抢占（动态任务下发）
 
+> **分两步落地**：**最小版**（起 server + 起 N worker + 聚合，**M1/T1-5 ✅ 已实现**）→ **动态版**（队列 / 分池 / 看门狗 / episode-chunk，**M2/T2-2**）。下面描述的是**目标形态（M2）**；最小版只做"一行命令"（`coordinator.py` + config 里 `coordinator: {n_workers: N}`）。
+
 **工作单元**：`unit = (ckpt, benchmark, suite, task_id, episode_range)`，例 `libero_10__task3__eps0-9`。粒度取 **episode-chunk（~10 集）**——task 级太粗（libero_10 单集 60s 长尾会失衡），单集级太碎（协调开销 + resume 粒度太细）。
 
 **组件与数据流**：
@@ -240,11 +242,15 @@ worker                    work/                       server/sim            结�
 
 ## 5. 关键接口
 
-### 5.1 server 侧：external 模式（阶段 1）
+### 5.1 server 侧：external 模式（阶段 1）【✅ 已实现】
 
-改动点：
-- `server_manager.py`：新增 `ManagedServer` 的 **external 模式**——命中 `server.external_url`（或 `--reuse-server`）时跳过 `start()`，只做 `wait_healthz`，并**禁用 `ensure_running` 的重启分支**（否则会误杀共享 server）。
-- `run.py`：5 处 `_run_*_once` 支持"纯 client"启动——不起 server，指向给定 `ws://host:port`。
+**配置**：`server.external_url: ws://host:port`（命中即 external 模式）。
+
+**改动**（比原计划更小——**`run.py` 不用动**）：
+
+- `config.py`：`server.external_url` → `external_url`，并在 `apply_config` 里**从 URL 推出 `host`/`port`**（client 连接用）。
+- `server_manager.py`：`ManagedServer` 在 external 模式下 `start()` / `ensure_running()` / `stop()` **全部 no-op**——不起、不重启、不杀共享 server。因 `run.py` 只是 `ManagedServer(...).start()`，**编排层无需改动**。
+- 单测：`unit_tests/test_server_manager_external.py`；E2E：起 1 个 server + 用真 orchestrator（带 `external_url`）跑 shard。
 
 **安全前提（server 从"自起自销"变"共享长驻"后必须显式化）**：`PolicyServer` 默认 `host="0.0.0.0"`（`transport/rpc_server.py:26`，`servers/loongforge_server.py:110` 未传 host）、`max_size=None`（`:46`）、**无认证**。改造后应收紧：
 
@@ -466,12 +472,12 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 ### 7.2 阶段 1：1 server ↔ N sim（唯一有量级收益的一步）
 
 - 前置阻塞：`server_manager.py:30-48` 的 server 托管逻辑（§5.1）。
-- 交付：external server 模式 + 纯 client 启动 + N 标定（§6）。
-- 预期：把 GPU 从关键路径摘掉。**注意**：§7.1 的"5.5×/29min"是**理想装箱下界**，静态映射达不到，需阶段 1+2 共同兑现。
+- 交付：external server 模式（✅ 已实现）+ **最小 coordinator（一行命令起 1 server + N worker，T1-5）** + N 标定（§6）。
+- 预期：把**绑定资源**从关键路径摘掉。**注意**：§7.1 的"5.5×/29min"是**理想装箱下界**（且假设 GPU 是 max），静态映射达不到，需阶段 1+2 共同兑现。
 
-### 7.3 阶段 2：动态任务分配（抹平长尾）
+### 7.3 阶段 2：动态任务分配（把最小 coordinator 动态化）
 
-- 交付：§5.3 的 shard 契约 + §4.3 的队列 + 按 ckpt 分片 / 按资源分池。
+- 交付：§5.3 的 shard 契约 + §4.3 的**动态队列**（按 ckpt 分片 / 按资源分池 / 看门狗 / episode-chunk 粒度）。
 - 解决：套件/分片间时长不均（spatial 9703s vs goal 3005s）导致的卡空转。
 
 ### 7.4 阶段 3：Batch inference（**排在 M1/M2 之后**）

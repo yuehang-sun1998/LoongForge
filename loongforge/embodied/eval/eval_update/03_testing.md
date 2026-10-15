@@ -41,7 +41,7 @@
 |---|---|---|---|---|
 | T-01 | server 侧插桩 + vanilla 1:1 标定 | 0 | CPU-sim（LIBERO） | ✅ 通过 |
 | T-02 | N 扫描 → 标定报告 + 并行配置 | 0/1 | CPU-sim + GPU-sim 各一 | 🔄 CPU-sim ✅（含报告+决策）；GPU-sim 待做 |
-| T-03 | external server + 纯 client 启动 | 1 | CPU-sim | ⬜ 待执行 |
+| T-03 | 一行命令起 1+N（external + 最小 coordinator） | 1 | CPU-sim | ✅ 通过（N=1 两步 / N=2 一条命令） |
 | T-04 | shard/worker 契约 | 2 | 至少两个 family | ⬜ 待执行 |
 | T-05 | 动态队列 + 全量 wall-clock | 2 | 全 benchmark | ⬜ 待执行 |
 | T-06 | 数值一致性（batch>1 vs batch=1） | 3（暂缓） | 任一 | ⏸ 暂缓 |
@@ -117,18 +117,20 @@
   - ⚠️ 用**手动探针**（T1-1 未实现），非正式流程；**GPU-sim 一路未测**。
   - 产物：`report.json` / `report.md` / `env.json` + `parallel_config.yaml` + `validation.json`（在探针目录 `calibration_report/`）。
 
-### T-03 · external server + 纯 client 启动
+### T-03 · 一行命令起 1+N（external server + 最小 coordinator）
 
-- **对应功能**：T1-1 / T1-2。
-- **目的**：验证多 orchestrator 共享一个 server 且不误杀。
-- **前置**：T1-1、T1-2 已实现。
+- **对应功能**：T1-1 / T1-2（已实现）+ **T1-5 最小 coordinator（待做）**。
+- **目的**：验证"**一条命令**起 1 server + N worker 跑完并聚合"，且 server 不被误杀。
+- **前置**：T1-1 已实现；T1-5 落地后走一条命令，否则先用两步（手起 server + 起 client）替代。
 - **步骤**：
-  1. 起 1 个长驻 server（占 1 卡）。
-  2. 起 N 个纯 client orchestrator，指向同一 `ws://host:port`，各分不同 shard。
-  3. 观察：有无端口冲突 / server 被误杀 / 结果错乱。
-- **通过标准**：N 个 client 全部跑完；server 全程存活；结果按 `(suite,task,episode)` 无重复无缺失。
-- **数据**：_待填_
-- **结论**：_待填_
+  1. （T1-5 前）起 1 个长驻 server + N 个纯 client orchestrator（config 带 `server.external_url`），各分不同 shard；
+     （T1-5 后）`orchestrator.run --config run.yaml` **一条命令**。
+  2. 观察：有无端口冲突 / server 被误杀 / 结果错乱。
+- **通过标准**：N 个 worker 全部跑完并聚合；**server 全程存活**（未被误杀）；结果按 `(suite,task,episode)` 无重复无缺失。
+- **数据**（2026-10-12）：
+  - **两步手动（N=1）**：起 1 共享 server（pid 661773）+ 1 纯 client orchestrator → `rc=0`、wall 40.9s；server 跑完仍存活。
+  - **一条命令（T1-5，N=2）**：`orchestrator.run --config coord_smoke.yaml` → 1 server + 2 worker，各 1 task、`rc=[0,0]`、**聚合 2 集**、**分片无重叠**（worker_0→task0 / worker_1→task1）。
+- **结论**：✅ **两版都通过**。external 模式生效（不误杀共享 server）；**最小 coordinator 让"一条命令"落地**（自动起 server + 分片 + 起 worker + 聚合）。**注**：N>1 的**动态**调度/长尾抹平待 M2。
 
 ### T-04 · shard/worker 契约
 
