@@ -31,12 +31,14 @@ def build_report(
     env: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Attach derived fields (server busy fraction) and assemble the report dict."""
-    mean_ms = float(service_time.get("mean") or 0.0)
+    default_ms = float(service_time.get("mean") or 0.0)
     rows: List[Dict[str, Any]] = []
     for record in sweep:
         row = dict(record)
         requests = row.get("requests")
         wall = row.get("wall_sec") or 0.0
+        # prefer the row's own measured service time (each N has its own timing.json)
+        mean_ms = float(row.get("service_mean_ms") or default_ms)
         row["server_busy_frac"] = (
             round(requests * mean_ms / 1000.0 / wall, 3) if requests and wall else None
         )

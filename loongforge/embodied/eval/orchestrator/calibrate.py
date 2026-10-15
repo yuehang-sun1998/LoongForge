@@ -66,6 +66,7 @@ def _sweep_rows(ns: Sequence[int], root: Path) -> List[Dict[str, Any]]:
             "workers": result.get("n_workers"),
             "wall_sec": elapsed,
             "episodes": episodes,
+            "requests": requests,
             "throughput_ep_per_min": round(episodes / elapsed * 60, 2) if (episodes and elapsed) else None,
             "server_busy_frac": busy,
             "service_mean_ms": round(mean_ms, 1) if mean_ms else None,
