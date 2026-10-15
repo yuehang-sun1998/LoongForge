@@ -39,6 +39,7 @@ from loongforge.embodied.eval.orchestrator.server_manager import (
 
 PORT_STRIDE = 20
 UNITS_PER_SLOT = 4  # shards per worker slot: slack so fast slots can steal work
+DEFAULT_MAX_RETRIES = 2  # episode-level infra retries (episode_error / timeouts) per unit
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
 
@@ -120,6 +121,10 @@ def _shard_config(config: Dict[str, Any], shard: tuple, external_url: str, outpu
     run_cfg = shard_cfg.setdefault("run", {})
     run_cfg["output_dir"] = output_dir
     run_cfg["timestamped_output"] = False  # deterministic path so the coordinator can aggregate
+    # Retry infra-level episode failures (episode_error / timeouts / server_unreachable) by
+    # default: a transient sim<->server disconnect must not be scored as a model failure.
+    # Model failures (not_successful_within_max_steps) are never retried.
+    run_cfg.setdefault("max_retries", DEFAULT_MAX_RETRIES)
     shard_cfg.setdefault("server", {})["external_url"] = external_url
     return shard_cfg
 
