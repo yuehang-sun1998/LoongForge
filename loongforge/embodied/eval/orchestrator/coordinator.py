@@ -7,7 +7,7 @@ A config is *coordinated* when it carries a ``coordinator:`` section; ``run.py``
 dispatches such configs here. The coordinator:
 
 1. starts one policy server (from the config's ``server:`` section),
-2. splits the benchmark's tasks across N workers,
+2. splits the benchmark into episode-chunk shards (so N can exceed the task count),
 3. launches each worker as an ordinary ``orchestrator.run`` subprocess pointed at
    the shared server via ``server.external_url``, and
 4. waits for all workers, then aggregates their per-worker results.
@@ -34,12 +34,24 @@ from loongforge.embodied.eval.orchestrator.server_manager import (
 )
 
 
-def split_round_robin(items: List[Any], groups: int) -> List[List[Any]]:
-    """Split items into at most ``groups`` round-robin groups (empty ones dropped)."""
-    buckets: List[List[Any]] = [[] for _ in range(max(1, groups))]
-    for index, item in enumerate(items):
-        buckets[index % len(buckets)].append(item)
-    return [bucket for bucket in buckets if bucket]
+def build_shards(tasks: List[int], episodes_per_task: int, n_workers: int) -> List[tuple]:
+    """Split the (task, episode) space into ~``n_workers`` episode-chunk shards.
+
+    Each shard is ``(task_id, episode_offset, episode_count)``. Chunk size is
+    chosen so the shard count is close to ``n_workers``. Sharding at the *episode*
+    level (not the task level) is what lets N exceed the task count -- required
+    once the server needs more concurrent sims than there are tasks.
+    """
+    total = max(1, len(tasks) * max(1, episodes_per_task))
+    chunk = max(1, -(-total // max(1, n_workers)))  # ceil division
+    shards: List[tuple] = []
+    for task in tasks:
+        offset = 0
+        while offset < episodes_per_task:
+            count = min(chunk, episodes_per_task - offset)
+            shards.append((task, offset, count))
+            offset += count
+    return shards
 
 
 def _task_ids(config: Dict[str, Any]) -> List[int]:
@@ -59,16 +71,20 @@ def _task_ids(config: Dict[str, Any]) -> List[int]:
     return list(range(n_tasks))
 
 
-def _shard_config(config: Dict[str, Any], tasks: List[int], external_url: str, output_dir: str) -> Dict[str, Any]:
-    """Build one worker's config: a copy of the base, minus coordinator, plus shard/endpoint."""
-    shard = copy.deepcopy(config)
-    shard.pop("coordinator", None)
-    shard.setdefault("benchmark", {})["task_ids"] = tasks
-    run_cfg = shard.setdefault("run", {})
+def _shard_config(config: Dict[str, Any], shard: tuple, external_url: str, output_dir: str) -> Dict[str, Any]:
+    """Build one worker's config: a copy of the base, minus coordinator, plus this shard."""
+    task_id, episode_offset, episode_count = shard
+    shard_cfg = copy.deepcopy(config)
+    shard_cfg.pop("coordinator", None)
+    benchmark = shard_cfg.setdefault("benchmark", {})
+    benchmark["task_ids"] = [task_id]
+    benchmark["episode_offset"] = episode_offset
+    benchmark["episodes_per_task"] = episode_count
+    run_cfg = shard_cfg.setdefault("run", {})
     run_cfg["output_dir"] = output_dir
     run_cfg["timestamped_output"] = False  # deterministic path so the coordinator can aggregate
-    shard.setdefault("server", {})["external_url"] = external_url
-    return shard
+    shard_cfg.setdefault("server", {})["external_url"] = external_url
+    return shard_cfg
 
 
 def _aggregate(output_dir: Path, n_workers: int) -> Dict[str, Any]:
@@ -111,7 +127,8 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     output_dir = Path(str((config.get("run") or {}).get("output_dir") or "/tmp/vla_eval"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    shards = split_round_robin(_task_ids(config), n_workers)
+    episodes_per_task = int((config.get("benchmark") or {}).get("episodes_per_task") or 1)
+    shards = build_shards(_task_ids(config), episodes_per_task, n_workers)
     proc = start_server(server_args)
     returncodes: List[int] = []
     try:
@@ -122,10 +139,10 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         )
         workers = []
         with tempfile.TemporaryDirectory() as tmp:
-            for index, tasks in enumerate(shards):
-                shard = _shard_config(config, tasks, external_url, str(output_dir / f"worker_{index}"))
+            for index, shard_spec in enumerate(shards):
+                shard_cfg = _shard_config(config, shard_spec, external_url, str(output_dir / f"worker_{index}"))
                 cfg_path = Path(tmp) / f"shard_{index}.json"
-                cfg_path.write_text(json.dumps(shard), encoding="utf-8")
+                cfg_path.write_text(json.dumps(shard_cfg), encoding="utf-8")
                 log = open(output_dir / f"worker_{index}.log", "a", buffering=1)
                 workers.append(
                     subprocess.Popen(

@@ -130,7 +130,10 @@
 - **数据**（2026-10-12）：
   - **两步手动（N=1）**：起 1 共享 server（pid 661773）+ 1 纯 client orchestrator → `rc=0`、wall 40.9s；server 跑完仍存活。
   - **一条命令（T1-5，N=2）**：`orchestrator.run --config coord_smoke.yaml` → 1 server + 2 worker，各 1 task、`rc=[0,0]`、**聚合 2 集**、**分片无重叠**（worker_0→task0 / worker_1→task1）。
-- **结论**：✅ **两版都通过**。external 模式生效（不误杀共享 server）；**最小 coordinator 让"一条命令"落地**（自动起 server + 分片 + 起 worker + 聚合）。**注**：N>1 的**动态**调度/长尾抹平待 M2。
+  - **真任务烟测（N=4）**：`libero_10` task 0-3、官方 `max_steps=700`、每任务 1 集 → 4 worker rc=0、分片无重叠、聚合 **4 集 / 3 成功（0.75）**、`timing` `mean=51.1ms p95=495ms`（量级一致）。
+  - **episode-chunk 分片（T1-6，N=4 > 2 任务）**：2 task × 4 集、`n_workers=4` → **4 分片**（worker_i 各领 `(task, eps[0,1])` / `(task, eps[2,3])`）、**8 集恰好覆盖一次**、聚合 8 集。
+- **结论**：✅ **全部通过**。external 模式生效（不误杀共享 server）；**最小 coordinator 让"一条命令"落地**（自动起 server + 分片 + 起 worker + 聚合）；**episode-chunk 分片使 N 不受任务数限制**。
+- **注**：N>1 的**动态**调度/长尾抹平待 M2。
 
 ### T-04 · shard/worker 契约
 

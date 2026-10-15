@@ -168,6 +168,7 @@ CONFIG_MAPPING = {
     "benchmark.max_tasks": "max_tasks",
     "benchmark.task_ids": "task_ids",
     "benchmark.episodes_per_task": "episodes_per_task",
+    "benchmark.episode_offset": "episode_offset",
     "benchmark.num_steps_wait": "num_steps_wait",
     "benchmark.max_steps": "max_steps",
     "benchmark.continuous_gripper": "continuous_gripper",
