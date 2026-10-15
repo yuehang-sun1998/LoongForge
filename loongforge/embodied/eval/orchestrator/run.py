@@ -299,9 +299,11 @@ def main() -> None:
     args = build_argparser().parse_args()
     config_path = str(pathlib.Path(args.config).resolve())
     config = load_config(config_path)
-    # A config with a ``coordinator:`` section is a 1 server : N worker run --
-    # one command starts the server, the workers, and the aggregation.
-    if config.get("coordinator"):
+    # A config carrying ``coordinator`` / ``servers`` / ``pools`` is a multi-server
+    # run -- one command starts the servers, the workers, and the aggregation.
+    # Test key presence, not truthiness: ``coordinator: {}`` (placement taken from
+    # ``servers``/``pools``) is a valid coordinated config.
+    if any(key in config for key in ("coordinator", "servers", "pools")):
         from loongforge.embodied.eval.orchestrator.coordinator import run as run_coordinated
 
         print(json.dumps(run_coordinated(config, config_path), ensure_ascii=False, indent=2, default=str))

@@ -159,11 +159,13 @@ def apply_runtime_env(args: argparse.Namespace, env: dict[str, str]) -> None:
         env["LIBERO_CONFIG_PATH"] = args.libero_config_path
 
 
-def start_server(args: argparse.Namespace) -> subprocess.Popen:
+def start_server(args: argparse.Namespace, env_overrides: dict[str, str] | None = None) -> subprocess.Popen:
     """Run start_server."""
     eval_root = Path(args.eval_root).resolve()
     loongforge_root = Path(args.loongforge_root).resolve() if args.loongforge_root else eval_root.parent
     env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
     env["PYTHONPATH"] = f"{loongforge_root}:{eval_root}:{env.get('PYTHONPATH', '')}"
     apply_runtime_env(args, env)
     ensure_libero_config(args)
