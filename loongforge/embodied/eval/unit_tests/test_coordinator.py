@@ -57,6 +57,15 @@ def test_shard_config_sets_suite_offset_and_count() -> None:
     assert "coordinator" in base  # base not mutated
 
 
+def test_shard_config_defaults_max_retries_but_respects_explicit() -> None:
+    """Coordinated units retry infra episode failures by default; an explicit value wins."""
+    base = {"benchmark": {"suites": ["a"], "episodes_per_task": 2}, "server": {"ckpt_path": "x"}}
+    shard = _shard_config(base, ("a", 0, 0, 2), "ws://h:1", "/tmp/out")
+    assert shard["run"]["max_retries"] == 2
+    explicit = {**base, "run": {"max_retries": 0}}
+    assert _shard_config(explicit, ("a", 0, 0, 2), "ws://h:1", "/tmp/out")["run"]["max_retries"] == 0
+
+
 def test_shard_config_applies_per_suite_overrides() -> None:
     """A per-suite override (e.g. max_steps) wins over the shared benchmark value."""
     base = {
