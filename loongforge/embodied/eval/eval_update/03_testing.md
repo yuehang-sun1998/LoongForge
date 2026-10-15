@@ -94,7 +94,7 @@
 - **目的**：扫出吞吐曲线，**产出标定报告**（`report.json`/`report.md`/`env.json`），供 agent 决策出并行配置（§5.4 schema）。
 - **前置**：T-01 完成；external server 模式（T1-1）可用。
 - **步骤**：
-  1. 扫 `N ∈ {1, 2, 4, 8, 16}`（**N=1 即 T-01 那次**，复用不重跑；或按 §`01_architecture.md` §6.2 的 `N_min` 取附近点）。**要扫到吞吐出平台**为止。**不同 N 并行到不同卡**（每 N 一个 server），别串行。
+  1. 扫 `N ∈ {1, 2, 4, 8, 16, 32}`（**N=1 即 T-01 那次**，复用不重跑）。**要扫到吞吐出平台**为止。**不同 N 并行到不同卡**（每 N 一个 server），别串行。**正式入口**：`orchestrator/calibrate.py --config run.yaml --n 1,2,4,8,16,32`（一条命令，含报告 + 兜底 N + 校验/缓存）。
   2. **CPU-sim 与 GPU-sim 各跑一遍**（后者额外测单 sim 显存占用 + 同卡下 `t_infer` 被抬高多少）。
   3. **生成报告**：`orchestrator/calibration_report.py --sweep <sweep.json> --timing <timing.json> --env <env.json> --out <dir>` → 三件套；→ agent 决策 → **校验 + 缓存**：`orchestrator/calibration_config.py`（`validate_parallel_config` 做 `N ≤ 核数/每sim核数`、显存、`timeout ≥ N×服务时间×safety` 边界检查；`save_calibration` 缓存 `(model, benchmark, gpu)`）。
 - **通过标准**：产出报告三件套；agent 决策出**合法**配置（过校验）；`N*` 达到 ≥95% 平台吞吐；**无 sim 因等待超时失败**（排队等待 ≈ `(N-1)×t_infer`，客户端 `--policy-call-timeout-ms` 默认 5000，须按 N 放宽）。
