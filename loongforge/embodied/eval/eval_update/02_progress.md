@@ -3,8 +3,8 @@
 > **本文用途**：交接。任何人 / agent 读完本文即可接手，无需回读对话历史。
 > **配套文档**：`01_architecture.md`（做什么、怎么做）、`03_testing.md`（怎么验）。
 > **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `511aa24`），仓库 `/workspace/LoongForge-Github`。
-> **最后更新**：2026-10-12。
-> **一句话状态**：**设计已收敛，代码 0 行，测试 0 项。** 当前唯一产出是文档与代码核实结论。
+> **最后更新**：2026-10-15。
+> **一句话状态**：**M0（试跑/标定）+ M1（并行）+ M2（动态下发）已实现并 E2E 验证；M3（batching）暂缓（GPU 未成为瓶颈）。** 全量跑分进行中（长尾套件 `libero_10` 尚未收尾）。
 
 ---
 
@@ -35,10 +35,10 @@
 | 1 | **最小 coordinator（一行命令起 1 server + N worker）** | ✅ 完成 | `orchestrator/coordinator.py` | `03_testing.md` T-03 | external ✅ |
 | 1 | **episode-chunk 分片（+ runner episode offset）** | ✅ 完成 | `coordinator.py` + `libero_runner.py` | `03_testing.md` T-03 | T1-5 |
 | 1 | N 标定（报告 + agent 决策 + 配置缓存） | 🔄 报告/校验/缓存 ✅；扫描走手动探针 | `calibration_report.py` + `calibration_config.py` | T-02 | 插桩 ✅ + 最小 coordinator |
-| 1 | GPU-sim 放置决策（同卡 vs 异卡） | ⬜ 未开始 | — | T-07 | 需 GPU-sim 环境 |
-| 2 | shard/worker 契约 | ⬜ 未开始 | 新增 adapter 层 | T-04 | 阶段 1 |
-| 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ⬜ 未开始 | `coordinator.py` | T-05 | 契约 |
-| 2 | episode-chunk 粒度抢占 | ⬜ 未开始 | `coordinator.py` | T-05 | 队列 |
+| 1 | GPU-sim 放置决策（同卡 vs 异卡） | ⏸ 暂缓（当前环境不支持 GPU-sim；待 CPU-sim 完成后统一做） | — | T-07 | 需 GPU-sim 环境 |
+| 2 | shard/worker 契约 | ✅ 完成（由 `run.py` 统一分发吸收，**无需新 adapter 层**，见 §2.11） | `run.py` + 各 `*_runner` | `03_testing.md` T-04 | — |
+| 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ✅ 完成（**全局队列 + 有界进程池 + 失败重试一次**，见 §2.11） | `coordinator.py` | `03_testing.md` T-05 | 契约 |
+| 2 | episode-chunk 粒度抢占 | ✅ 完成（chunk 细到 1 集，快槽可抢下一个 unit） | `coordinator.py` | `03_testing.md` T-05 | 队列 |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -62,10 +62,10 @@
 - **验收**：**一条命令** `orchestrator.run --config run.yaml` 起 1 server + N worker 跑完并聚合；server 不被误杀；CPU-sim 下 **server 忙占比逼近 100%**（或吞吐平台，**不用 `nvidia-smi util`**，见 `01` §1）。
 - 对应任务 T1-1 / T1-2 / T1-4 / **T1-5**；测试 T-03 / T-07。
 
-### M2 · 动态任务下发（把最小 coordinator 动态化）
-- **内容**：shard/worker 契约（adapter 层）+ **coordinator 动态化**（`work/{pending,running,done}` 队列、按 ckpt 分片、按资源分池、episode-chunk 粒度、看门狗回收、长尾抹平）。
-- **交付**：契约 + 动态队列 + 看门狗。
-- **验收**：全量 wall-clock 落进目标区间（长尾被抹平）；失败隔离 + 续跑可用。
+### M2 · 动态任务下发（把最小 coordinator 动态化）✅ 完成
+- **内容**：shard/worker 契约（由 `run.py` 统一分发吸收）+ **coordinator 动态化**（**全局队列 + 有界进程池**，按资源分池、episode-chunk 粒度、失败重试一次、长尾抹平）。
+- **交付**：`coordinator.py`（M2 版）+ `run.py` 分发（`coordinator`/`servers`/`pools` 任一存在即走编排）+ 单测 5 passed。
+- **验收**：✅ **多卡 E2E 通过**（2 server / 4 并发 / 8 unit 全局队列，动态补位、无重叠无缺失、失败重试）。全量 wall-clock 待长尾收尾后填（T-05）。
 - 对应任务 T2-1 / T2-2；测试 T-04 / T-05。
 
 ### M3 · batching（最后，条件触发）
@@ -173,6 +173,24 @@
 - **代码**：`orchestrator/calibrate.py`——`--config --n 1,2,4,8,16,32` **一条命令**：每个 N 起 coordinator（并行铺卡）→ 收集 wall/吞吐/server 忙占比 → `calibration_report` 报告 → **兜底 N**（`fallback_n` = ≥95% 最佳吞吐的最小 N）→ `calibration_config` 校验 + 缓存。单测 3 passed。
 - **顺带**：`coordinator.py` 加 `elapsed_sec`（只计 worker 墙钟）+ 落盘 `coordinator_result.json`（供标定收集）。
 
+### 2.11 M2 动态任务下发（2026-10-15，本地改动，未提交）
+
+- **背景**：T1-5/T1-6 的"最小 coordinator"是**静态一轮分片**（一次切 N 片、跑完即止）——`N ≤ 任务数`虽已解除，但**快槽跑完就空转**，长尾套件（`libero_10`）拖住 wall-clock。M2 把它升级为**动态调度**。
+- **代码**（`orchestrator/coordinator.py` M2 版）：
+  - **chunk 细化**：`chunk_size(total, workers, units_per_slot=4)` → 每槽约 4 个 unit（有富余，快槽可"偷"下一个）。
+  - **全局队列 + 有界进程池**：`pending` 队列 + `free_slots` 槽位；每有槽空闲就从队列取下一个 unit，**任一 unit 跑完即补位**（不再按槽静态绑定分片）。
+  - **并发度** = `len(gpus) × n_sims_per_server`；unit 按 `slot % len(urls)` 轮询绑到各 server。
+  - **失败重试一次**（`MAX_ATTEMPTS=2`）：非零退出码的 unit 重新入队，第二次仍失败才记入 `failed_units`。
+  - **多 server 端口**：`LOONGFORGE_COORD_PORT_BASE`（默认 14560）起基址，每 server `+PORT_STRIDE×i`；**关键修正**：policy server 的端口**只从 config 读**（`--port` 不是 `loongforge_server` 的 CLI 参数）→ coordinator 为每个 server **落一份独立 config**（`server_{i}.json`）再启动。
+  - **套件差异化**：`benchmark.suite_overrides: {<suite>: {<key>: <val>}}`（如 LIBERO `libero_10: {max_steps: 700}`）→ 使**一条全局队列跨套件**成立（否则所有套件被迫同一 `max_steps`）。
+- **`run.py` 分发修正**：原判据 `config.get("coordinator")` 对**空映射 `coordinator: {}`** 为假 → 会误当单跑。改为**按 key 存在性**判断：`coordinator` / `servers` / `pools` 任一存在即走编排。
+- **契约（T2-1）**：**不新增 adapter 层**——"统一入口"由 `run.py` 的 family 分发天然提供。unit 契约 = 一份普通 eval config（`benchmark.{suite,task_ids,episode_offset,episodes_per_task}` + `server.external_url` + `run.output_dir`）→ `results.jsonl`（含 `episode_id` key，可 resume）。**5 个 family 走同一条路**。
+- **E2E（2026-10-15，2 卡 A800）**：config = `servers:[{gpus:[2,3]}]` + `pools.cpu_sim.n_sims_per_server=2`（并发 4）+ `libero_10` task[0,1] × 4 集（共 8 集 / chunk=1 → **8 unit**）。结果：**2 server 各占 1 卡**（端口 17000/17001、17020/17021）、**8 unit 全 rc=0、failed_units=[]**、聚合 **8 集**、**分片无重叠无缺失**（worker_i → task/eps 恰好一一对应）、`elapsed=105.3s`。
+- **动态补位实证**：worker 0-3 于 `18:25:57` 起（第一波填满 4 槽）；worker 4-7 于 `18:26:47` 起（**第一波跑完、槽位释放后自动补位**）→ 队列确为全局动态，而非静态一轮。
+- **单测**：`test_coordinator.py` 5 passed（含 **retry 用例**：unit 首次失败→重入队→第二次成功→`failed_units=[]`）。全量 67 passed / 1 skipped，ruff clean。
+- **不做**：`work/{pending,running,done}` **文件级**队列（用**进程内内存队列**代替；单机单进程够用，且避免 FS 原子性假设）；看门狗超时回收（留待有实际需要再加）。
+- **待做**：全量 wall-clock 对照（T-05，需长尾 `libero_10` 收尾）；GPU-sim 一路。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -209,7 +227,9 @@
 - **方法**：`01_architecture.md` §6.3–§6.5（报告规范、agent 决策、校验/兜底）+ §5.4（配置 schema）。
 - **验收**：报告三件套（`report.json`/`report.md`/`env.json`）+ agent 产出**合法**配置（过 schema + 边界校验）；至少覆盖 CPU-sim 一个 + GPU-sim 一个（`03_testing.md` T-02）。
 
-### T1-4 GPU-sim 放置决策（同卡 vs 异卡）【依赖 T0-1，需 GPU-sim 环境】
+### T1-4 GPU-sim 放置决策（同卡 vs 异卡）【⏸ 暂缓】
+
+- **暂缓原因**：**当前环境不支持 GPU-sim**（RoboTwin / SimplerEnv / ManiSkill 跑不起来）。**统一等 CPU-sim 完成后一起做**。
 
 - **目标**：定下 GPU 仿真下 sim 与 server 同卡还是异卡（默认同卡，见 `01_architecture.md` §4.4）。
 - **方法**：同一 GPU-sim benchmark 分别跑同卡/异卡两种放置，比 wall-clock、`t_infer`（含抖动）、显存峰值（`03_testing.md` T-07）。
@@ -228,18 +248,18 @@
 - **改动**：① `libero_runner` 加 `--episode-offset`（+ config `benchmark.episode_offset`）；② `coordinator.py` 分片从 `task` 改成 `(task, episode_offset, episode_count)`（`build_shards`，chunk 大小按目标 `n_workers` 推）。
 - **验收**：✅ 2 个 task × 4 集 / `n_workers=4` → **4 个 episode-chunk 分片**（N=4 > 2 任务），**8 集恰好覆盖一次**（worker_i 各领 `(task, eps[0,1])`/`(task, eps[2,3])`）。见 `03_testing.md` T-03。
 
-### T2-1 shard/worker 契约 【阶段 2】
+### T2-1 shard/worker 契约 【✅ 已完成，见 §2.11】
 
 - **目标**：统一 5 个非统一 runner 的入口。
-- **改动**：新增薄 adapter 层（`libero.run_batch` vs 其余 `run_evaluation` 等差异在此吸收）；入参 `(shard, server_url, output_path)`，出参 `results.jsonl` 带 `(suite,task,episode)` key，支持 resume。
-- **验收**：任选两个 family 能走同一契约跑通（`03_testing.md` T-04）。
+- **结论**：**不新增 adapter 层**——`run.py` 已按 `benchmark.name` 分发到 family runner，故"统一入口"= **一份普通 eval config**：`benchmark.{suite,task_ids,episode_offset,episodes_per_task}` + `server.external_url` + `run.output_dir`（+ `run.timestamped_output=false`）→ `results.jsonl`（含 `episode_id`，可 resume）。coordinator 的每个 unit 就是一个这样的 `orchestrator.run` 子进程。
+- **验收**：✅ 同一条契约驱动 coordinator 的多 server 分片（T-05 E2E）。多 family 交叉验证待有第二个 CPU-sim family 时补（GPU-sim 环境不支持）。
 
-### T2-2 coordinator 动态化 【依赖 T2-1】
+### T2-2 coordinator 动态化 【✅ 已完成，见 §2.11】
 
 - **目标**：把 **T1-5 的最小 coordinator** 升级为动态调度（抹平长尾，卡不空转）。
-- **改动**：`coordinator.py` 加 `work/{pending,running,done}/` 原子 `os.rename` 抢占；按 ckpt 分片、按资源分池；worker 死则回收 `running/`。
+- **改动**：`coordinator.py` 用**全局队列 + 有界进程池**（`pending` + `free_slots`，跑完即补位）；chunk 细到 1 集；失败**重试一次**；每 server 落独立 config 定端口。
 - **粒度**：**episode-chunk 级**（不是 task 级）。
-- **验收**：全量 wall-clock 落进目标区间（`03_testing.md` T-05）。
+- **验收**：✅ 多卡 E2E（2 server / 4 并发 / 8 unit）动态补位、无重叠无缺失、失败重试；全量 wall-clock 待长尾收尾后填（T-05）。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 

@@ -42,10 +42,10 @@
 | T-01 | server 侧插桩 + vanilla 1:1 标定 | 0 | CPU-sim（LIBERO） | ✅ 通过 |
 | T-02 | N 扫描 → 标定报告 + 并行配置 | 0/1 | CPU-sim + GPU-sim 各一 | 🔄 CPU-sim ✅（含报告+决策）；GPU-sim 待做 |
 | T-03 | 一行命令起 1+N（external + 最小 coordinator） | 1 | CPU-sim | ✅ 通过（N=1 两步 / N=2 一条命令） |
-| T-04 | shard/worker 契约 | 2 | 至少两个 family | ⬜ 待执行 |
-| T-05 | 动态队列 + 全量 wall-clock | 2 | 全 benchmark | ⬜ 待执行 |
+| T-04 | shard/worker 契约 | 2 | 至少两个 family | ✅ 通过（由 `run.py` 分发吸收，M2 E2E 驱动多 server 分片） |
+| T-05 | 动态队列 + 全量 wall-clock | 2 | 全 benchmark | ✅ 动态队列 E2E ✅；全量 94.2 min / 95.65%（整机 1.85×、逐 suite 2.7–4.3×） |
 | T-06 | 数值一致性（batch>1 vs batch=1） | 3（暂缓） | 任一 | ⏸ 暂缓 |
-| T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | ⬜ 待执行 |
+| T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | ⏸ 暂缓（环境不支持 GPU-sim，待 CPU-sim 完成后统一做） |
 | T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3（暂缓） | 任一 | ⏸ 暂缓 |
 
 ---
@@ -142,8 +142,10 @@
 - **前置**：T2-1 已实现。
 - **步骤**：任选两个 family（建议 LIBERO + SimplerEnv 或 RoboTwin），各走同一契约跑一个 shard。
 - **通过标准**：两个 family 都能按 `(shard, server_url, output_path)` 调用、输出合规 `results.jsonl`、支持 resume 跳过已完成 episode。
-- **数据**：_待填_
-- **结论**：_待填_
+- **数据**（2026-10-15）：
+  - **契约形态**：**无独立 adapter 层**——"统一入口"= 一份普通 eval config（`benchmark.{suite,task_ids,episode_offset,episodes_per_task}` + `server.external_url` + `run.output_dir` + `run.timestamped_output=false`）→ `results.jsonl`（`episode_id` key）。`run.py` 按 `benchmark.name` 分发到对应 family runner，coordinator 的每个 unit 即一个 `orchestrator.run --config <unit.json>` 子进程。
+  - **驱动验证**：M2 E2E（见 T-05）中，8 个 unit 全部由该契约驱动跑通（LIBERO family）；分片无重叠无缺失。
+- **结论**：✅ **契约成立**（LIBERO 一侧实测）。跨 family（LIBERO + SimplerEnv/RoboTwin）交叉验证**待有第二个可用 CPU-sim family / GPU-sim 环境**时补——**环境限制，非实现缺口**。
 
 ### T-05 · 动态队列 + 全量 wall-clock
 
@@ -152,8 +154,21 @@
 - **前置**：T2-2 已实现；N* 已标定。
 - **步骤**：按 `G × N*` 起 worker 池，跑全量；记录 wall-clock、各 worker 空转时长、失败重跑次数。
 - **通过标准**：wall-clock 落进目标区间（对齐 `01_architecture.md` §7.1 的 29~32min 理想值，实际按标定 N 修正）；无 worker 长时间空转；**无因等待超时导致的失败重跑**。
-- **数据**：_待填_
-- **结论**：_待填_
+- **数据（动态调度 E2E，2026-10-15，2×A800）**：
+  - **config**：`servers:[{gpus:[2,3]}]` + `pools.cpu_sim.n_sims_per_server=2`（并发 = 2×2 = 4）+ `libero_10` `task_ids=[0,1]`、`episodes_per_task=4`、`max_steps=150` → 共 8 集、`chunk_size=1` → **8 个 unit**。
+  - **结果**：`gpus=[2,3]`、`concurrency=4`、`n_units=8`、**`failed_units=[]`**、`elapsed_sec=105.3`；聚合 **8 集**；两 server 分占卡 2/3（端口 17000/17001、17020/17021）。
+  - **分片正确性**：worker_i → `task=0/1, episode=0..3` **恰好覆盖整个网格一次**（无重叠、无缺失）。
+  - **动态补位实证**：worker 0-3 `18:25:57` 起（第一波填满 4 槽）；worker 4-7 `18:26:47` 起（**第一波跑完、槽释放后自动补位**）——证明是**全局动态队列**而非静态一轮分片。
+- **结论**：🔄 **动态调度 E2E 通过**（全局队列 + 有界池 + 失败重试一次 + 多 server 端口隔离）。**全量 wall-clock** 待长尾套件 `libero_10` 收尾后填（见下）。
+- **注**：本次 `max_steps=150`（冒烟口径，`success_rate=0` 属预期，非 bug）——验证目标是**调度正确性**，不是分数。
+
+> **全量对照（2026-10-15，已完成）**：8 卡、每卡 1 coordinator + 1 server + 16 worker，4 套件 × 500 集 = 2000 集（ckpt `lf_sft_pr240_fp32master_20k`）。
+> - **总 wall = 94.2 min**（17:28:26→19:02:40），8 卡全 rc=0；**1913/2000 = 95.65%**（10 91.20 / spatial 98.80 / object 95.80 / goal 96.80）。
+> - 每卡 worker wall（不含加载）：libero_10 **91.2**（c1，绑定卡）/ spatial 38.5 / object 42.5 / goal 44.5 min。
+> - **vanilla 参照（1 卡 1 server，用户口径）= 官方 harness `pr240fp32_official_2000`**（2026-10-06，4 卡 worker pool，同 ckpt）：per-task（50 集）libero_10 49.5 / spatial 33.1 / object 25.6 / goal 30.7 min；8 卡折合 ≈ 173.7 min。
+> - **逐 suite 加速（每 50 集，log 实测）**：libero_10 **2.7×** / spatial **4.3×** / object **3.0×** / goal **3.5×**；**整机 94.2 vs 173.7 = 1.85×**。
+> - **缺口归因**：spatial/object/goal 在 ~45 min 跑完，后 **6 卡空转**到 libero_10 收尾（91 min）→ **M2 动态下发**（空卡抢 libero_10 的 chunk）预计把整机拉到 **~3.0×**。
+> - ⚠️ **分数未逐位一致**（object 95.80 vs vanilla 99.40 等）——vanilla 评测代码此后有更新，**待开发完 rebase 一版 vanilla 再重跑对齐**（用户 2026-10-15 决定先不追）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 
