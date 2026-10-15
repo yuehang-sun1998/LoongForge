@@ -11,6 +11,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from loongforge.embodied.eval.payload_builders import PayloadBuilder, build_payload_builder
 
@@ -154,6 +155,7 @@ CONFIG_MAPPING = {
     "server.kill_after_healthcheck": "kill_server_after_healthcheck",
     "server.stop_after_healthcheck": "stop_server_after_healthcheck",
     "server.python": "server_python",
+    "server.external_url": "external_url",
     "env.eval_root": "eval_root",
     "env.loongforge_root": "loongforge_root",
     "env.dataset_statistics_path": "dataset_statistics_path",
@@ -213,12 +215,25 @@ CONFIG_MAPPING = {
 }
 
 
+def parse_external_url(url: str) -> tuple[str, int]:
+    """Parse ``ws://host:port`` (or ``host:port``) into ``(host, port)``."""
+    parsed = urlparse(url if "://" in url else f"ws://{url}")
+    if not parsed.hostname or not parsed.port:
+        raise ValueError(f"external_url must be host:port or scheme://host:port, got {url!r}")
+    return parsed.hostname, int(parsed.port)
+
+
 def apply_config(args: Any, config: Dict[str, Any]) -> Any:
     """Run apply_config."""
     for source, target in CONFIG_MAPPING.items():
         value = _get_nested(config, source)
         if value is not None:
             setattr(args, target, value)
+    # External-server mode: the client connects to a shared server, so host/port
+    # are derived from external_url rather than from the (unused) local server.
+    external_url = getattr(args, "external_url", "")
+    if external_url:
+        args.host, args.port = parse_external_url(external_url)
     return args
 
 

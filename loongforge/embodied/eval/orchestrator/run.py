@@ -299,6 +299,13 @@ def main() -> None:
     args = build_argparser().parse_args()
     config_path = str(pathlib.Path(args.config).resolve())
     config = load_config(config_path)
+    # A config with a ``coordinator:`` section is a 1 server : N worker run --
+    # one command starts the server, the workers, and the aggregation.
+    if config.get("coordinator"):
+        from loongforge.embodied.eval.orchestrator.coordinator import run as run_coordinated
+
+        print(json.dumps(run_coordinated(config, config_path), ensure_ascii=False, indent=2, default=str))
+        return
     results = []
     for sweep_config in expand_sweep(config):
         effective = _timestamped_run_config(sweep_config)
