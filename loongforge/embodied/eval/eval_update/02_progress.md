@@ -32,6 +32,7 @@
 | 0 | 配置校验 + 缓存 | ✅ 完成 | `orchestrator/calibration_config.py` | 单测 7 passed | — |
 | 1 | external server 模式（+ 纯 client） | ✅ 完成 | `server_manager.py` + `config.py` | `03_testing.md` T-03 | — |
 | 1 | **最小 coordinator（一行命令起 1 server + N worker）** | ✅ 完成 | `orchestrator/coordinator.py` | `03_testing.md` T-03 | external ✅ |
+| 1 | **episode-chunk 分片（+ runner episode offset）** | ✅ 完成 | `coordinator.py` + `libero_runner.py` | `03_testing.md` T-03 | T1-5 |
 | 1 | N 标定（报告 + agent 决策 + 配置缓存） | 🔄 报告/校验/缓存 ✅；扫描走手动探针 | `calibration_report.py` + `calibration_config.py` | T-02 | 插桩 ✅ + 最小 coordinator |
 | 1 | GPU-sim 放置决策（同卡 vs 异卡） | ⬜ 未开始 | — | T-07 | 需 GPU-sim 环境 |
 | 2 | shard/worker 契约 | ⬜ 未开始 | 新增 adapter 层 | T-04 | 阶段 1 |
@@ -151,12 +152,19 @@
 - **E2E 验证**：✅ 起 1 共享 server + 1 纯 client orchestrator（`external_url`）→ `rc=0`、共享 server **未被误杀**（`alive after run: True`）。见 `03_testing.md` T-03。
 - **待做**：N>1 多 client 并发（M2）；coordinator（起 server + 起 worker 池）。
 
-### 2.8 T1-5 最小 coordinator（2026-10-12）
+### 2.8 T1-5 最小 coordinator（2026-10-12，已提交 `19f6ac7`）
 
-- **代码**：`orchestrator/coordinator.py`（`split_round_robin` / `_shard_config` / `run`）+ `run.py` 分发（config 有 `coordinator:` → coordinator）+ 单测 `test_coordinator.py`（3 passed）。**未提交**。
+- **代码**：`orchestrator/coordinator.py`（`split_round_robin` / `_shard_config` / `run`）+ `run.py` 分发（config 有 `coordinator:` → coordinator）+ 单测 `test_coordinator.py`（3 passed）。
 - **用法**：config 加 `coordinator: {n_workers: N}`；`orchestrator.run --config run.yaml` **一条命令**。
 - **E2E**：✅ 2 worker 各 1 task、rc=0、聚合 2 集、分片无重叠。
-- **不做**（M2/T2-2）：队列、分池、看门狗、episode-chunk。
+- **真任务烟测**（✅ 2026-10-12）：`libero_10` task 0-3、官方 `max_steps=700`、每任务 1 集、`n_workers=4` → 一条命令跑通：4 worker rc=0、**分片无重叠**（worker_i→task i）、聚合 **4 集 / 3 成功（0.75）**、`timing` `mean=51.1ms p95=495ms`（与既有量级一致）。
+- 🔴 **发现的分片上限**（已在 T1-6 解决）：最小 coordinator 原按 task 分片 → `N ≤ 任务数`。见 **T1-6**。
+- **不做**（M2/T2-2）：队列、分池、看门狗。
+
+### 2.9 T1-6 episode-chunk 分片（2026-10-12）
+
+- **代码**：`libero_runner` `--episode-offset` + config `benchmark.episode_offset`；`coordinator.build_shards`（episode-chunk 级）+ 单测更新（4 passed）。**未提交**。
+- **E2E**：✅ 2 task × 4 集 / `n_workers=4` → 4 分片、8 集恰好覆盖一次。
 
 ---
 
@@ -206,6 +214,12 @@
 - **改动**：新增 `orchestrator/coordinator.py`（起 server → 按 task 轮询切 N 片 → 起 N 个 worker 子进程，每个 = `orchestrator.run --config <shard.json>` 带 `external_url` → 聚合）；`run.py` 加"**编排型 config（有 `coordinator:`）→ 分发到 coordinator**"。
 - **不做**（留 M2/T2-2）：队列、按 ckpt 分片、按资源分池、看门狗、episode-chunk 抢占。
 - **验收**：✅ 一条命令 `orchestrator.run --config run.yaml` 跑通 1 server + 2 worker（各 1 task、rc=0、聚合 2 集、分片无重叠）。见 `03_testing.md` T-03。
+
+### T1-6 episode-chunk 分片（+ runner episode offset）【✅ 已完成】
+
+- **目标**：分片细到 **episode-chunk**，使 `N` **不再受"任务数"限制**——全量每 server 需 N≈16，而 libero_10 只有 10 个 task。
+- **改动**：① `libero_runner` 加 `--episode-offset`（+ config `benchmark.episode_offset`）；② `coordinator.py` 分片从 `task` 改成 `(task, episode_offset, episode_count)`（`build_shards`，chunk 大小按目标 `n_workers` 推）。
+- **验收**：✅ 2 个 task × 4 集 / `n_workers=4` → **4 个 episode-chunk 分片**（N=4 > 2 任务），**8 集恰好覆盖一次**（worker_i 各领 `(task, eps[0,1])`/`(task, eps[2,3])`）。见 `03_testing.md` T-03。
 
 ### T2-1 shard/worker 契约 【阶段 2】
 

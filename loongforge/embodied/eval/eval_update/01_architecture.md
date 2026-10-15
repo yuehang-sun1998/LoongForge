@@ -139,6 +139,7 @@ T_wall = max( 仿真总时间 / 仿真并行度 , 推理总时间 / GPU 吞吐 )
 ### 4.3 队列与抢占（动态任务下发）
 
 > **分两步落地**：**最小版**（起 server + 起 N worker + 聚合，**M1/T1-5 ✅ 已实现**）→ **动态版**（队列 / 分池 / 看门狗 / episode-chunk，**M2/T2-2**）。下面描述的是**目标形态（M2）**；最小版只做"一行命令"（`coordinator.py` + config 里 `coordinator: {n_workers: N}`）。
+> ⚠️ **最小版分片**：原按 task 分片 → `N ≤ 任务数`（libero_10 只有 10）。**已由 T1-6 解决**：`build_shards` 改成 **episode-chunk 级**（`(task, episode_offset, count)`，+ runner `--episode-offset`），`N` 不再受任务数限制。
 
 **工作单元**：`unit = (ckpt, benchmark, suite, task_id, episode_range)`，例 `libero_10__task3__eps0-9`。粒度取 **episode-chunk（~10 集）**——task 级太粗（libero_10 单集 60s 长尾会失衡），单集级太碎（协调开销 + resume 粒度太细）。
 

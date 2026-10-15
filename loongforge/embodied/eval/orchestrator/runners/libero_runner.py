@@ -571,9 +571,10 @@ def run_batch(args: argparse.Namespace) -> Dict[str, Any]:
         for task_id in selected_task_ids:
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
-            n_episodes = min(args.episodes_per_task, len(initial_states))
+            start = max(0, int(getattr(args, "episode_offset", 0) or 0))
+            n_episodes = min(args.episodes_per_task, len(initial_states) - start)
             expected_counts[task_id] = n_episodes
-            for episode_idx in range(n_episodes):
+            for episode_idx in range(start, start + n_episodes):
                 key = ("libero", args.task_suite_name, task_id, episode_idx)
                 if key in completed:
                     continue
@@ -683,6 +684,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--task-suite-name", default="libero_goal")
     parser.add_argument("--max-tasks", type=int, default=1, help="<=0 means all tasks in suite")
     parser.add_argument("--episodes-per-task", type=int, default=1)
+    parser.add_argument("--episode-offset", type=int, default=0, help="first episode index within each task")
     parser.add_argument("--num-steps-wait", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=-1, help="<=0 means suite default")
     parser.add_argument("--seed", type=int, default=7)
