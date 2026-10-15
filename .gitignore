@@ -103,3 +103,8 @@ nsight_*/
 
 # Local AI coding assistant rules
 /.comate/
+
+# Machine-specific configs / launch scripts that carry internal paths.
+# Keep the sanitized (placeholder) version tracked; the *.internal.* copy stays local.
+*.internal.yaml
+*.internal.sh
