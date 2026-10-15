@@ -4,7 +4,7 @@
 > **配套文档**：`01_architecture.md`（做什么、怎么做）、`03_testing.md`（怎么验）。
 > **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `511aa24`），仓库 `/workspace/LoongForge-Github`。
 > **最后更新**：2026-10-15。
-> **一句话状态**：**M0（试跑/标定）+ M1（并行）+ M2（动态下发）已实现并 E2E 验证；M3（batching）暂缓（GPU 未成为瓶颈）。** 全量跑分进行中（长尾套件 `libero_10` 尚未收尾）。
+> **一句话状态**：**M0（试跑/标定）+ M1（并行）+ M2（动态下发）已实现并验证；全量实测 94.2 min / 95.65%，逐 suite 加速 2.7–4.3×、整机 1.85×（vs 1卡1server vanilla）。** M3（batching）暂缓（GPU 未成瓶颈）。M2 已提交 `588eaf4`（未 push）。
 
 ---
 
@@ -64,8 +64,8 @@
 
 ### M2 · 动态任务下发（把最小 coordinator 动态化）✅ 完成
 - **内容**：shard/worker 契约（由 `run.py` 统一分发吸收）+ **coordinator 动态化**（**全局队列 + 有界进程池**，按资源分池、episode-chunk 粒度、失败重试一次、长尾抹平）。
-- **交付**：`coordinator.py`（M2 版）+ `run.py` 分发（`coordinator`/`servers`/`pools` 任一存在即走编排）+ 单测 5 passed。
-- **验收**：✅ **多卡 E2E 通过**（2 server / 4 并发 / 8 unit 全局队列，动态补位、无重叠无缺失、失败重试）。全量 wall-clock 待长尾收尾后填（T-05）。
+- **交付**：`coordinator.py`（M2 版）+ `run.py` 分发（`coordinator`/`servers`/`pools` 任一存在即走编排）+ 单测 6 passed。已提交 `588eaf4`。
+- **验收**：✅ **多卡 E2E 通过**（2 server / 4 并发 / 8 unit 全局队列，动态补位、无重叠无缺失、失败重试）；✅ **全量对照已量化**（静态 8 卡基线 94.2 min / 95.65%，逐 suite 2.7–4.3×、整机 1.85× vs 1卡1server；见 §2.12）。M2 全量对照（~3.0×）待跑。
 - 对应任务 T2-1 / T2-2；测试 T-04 / T-05。
 
 ### M3 · batching（最后，条件触发）
@@ -119,7 +119,7 @@
 
 ### 2.3 T0-1 实现 + 真评测验证（2026-10-12）
 
-- **代码**：新增 `transport/timing.py`、`rpc_server.py` 接线、`unit_tests/test_server_timing.py`（**9 passed**，ruff clean）。**未提交**。
+- **代码**：新增 `transport/timing.py`、`rpc_server.py` 接线、`unit_tests/test_server_timing.py`（**9 passed**，ruff clean）。**已提交 `af2d7ea`**。
 - **验证**：真评测（LIBERO `libero_10` task0 × 2 集）跑通，`timing.json` 出数、与 `inference_latency_ms` 交叉验证一致（max 554.8ms 精确相同）；**开关关/开逐集结果完全一致**（非侵入）。详见 `03_testing.md` T-01。
 - **跑评测踩到的环境坑（4 条，复现用）**：
   1. **`env.loongforge_root` 才是有效键**（`server.loongforge_root` 是 no-op；用户脚本靠 `export PYTHONPATH` 兜住）。
@@ -129,7 +129,7 @@
 
 ### 2.4 标定报告生成器（2026-10-12）
 
-- **代码**：`orchestrator/calibration_report.py`（`build_report` / `render_markdown` 纯函数 + CLI：`--sweep` / `--timing` / `--env` → `report.json` / `report.md` / `env.json`）+ 单测 `test_calibration_report.py`（**3 passed**，ruff clean）。**未提交**。
+- **代码**：`orchestrator/calibration_report.py`（`build_report` / `render_markdown` 纯函数 + CLI：`--sweep` / `--timing` / `--env` → `report.json` / `report.md` / `env.json`）+ 单测 `test_calibration_report.py`（**3 passed**，ruff clean）。**已提交 `9ac3021`**。
 - **设计**：输入与扫描器**解耦**（只认 sweep/timing 的 JSON），任何 sweep harness 都能喂。
 - **报告读法**（写进 `report.md`）：主判据 = **吞吐平台 + server 忙占比**；**不用 `nvidia-smi util`**。
 
@@ -143,12 +143,12 @@
 
 ### 2.6 配置校验 + 缓存（2026-10-12）
 
-- **代码**：`orchestrator/calibration_config.py`（`validate_parallel_config` 按 `N ≤ 核数/每sim核数`、显存、`timeout ≥ N×服务时间×safety` 做边界检查；`calibration_key` / `save_calibration` / `load_calibration` 做 `(model,benchmark,gpu)` 缓存）+ 单测（**7 passed**，ruff clean）。**未提交**。
+- **代码**：`orchestrator/calibration_config.py`（`validate_parallel_config` 按 `N ≤ 核数/每sim核数`、显存、`timeout ≥ N×服务时间×safety` 做边界检查；`calibration_key` / `save_calibration` / `load_calibration` 做 `(model,benchmark,gpu)` 缓存）+ 单测（**7 passed**，ruff clean）。**已提交 `9ac3021`**。
 - **实测**：对 T-02 的配置跑校验 → **PASS**（`timeout 60000ms ≥ 16×50.9×2 = 1628ms`）。
 
 ### 2.7 T1-1/T1-2 external server 模式（2026-10-12）
 
-- **代码**：`config.py`（`server.external_url` → `external_url`，并从 URL 推 `host`/`port`）+ `server_manager.py`（`ManagedServer` external 模式下 `start`/`ensure_running`/`stop` 全 no-op）+ 单测 `test_server_manager_external.py`（5 passed）。**`run.py` 无需改动**。**未提交**。
+- **代码**：`config.py`（`server.external_url` → `external_url`，并从 URL 推 `host`/`port`）+ `server_manager.py`（`ManagedServer` external 模式下 `start`/`ensure_running`/`stop` 全 no-op）+ 单测 `test_server_manager_external.py`（5 passed）。**`run.py` 无需改动**。**已提交 `19f6ac7`**。
 - **用法**：config 里加 `server.external_url: ws://host:port`；手起（或 coordinator 起）1 个 server，N 个 orchestrator 都指向它 → **1 server : N sims**。
 - **E2E 验证**：✅ 起 1 共享 server + 1 纯 client orchestrator（`external_url`）→ `rc=0`、共享 server **未被误杀**（`alive after run: True`）。见 `03_testing.md` T-03。
 - **待做**：N>1 多 client 并发（M2）；coordinator（起 server + 起 worker 池）。
@@ -164,7 +164,7 @@
 
 ### 2.9 T1-6 episode-chunk 分片（2026-10-12）
 
-- **代码**：`libero_runner` `--episode-offset` + config `benchmark.episode_offset`；`coordinator.build_shards`（episode-chunk 级）+ 单测更新（4 passed）。**未提交**。
+- **代码**：`libero_runner` `--episode-offset` + config `benchmark.episode_offset`；`coordinator.build_shards`（episode-chunk 级）+ 单测更新（4 passed）。**已提交 `50fbfb6`**。
 - **E2E**：✅ 2 task × 4 集 / `n_workers=4` → 4 分片、8 集恰好覆盖一次。
 
 ### 2.10 标定正式入口 `calibrate.py`（2026-10-12）
@@ -173,7 +173,7 @@
 - **代码**：`orchestrator/calibrate.py`——`--config --n 1,2,4,8,16,32` **一条命令**：每个 N 起 coordinator（并行铺卡）→ 收集 wall/吞吐/server 忙占比 → `calibration_report` 报告 → **兜底 N**（`fallback_n` = ≥95% 最佳吞吐的最小 N）→ `calibration_config` 校验 + 缓存。单测 3 passed。
 - **顺带**：`coordinator.py` 加 `elapsed_sec`（只计 worker 墙钟）+ 落盘 `coordinator_result.json`（供标定收集）。
 
-### 2.11 M2 动态任务下发（2026-10-15，本地改动，未提交）
+### 2.11 M2 动态任务下发（2026-10-15，已提交 `588eaf4`）
 
 - **背景**：T1-5/T1-6 的"最小 coordinator"是**静态一轮分片**（一次切 N 片、跑完即止）——`N ≤ 任务数`虽已解除，但**快槽跑完就空转**，长尾套件（`libero_10`）拖住 wall-clock。M2 把它升级为**动态调度**。
 - **代码**（`orchestrator/coordinator.py` M2 版）：
@@ -187,9 +187,21 @@
 - **契约（T2-1）**：**不新增 adapter 层**——"统一入口"由 `run.py` 的 family 分发天然提供。unit 契约 = 一份普通 eval config（`benchmark.{suite,task_ids,episode_offset,episodes_per_task}` + `server.external_url` + `run.output_dir`）→ `results.jsonl`（含 `episode_id` key，可 resume）。**5 个 family 走同一条路**。
 - **E2E（2026-10-15，2 卡 A800）**：config = `servers:[{gpus:[2,3]}]` + `pools.cpu_sim.n_sims_per_server=2`（并发 4）+ `libero_10` task[0,1] × 4 集（共 8 集 / chunk=1 → **8 unit**）。结果：**2 server 各占 1 卡**（端口 17000/17001、17020/17021）、**8 unit 全 rc=0、failed_units=[]**、聚合 **8 集**、**分片无重叠无缺失**（worker_i → task/eps 恰好一一对应）、`elapsed=105.3s`。
 - **动态补位实证**：worker 0-3 于 `18:25:57` 起（第一波填满 4 槽）；worker 4-7 于 `18:26:47` 起（**第一波跑完、槽位释放后自动补位**）→ 队列确为全局动态，而非静态一轮。
-- **单测**：`test_coordinator.py` 5 passed（含 **retry 用例**：unit 首次失败→重入队→第二次成功→`failed_units=[]`）。全量 67 passed / 1 skipped，ruff clean。
+- **单测**：`test_coordinator.py` **6 passed**（含 **retry 用例**：unit 首次失败→重入队→第二次成功→`failed_units=[]`；**suite_overrides 用例**）。全量 **68 passed / 1 skipped**，ruff clean。
 - **不做**：`work/{pending,running,done}` **文件级**队列（用**进程内内存队列**代替；单机单进程够用，且避免 FS 原子性假设）；看门狗超时回收（留待有实际需要再加）。
-- **待做**：全量 wall-clock 对照（T-05，需长尾 `libero_10` 收尾）；GPU-sim 一路。
+- **待做**：M2 全量对照（单 coordinator 跨套件全局队列，验证 §2.12 推算的 ~3.0×）；GPU-sim 一路。
+
+### 2.12 全量实测 + 逐 suite 加速（2026-10-15，**静态 8 卡基线**）
+
+> 口径：8 卡、每卡 1 coordinator + 1 server + 16 worker，4 套件 × 500 集 = 2000 集；ckpt `lf_sft_pr240_fp32master_20k`。**这是 M2 之前的静态分配（每套件钉 2 卡），用作 M2 的对照基线。**
+
+- **总 wall = 94.2 min**（17:28:26→19:02:40），8 卡全 rc=0；**1913/2000 = 95.65%**（10 91.20 / spatial 98.80 / object 95.80 / goal 96.80）。
+- 每卡 worker wall（不含加载）：libero_10 **91.2**（c1，绑定卡）/ spatial 38.5 / object 42.5 / goal 44.5 min。
+- **vanilla 参照 = 1 卡 1 server**（用户口径）：官方 harness `evaluate_results/pr240fp32_official_2000`（2026-10-06，4 卡 worker pool，同 ckpt）。per-task（50 集）libero_10 49.5 / spatial 33.1 / object 25.6 / goal 30.7 min；8 卡折合 ≈ **173.7 min**。
+- **逐 suite 加速（每 50 集，log 实测，无估算）**：libero_10 **2.7×** / spatial **4.3×** / object **3.0×** / goal **3.5×**；**整机 94.2 vs 173.7 = 1.85×**。
+- **缺口归因**：spatial/object/goal 在 ~45 min 跑完，后 **6 卡空转**到 libero_10 收尾（91 min）→ 逐 suite ~3.5× 被摊薄成整机 1.85×。**这正是 M2 要吃的**：空卡抢 libero_10 的 chunk → 整机 ≈ `45 + 254/(8×2.74) ≈ 57 min` → **~3.0×**。
+- ⚠️ **分数未逐位一致**（object 95.80 vs vanilla 99.40 等）：vanilla 评测代码此后有更新，**待开发完 rebase 一版 vanilla 再重跑对齐**（用户 2026-10-15 决定先不追）。**速度对比也因此非严格 apples-to-apples**（episode 长度受协议项影响）。
+- ⚠️ 注：**别用 `eval_ckpt_all_parallel.sh` 的 SPG=2 结果当基线**（10-13/10-14 的 followups 全量即 SPG=2）；口径不一致。
 
 ---
 
@@ -259,7 +271,7 @@
 - **目标**：把 **T1-5 的最小 coordinator** 升级为动态调度（抹平长尾，卡不空转）。
 - **改动**：`coordinator.py` 用**全局队列 + 有界进程池**（`pending` + `free_slots`，跑完即补位）；chunk 细到 1 集；失败**重试一次**；每 server 落独立 config 定端口。
 - **粒度**：**episode-chunk 级**（不是 task 级）。
-- **验收**：✅ 多卡 E2E（2 server / 4 并发 / 8 unit）动态补位、无重叠无缺失、失败重试；全量 wall-clock 待长尾收尾后填（T-05）。
+- **验收**：✅ 多卡 E2E（2 server / 4 并发 / 8 unit）动态补位、无重叠无缺失、失败重试；✅ 全量对照已量化（§2.12：94.2 min / 95.65%，逐 suite 2.7–4.3×、整机 1.85× vs 1卡1server）。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 
