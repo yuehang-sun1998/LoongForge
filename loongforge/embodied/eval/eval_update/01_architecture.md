@@ -194,7 +194,7 @@ worker                    work/                       server/sim            结�
 - **二维分组**：worker 池 = `ckpt × resource_class`；worker 只领同类 unit。
 - **看门狗**：worker 死 → 其 `running/` 单元回 `pending/`。
 - **断点复用**：`--resume` + `completed_episode_keys`（`libero_runner.py:444`）→ 即使 chunk 跑到一半崩，新 worker 跳过已完成的 episode。
-- **聚合**：merge `results/worker_*.jsonl`，按 `(suite, task, episode)` 去重。
+- **聚合 + 校验**：merge `results/worker_*.jsonl`，按 `(suite, task, episode)` 去重；**再与"计划应跑集合"比对**（漏 / 重 / 多出），**漏的自动补跑**（见 §5.5）。
 - **离线前提**：work 全部事先已知 → coordinator 启动时**一次性枚举**；"动态"只体现在分配，**不需要任何外部服务**（本地进程 + 本地 `work/` 目录）。
 - **前提：单机单 FS**。`os.rename` 的原子性只在**同一文件系统**内成立——跨节点 / NFS 不保证。本方案假定所有 worker 与 `work/` 在同一台机器。上多机时这个队列是死路，需换真正的调度器（**Ray Serve 已评估**：能现成解决路由 / autoscale / 容错，但依赖重，与"编排层收口、少依赖"冲突，故不选）。
 
@@ -320,6 +320,17 @@ vectorization: { num_envs: 1 }                                          # §7.5
 > `resources` / `queue` / `calibrated` / `batching` / `vectorization` 仍是**目标 schema**，尚未接线（M2 的队列用进程内内存实现，非 `work/` 文件队列，见 `02_progress.md` §2.11）。
 
 ---
+
+### 5.5 运行后覆盖校验 + 自动补跑
+
+跑完 ≠ 跑对：`_aggregate` 只做去重计数，**漏集 / 重复 / 多出**都会被静默吞掉（分数照出）。所以聚合后必须与**计划应跑集合**比对：
+
+- **期望集合**：由分片计划推出——`(suite, task, offset..offset+count-1)` → `{(suite, task, episode)}`。
+- **实跑集合**：逐 worker `results.jsonl` 取 `(task_suite, task_id, episode_idx)`（缺字段时回退解析 `episode_id`）。
+- **判据**：`missing`（漏）/ `duplicates`（重）/ `unexpected`（多出）/ `unkeyed` 全为 0 → `ok`。
+- **失败分类**：`infra_failed`（`episode_error` / 超时 / `server_unreachable`——**没真跑**）与**模型失败**分开统计；模型失败是正常结果，**不算"不完整"**。
+- **闭环（不中断评测）**：`missing` 非空 → 把缺失键**合并回连续区间**成补跑分片 → 复用同一个有界池再跑 → 再校验，最多 `MAX_REPAIR_ROUNDS=3` 轮。**只有 3 轮后仍不完整**才 `ok=false`（此时才值得人工介入）；**过程中不抛异常、不中断**。
+- **实现**：`orchestrator/validation.py`（`expected_keys` / `key_of` / `read_records` / `validate` / `missing_keys` / `repair_shards` / `format_report` + CLI）；报告随 `coordinator_result.json` 落盘。
 
 ## 6. 标定方法论
 
@@ -542,7 +553,7 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 | B7 标 done | 完成的 unit | `done/<unit>.json` |
 | B8 看门狗（与 B5–B7 并发） | worker 心跳 / PID + `running/` | 死 worker 的 unit 回 `pending/` |
 | B9 收尾 | `pending/` 与 `running/` 皆空 | 停 server |
-| B10 聚合 | `results/worker_*.jsonl` | 按 `(suite, task, episode)` 去重的最终指标 |
+| B10 聚合 + 校验 | `results/worker_*.jsonl` + 计划应跑集合 | 去重指标 + **覆盖校验**（漏→自动补跑，最多 3 轮；仍缺才 `ok=false`） |
 
 ### 8.3 两类差异（只影响 B3 / B4）
 

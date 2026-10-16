@@ -39,6 +39,7 @@
 | 2 | shard/worker 契约 | ✅ 完成（由 `run.py` 统一分发吸收，**无需新 adapter 层**，见 §2.11） | `run.py` + 各 `*_runner` | `03_testing.md` T-04 | — |
 | 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ✅ 完成 + 全量对照（**全局队列 + 有界进程池 + 失败重试**；56.2 min / 3.09×，见 §2.11–§2.13） | `coordinator.py` | `03_testing.md` T-05 | 契约 |
 | 2 | episode-chunk 粒度抢占 | ✅ 完成（chunk 细到 1 集，快槽可抢下一个 unit） | `coordinator.py` | `03_testing.md` T-05 | 队列 |
+| 2 | **运行后覆盖校验 + 自动补跑** | ✅ 完成 | `validation.py` + `coordinator.py` | `03_testing.md` T-09 | — |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -214,6 +215,17 @@
 - **分数对齐（逐集）**：与基线比对 2000 集，**仅 16 集不同**，全在 `libero_object/task=6/episode=16..31`，且基线里**全由同一 worker 连续产出**、`failure_reason=episode_error`/`ConnectionClosedError`（websocket keepalive 超时、`steps=0`、**根本没跑**）。**剔除这 16 个 spurious 失败后两边一致（96.42% vs 96.45%）→ 模型行为逐集相同**。
 - **收获**：① 证实 M2 的全局队列确实抹平长尾（整机 1.68× / 对 vanilla 3.09×）；② 满负载下多 server 端口隔离、`suite_overrides`、unit 级重试均正常；③ 暴露"**episode 级重试默认关**"这个坑 → 已在 §2.11 修为默认 `run.max_retries=2`。
 - **待做**：GPU-sim 一路；vanilla 代码 rebase 后重跑对齐绝对分数。
+
+### 2.14 运行后覆盖校验 + 自动补跑（2026-10-15）
+
+- **背景**：`_aggregate` 只做去重计数——**漏集 / 重复 / 多出**都会被静默吞掉（分数照出）。用户要求补一个校验机制。
+- **代码**：新增 `orchestrator/validation.py`——`expected_keys(plan)`（计划应跑集合）、`key_of(record)`（取 `(suite,task,episode)`；缺字段回退解析 `episode_id`）、`read_records`、`validate`、`missing_keys`、`repair_shards`（缺失键**合并回连续区间**）、`format_report`；CLI `python -m ...validation --output-dir … --n-units N --plan plan.json`（默认**只报告**，`--strict` 才 exit 1）。coordinator 跑完把 `plan.json` 落盘，供离线复查。
+- **闭环（不中断评测）**：主队列跑完 → **校验 → 有缺失就生成补跑分片（连续区间合并）→ 复用同一个有界池再跑 → 再校验**，最多 `MAX_REPAIR_ROUNDS=3` 轮。**只有 3 轮后仍不完整**才 `ok=false`（此时才值得人工介入）；**过程不抛异常、不中断**。
+- **失败分类**：`infra_failed`（`episode_error`/超时/`server_unreachable`，**没真跑**）与**模型失败**分开；模型失败是正常结果，**不算不完整**。
+- **验证**：
+  - 单测 `test_validation.py` 5 passed（期望集合 / 键解析 / 区间合并 / 缺重多检测 / 失败分类）；全量 **74 passed / 1 skipped**。
+  - **E2E 冒烟**（2 卡 / 8 unit）：`coordinator_result.json` 出 `validation` 块，`ok=true`、`repair_rounds=0`、模型失败 8 个被正确排除。
+  - **对真实 M2 全量离线校验**（2000 集 / 520 unit）：**`ok=true`、missing=0、duplicates=0、unexpected=0、unkeyed=0、infra_failed=0**，`success_rate=0.9645`，失败全是 `not_successful_within_max_steps`（71）。
 
 ---
 

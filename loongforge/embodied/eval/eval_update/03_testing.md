@@ -47,6 +47,7 @@
 | T-06 | 数值一致性（batch>1 vs batch=1） | 3（暂缓） | 任一 | ⏸ 暂缓 |
 | T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | ⏸ 暂缓（环境不支持 GPU-sim，待 CPU-sim 完成后统一做） |
 | T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3（暂缓） | 任一 | ⏸ 暂缓 |
+| T-09 | 运行后覆盖校验（漏/重/多出）+ 自动补跑 | 2 | 任一 | ✅ 通过（单测 5 passed；真实 M2 全量 `ok=true`） |
 
 ---
 
@@ -176,6 +177,19 @@
 > - **长尾被吃掉**：libero_10 的 500 集在基线里 2 卡拖 91 min，M2 里用满 8 卡、在 56 min 总盘子内跑完（后 6 卡不再空转）。
 > - **分数对齐**：逐集比对，2000 集中仅 **16 集**不同，全在 `libero_object/task=6/episode=16..31`，且基线里**全由同一 worker 连续产出**、`failure_reason=episode_error`/`ConnectionClosedError`（websocket keepalive 超时、`steps=0`、**根本没跑**）。**剔除这 16 个 spurious 失败后两边一致（96.42% vs 96.45%）→ 模型行为逐集相同**。
 > - ⚠️ **retry 缺口（已修）**：`episode_error` 本就在 episode 级重试集合里（`libero_runner.py:505`），但 `--max-retries` **默认 0** → 基线没设就把它记成失败。已在 `coordinator._shard_config` 默认注入 `run.max_retries=2`（显式值优先）。
+
+### T-09 · 运行后覆盖校验 + 自动补跑
+
+- **对应功能**：§5.5（`validation.py` + coordinator 补跑轮）。
+- **目的**：确认"计划要跑的集"与"实际跑出的集"一致——**不漏、不重、不多**；漏的自动补跑而不是中断。
+- **前置**：M2 coordinator 可用。
+- **步骤**：跑一次协调评测 → 看 `coordinator_result.json` 的 `validation` 块；或离线 `python -m ...validation --output-dir … --n-units N --plan plan.json`。
+- **通过标准**：`missing=duplicates=unexpected=unkeyed=0`（`ok=true`）；模型失败**不算**不完整；若确有缺失，应在 ≤3 轮内被补跑补齐。
+- **数据（2026-10-15）**：
+  - **单测**：`test_validation.py` 5 passed（期望集合 / `episode_id` 回退解析 / 连续区间合并 / 缺重多检测 / infra vs 模型失败分类）。
+  - **E2E 冒烟**（2 卡 / 4 并发 / 8 unit）：`validation.ok=true`、`repair_rounds=0`、`infra_failed=0`、失败 8 个全为 `not_successful_within_max_steps`。
+  - **真实 M2 全量离线校验**（2000 集 / 520 unit）：`ok=true`、`expected=actual=2000`、`missing=duplicates=unexpected=unkeyed=0`、`infra_failed=0`、`success_rate=0.9645`。
+- **结论**：✅ 通过。覆盖校验把"缺/重/多出"变成显式判据；缺失自动补跑（最多 3 轮），不中断评测。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 
