@@ -59,9 +59,13 @@ class PolicyClient:
         self._ws.close()
 
     def request(
-        self, message_type: str, payload: Optional[Dict[str, Any]] = None, request_id: str = "default"
+        self,
+        message_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        request_id: str = "default",
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Run request."""
+        """Send a request and read the reply. ``timeout`` bounds the wait for the reply."""
         message = {
             "type": message_type,
             "request_id": request_id,
@@ -69,14 +73,14 @@ class PolicyClient:
             "payload": payload or {},
         }
         self._ws.send(self._packer.pack(message))
-        response = self._ws.recv()
+        response = self._ws.recv() if timeout is None else self._ws.recv(timeout=timeout)
         if isinstance(response, str):
             raise RuntimeError(response)
         return msgpack_numpy.unpackb(response)
 
-    def ping(self) -> Dict[str, Any]:
-        """Run ping."""
-        return self.request("ping")
+    def ping(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Round-trip a ``ping``. ``timeout`` bounds the wait for the pong."""
+        return self.request("ping", timeout=timeout)
 
     def reset(self, episode_id: str) -> Dict[str, Any]:
         """Run reset."""
