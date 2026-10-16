@@ -45,6 +45,7 @@
 | 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
 | 2 | **分片：per-benchmark planner 表** | ✅ 完成 | `planning.py` + `coordinator.py` + `validation.py` | `03_testing.md` T-12 | §2.18 |
 | 3 | server 侧 batcher（M3） | 🔄 **探针实测：`per_sample_ms` 583→79ms（batch 8，7.3×）→ 判定 GO，是量级最大的剩余杠杆**；待补 batch 契约 | `orchestrator/batch_probe.py`（诊断） | `03_testing.md` T-13 | FastWAM batch 契约 |
+| 3 | **单卡多 server vs batch**（T-08） | ✅ 已结案：**多副本只 1.25×、batch 7.3×** → 选 batch | —（A/B 用现有 coordinator 跑） | `03_testing.md` T-08 | — |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
 
@@ -317,6 +318,16 @@
 - 🔑 **逐集比对干净 M2 全量：2000 集 0 处不同** → **故障零扰动**（不是"看起来对"，是逐位一致）。
 - **代价有界**：2 次 server 重启各 ~100s 重载 + 补跑/重试 ≈ +4.1 min。
 - **顺带**：这轮之前我中断一次工具调用，暴露并修掉了 `watchdog.join()` 未 start 就调用 → **server 泄漏**的 bug（`ed7a7b6`）。
+
+### 2.21 单卡多 server vs batch 的 A/B（2026-10-15）
+
+- **背景**：用户提出"单卡多 server 是不是更简单"（不用写 batcher）。用**现有 coordinator** 直接跑 A/B 回答。
+- **设计**：同一批 **400 集**（`libero_10` 10 tasks × 40 集、`max_steps=150`）、**同为 128 并发**，只变每卡 server 数：
+  - **A**：`gpus:[0..7]`，8 server × 16 sim（1 server/卡）
+  - **B**：`gpus:[0,0,1,1,...]`，16 server × 8 sim（2 server/卡）—— 现有代码直接支持（同卡列两次即可）
+- **结果**：A 30.3 ep/min（wall 13.20 min）vs B **32.5 ep/min**（wall 12.29 min）→ **worker wall 只快 1.25×**（10.16→8.15 min），总 wall 只快 1.07×。显存不是瓶颈（2×24.7=49.4 < 81.9GB，`server_restarts=0`）。
+- **结论**：**强次线性**——多进程共享 GPU 受**上下文切换/驱动串行化**限制（不是 SM 不够）。**"单卡多 server 就够了"不成立**（~1.25×），而 batching 有独立且大得多的空间（7.3×）→ **M3 值得做，且不能靠多开 server 替代**。同时**结案 T-08**（"大 batch vs 单卡多副本" → 选 batch）。
+- **caveat**：单 workload 的结论；换 workload / 试 3 server 一卡可能有出入，但 1.25× 这个量级已足以否掉"多 server 替代 batching"。
 
 ---
 
