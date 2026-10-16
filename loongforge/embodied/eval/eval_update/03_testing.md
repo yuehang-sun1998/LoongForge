@@ -214,8 +214,11 @@
   2. **收尾信号**：`ok=false` → `run.py` **exit 2**；`infra_failed>0` → stderr 告警（单测：两个退出码用例）。
   3. **看门狗竞态**：shutdown 落在 restart 中途 → 期间启动的 server 被自己 terminate、不进 `servers`（单测：`created[0].terminated`）。
   4. **hung 探活**：进程活但 ping 不通 → 连续 2 次失败后重启；活着的正常 server 不误杀；探活有界且恢复代理环境变量（单测 3 个）。
-- **数据（2026-10-15）**：单测 **8 个**全过；全量 **87 passed / 1 skipped**，ruff clean；小规模 E2E 冒烟通过（覆盖行打印 + 无告警）。
-- **结论**：✅ 通过。四类失败模式均已兜底；**未覆盖项**列在 `01_architecture.md` §5.7 末（coordinator 单点 / output_dir 无锁 / `policy_call_ms` 未自动放宽）。
+  5. **`output_dir` 冲突**：已有 `coordinator_result.json` → 拒绝启动（`SystemExit`）；`run.resume: true` 放行（单测 2 个）。
+  6. **`policy_call_ms` 下限**：`N × service_ms × 2` 之上不告警、之下告警、未给 `service_ms` 跳过（单测 1 个，三态）。
+  7. **server 崩溃循环**：连续失败超过 `MAX_SERVER_RESTARTS` → 放弃并记入 `servers_given_up`；`run.py` **exit 2**（单测 2 个）。
+- **数据（2026-10-15）**：单测 **13 个**全过；全量 **92 passed / 1 skipped**，ruff clean；小规模 E2E 冒烟通过（覆盖行打印 + 无告警）。
+- **结论**：✅ 通过。**明确不做**：coordinator supervisor（靠 resume 手动重跑）。**只写方案**：GPU-sim 的 `policy_call_ms` 推导（`01_architecture.md` §5.7 末）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 
