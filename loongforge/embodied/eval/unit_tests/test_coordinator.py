@@ -12,47 +12,26 @@ from types import SimpleNamespace
 import pytest
 from typing import Any
 
-from loongforge.embodied.eval.orchestrator.coordinator import (
-    _shard_config,
-    _shards,
-    build_shards,
-    chunk_size,
-)
+from loongforge.embodied.eval.orchestrator.coordinator import _shard_config
 
 
-def test_chunk_size_leaves_slack_per_slot() -> None:
-    """Run test_chunk_size_leaves_slack_per_slot."""
-    assert chunk_size(100, 4) == 7  # ceil(100 / (4 slots x 4 units))
-    assert chunk_size(10, 4) == 1
-    assert chunk_size(0, 4) == 1
+def _shard(sid: str, overrides: dict, expected: int) -> dict:
+    return {"id": sid, "overrides": overrides, "expected": expected}
 
 
-def test_build_shards_contiguous_and_disjoint() -> None:
-    """Run test_build_shards_contiguous_and_disjoint."""
-    assert build_shards([0, 1], 50, 25) == [(0, 0, 25), (0, 25, 25), (1, 0, 25), (1, 25, 25)]
-
-
-def test_shards_cover_every_episode_exactly_once() -> None:
-    """Run test_shards_cover_every_episode_exactly_once."""
-    config = {"benchmark": {"suites": ["a", "b"], "task_ids": [0, 1], "episodes_per_task": 4}}
-    shards = _shards(config, 4)
-    covered = {(suite, task, ep) for suite, task, off, count in shards for ep in range(off, off + count)}
-    assert covered == {(s, t, e) for s in ("a", "b") for t in (0, 1) for e in range(4)}
-    assert len(shards) == 16  # fine chunks (chunk=1) so fast slots can steal work
-
-
-def test_shard_config_sets_suite_offset_and_count() -> None:
-    """Run test_shard_config_sets_suite_offset_and_count."""
+def test_shard_config_applies_overrides_and_strips_coordinator_keys() -> None:
+    """The shard patch is applied mechanically; coordinator-only keys are dropped."""
     base = {
-        "benchmark": {"suites": ["a", "b"], "episodes_per_task": 50},
+        "benchmark": {"suites": ["a", "b"], "suite_overrides": {"a": {"max_steps": 1}}},
         "server": {"ckpt_path": "x"},
         "coordinator": {"n_workers": 4},
         "servers": [{"gpus": [0, 1]}],
         "pools": {"cpu_sim": {"n_sims_per_server": 2}},
     }
-    shard = _shard_config(base, ("b", 3, 10, 20), "ws://h:1", "/tmp/out")
+    patch = {"benchmark": {"suite": "b", "task_ids": [3], "episode_offset": 10, "episodes_per_task": 20}}
+    shard = _shard_config(base, _shard("b/task=3", patch, 20), "ws://h:1", "/tmp/out")
     assert "coordinator" not in shard and "servers" not in shard and "pools" not in shard
-    assert "suites" not in shard["benchmark"]
+    assert "suites" not in shard["benchmark"] and "suite_overrides" not in shard["benchmark"]
     assert shard["benchmark"]["suite"] == "b"
     assert shard["benchmark"]["task_ids"] == [3]
     assert shard["benchmark"]["episode_offset"] == 10
@@ -64,29 +43,11 @@ def test_shard_config_sets_suite_offset_and_count() -> None:
 
 def test_shard_config_defaults_max_retries_but_respects_explicit() -> None:
     """Coordinated units retry infra episode failures by default; an explicit value wins."""
-    base = {"benchmark": {"suites": ["a"], "episodes_per_task": 2}, "server": {"ckpt_path": "x"}}
-    shard = _shard_config(base, ("a", 0, 0, 2), "ws://h:1", "/tmp/out")
+    base = {"benchmark": {"suite": "a"}, "server": {"ckpt_path": "x"}}
+    shard = _shard_config(base, _shard("a/ep=0", {}, 2), "ws://h:1", "/tmp/out")
     assert shard["run"]["max_retries"] == 2
     explicit = {**base, "run": {"max_retries": 0}}
-    assert _shard_config(explicit, ("a", 0, 0, 2), "ws://h:1", "/tmp/out")["run"]["max_retries"] == 0
-
-
-def test_shard_config_applies_per_suite_overrides() -> None:
-    """A per-suite override (e.g. max_steps) wins over the shared benchmark value."""
-    base = {
-        "benchmark": {
-            "suites": ["libero_10", "libero_goal"],
-            "episodes_per_task": 2,
-            "max_steps": 400,
-            "suite_overrides": {"libero_10": {"max_steps": 700}},
-        },
-        "server": {"ckpt_path": "x"},
-    }
-    long_tail = _shard_config(base, ("libero_10", 0, 0, 1), "ws://h:1", "/tmp/out")
-    other = _shard_config(base, ("libero_goal", 0, 0, 1), "ws://h:1", "/tmp/out")
-    assert long_tail["benchmark"]["max_steps"] == 700
-    assert other["benchmark"]["max_steps"] == 400
-    assert "suite_overrides" not in long_tail["benchmark"]
+    assert _shard_config(explicit, _shard("a/ep=0", {}, 2), "ws://h:1", "/tmp/out")["run"]["max_retries"] == 0
 
 
 class _FakeProc:
@@ -128,10 +89,10 @@ def test_run_retries_a_failed_unit_once(monkeypatch: Any, tmp_path: Any) -> None
     monkeypatch.setattr(coord, "start_server", lambda args, env=None: _FakeProc(0))
     monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
     monkeypatch.setattr(coord, "_aggregate", lambda *args, **kwargs: {})
-    monkeypatch.setattr(coord, "missing_keys", lambda *args, **kwargs: [])
+    monkeypatch.setattr(coord, "short_shards", lambda *args, **kwargs: [])
 
     config = {
-        "benchmark": {"suite": "libero_10", "task_ids": [0], "episodes_per_task": 2},
+        "benchmark": {"name": "libero", "suite": "libero_10", "task_ids": [0], "episodes_per_task": 2},
         "servers": [{"gpus": [0]}],
         "pools": {"cpu_sim": {"n_sims_per_server": 1}},
         "run": {"output_dir": str(tmp_path)},
@@ -193,7 +154,7 @@ def test_unit_timeout_derives_from_the_episode_budget() -> None:
     """The per-unit budget is max episodes x per_episode_sec + connect + slack."""
     from loongforge.embodied.eval.orchestrator import coordinator as coord
 
-    shards = [("a", 0, 0, 4), ("a", 1, 0, 2)]
+    shards = [_shard("a/t0", {}, 4), _shard("a/t1", {}, 2)]
     config = {"timeouts": {"per_episode_sec": 100}, "server": {"connect_timeout_sec": 10}}
     assert coord._unit_timeout_sec(config, shards) == 4 * 100 + 10 + coord.UNIT_TIMEOUT_SLACK_SEC
     assert coord._unit_timeout_sec({**config, "run": {"unit_timeout_sec": 42}}, shards) == 42
@@ -330,7 +291,7 @@ def test_alive_probe_fails_fast_and_restores_proxy_env(monkeypatch: Any) -> None
 
 def _mini_config(output_dir: str, **run_extra: Any) -> dict:
     return {
-        "benchmark": {"suite": "libero_10", "task_ids": [0], "episodes_per_task": 1},
+        "benchmark": {"name": "libero", "suite": "libero_10", "task_ids": [0], "episodes_per_task": 1},
         "servers": [{"gpus": [0]}],
         "pools": {"cpu_sim": {"n_sims_per_server": 1}},
         "run": {"output_dir": output_dir, **run_extra},
@@ -359,7 +320,7 @@ def test_run_allows_a_finished_dir_when_resuming(monkeypatch: Any, tmp_path: Any
     monkeypatch.setattr(coord, "start_server", lambda args, env=None: _FakeProc(0))
     monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
     monkeypatch.setattr(coord, "_launch_unit", lambda *args, **kwargs: _FakeProc(0))
-    monkeypatch.setattr(coord, "missing_keys", lambda *args, **kwargs: [])
+    monkeypatch.setattr(coord, "short_shards", lambda *args, **kwargs: [])
     result = coord.run(_mini_config(str(out), resume=True), "")
     assert result["n_units"] == 1
 

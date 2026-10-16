@@ -7,15 +7,16 @@ A config is *coordinated* when it carries ``coordinator`` / ``servers`` / ``pool
 sections; ``run.py`` dispatches such configs here. The coordinator:
 
 1. starts one policy server per GPU (from ``servers[0].gpus``),
-2. splits the benchmark into **fine** episode-chunk shards across every suite,
+2. asks the benchmark family's planner (``planning.py``) for the shards,
 3. runs a **bounded pool** of ``len(gpus) * pools.cpu_sim.n_sims_per_server``
    concurrent unit processes, pulling the next shard from a global queue as one
    finishes -- so a fast slot picks up the next unit instead of idling (this is
    what flattens the long tail; a static one-shard-per-slot launch does not), and
-4. aggregates the per-unit results.
+4. aggregates the per-unit results and checks coverage.
 
 Each unit is an ordinary ``orchestrator.run`` subprocess pointed at a shared
-server via ``server.external_url``. Failed units are retried once.
+server via ``server.external_url``. Failed units are retried once, and shards
+that come up short are re-run (up to ``MAX_REPAIR_ROUNDS``) instead of aborting.
 """
 
 from __future__ import annotations
@@ -37,12 +38,12 @@ from loongforge.embodied.eval.orchestrator.server_manager import (
     start_server,
     wait_healthz,
 )
+from loongforge.embodied.eval.orchestrator.planning import Shard, plan_shards
 from loongforge.embodied.eval.transport.client import PolicyClient
 from loongforge.embodied.eval.orchestrator.validation import (
-    missing_keys,
-    read_records,
-    repair_shards,
     format_report,
+    read_records_by_unit,
+    short_shards,
     validate,
 )
 
@@ -65,81 +66,19 @@ POLICY_TIMEOUT_SAFETY = 2.0  # queue wait is (N-1) x service; keep 2x head-room
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
 
-def chunk_size(total_episodes: int, total_workers: int, units_per_slot: int = UNITS_PER_SLOT) -> int:
-    """Episodes per shard so there are ~``units_per_slot`` shards per worker slot."""
-    target = max(1, total_workers) * max(1, units_per_slot)
-    return max(1, -(-max(1, total_episodes) // target))  # ceil division
+def _shard_config(config: Dict[str, Any], shard: Shard, external_url: str, output_dir: str) -> Dict[str, Any]:
+    """Build one unit's config: a copy of the base, minus coordinator, plus this shard's patch.
 
-
-def build_shards(tasks: List[int], episodes_per_task: int, chunk: int) -> List[tuple]:
-    """Split one suite's (task, episode) space into ``(task, offset, count)`` chunks."""
-    shards: List[tuple] = []
-    for task in tasks:
-        offset = 0
-        while offset < episodes_per_task:
-            count = min(chunk, episodes_per_task - offset)
-            shards.append((task, offset, count))
-            offset += count
-    return shards
-
-
-def _suites(config: Dict[str, Any]) -> List[str]:
-    """Suites to evaluate: ``benchmark.suites`` (list) or the single ``benchmark.suite``."""
-    benchmark = config.get("benchmark") or {}
-    suites = benchmark.get("suites")
-    if suites:
-        return [str(s) for s in suites]
-    return [str(benchmark.get("suite") or benchmark.get("name"))]
-
-
-def _task_ids(config: Dict[str, Any], suite: str) -> List[int]:
-    """Task list for a suite (explicit ``task_ids`` or the suite's own task count)."""
-    benchmark = config.get("benchmark") or {}
-    explicit = benchmark.get("task_ids")
-    if explicit:
-        return [int(task) for task in explicit]
-    from libero.libero import benchmark as libero_benchmark  # only the eval env has this
-
-    n_tasks = libero_benchmark.get_benchmark_dict()[suite]().n_tasks
-    max_tasks = int(benchmark.get("max_tasks") or 0)
-    if max_tasks > 0:
-        n_tasks = min(n_tasks, max_tasks)
-    return list(range(n_tasks))
-
-
-def _shards(config: Dict[str, Any], total_workers: int) -> List[tuple]:
-    """All shards across suites: ``(suite, task, offset, count)``."""
-    episodes_per_task = int((config.get("benchmark") or {}).get("episodes_per_task") or 1)
-    per_suite = [(suite, _task_ids(config, suite)) for suite in _suites(config)]
-    total = max(1, sum(len(tasks) for _, tasks in per_suite) * max(1, episodes_per_task))
-    chunk = chunk_size(total, total_workers)
-    shards: List[tuple] = []
-    for suite, tasks in per_suite:
-        shards.extend(
-            (suite, task, offset, count) for task, offset, count in build_shards(tasks, episodes_per_task, chunk)
-        )
-    return shards
-
-
-def _shard_config(config: Dict[str, Any], shard: tuple, external_url: str, output_dir: str) -> Dict[str, Any]:
-    """Build one unit's config: a copy of the base, minus coordinator, plus this shard."""
-    suite, task_id, episode_offset, episode_count = shard
+    Benchmark-agnostic -- the planner already expressed the slice as config overrides.
+    """
     shard_cfg = copy.deepcopy(config)
-    shard_cfg.pop("coordinator", None)
-    shard_cfg.pop("servers", None)
-    shard_cfg.pop("pools", None)
+    for key in ("coordinator", "servers", "pools"):
+        shard_cfg.pop(key, None)
+    for section, values in (shard.get("overrides") or {}).items():
+        shard_cfg.setdefault(section, {}).update(values)
     benchmark = shard_cfg.setdefault("benchmark", {})
-    benchmark.pop("suites", None)
-    benchmark["suite"] = suite
-    benchmark["task_ids"] = [task_id]
-    benchmark["episode_offset"] = episode_offset
-    benchmark["episodes_per_task"] = episode_count
-    # Per-suite overrides (e.g. LIBERO's official max_steps differ per suite:
-    # 700 for libero_10, 400 for the rest) so one global queue can span suites.
-    overrides = (config.get("benchmark") or {}).get("suite_overrides") or {}
-    for key, value in (overrides.get(suite) or {}).items():
-        benchmark[key] = value
-    benchmark.pop("suite_overrides", None)
+    for key in ("suites", "suite_overrides"):  # coordinator-only keys
+        benchmark.pop(key, None)
     run_cfg = shard_cfg.setdefault("run", {})
     run_cfg["output_dir"] = output_dir
     run_cfg["timestamped_output"] = False  # deterministic path so the coordinator can aggregate
@@ -238,7 +177,7 @@ def _unit_timeout_sec(config: Dict[str, Any], shards: List[tuple]) -> float:
         return explicit
     per_episode = float((config.get("timeouts") or {}).get("per_episode_sec") or 1800)
     connect = float((config.get("server") or {}).get("connect_timeout_sec") or 60)
-    max_episodes = max((count for *_, count in shards), default=1)
+    max_episodes = max((int(shard["expected"]) for shard in shards), default=1)
     return max_episodes * per_episode + connect + UNIT_TIMEOUT_SLACK_SEC
 
 
@@ -443,7 +382,9 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     """Run a coordinated (G server : G x N worker) evaluation with dynamic dispatch."""
     gpus, n_per_server = _resolve_placement(config)
     concurrency = max(1, len(gpus) * n_per_server)
-    plan = _shards(config, concurrency)
+    plan = plan_shards(config, concurrency)
+    expected_by_shard = {shard["id"]: int(shard["expected"]) for shard in plan}
+    shards_by_id = {shard["id"]: shard for shard in plan}
 
     output_dir = Path(str((config.get("run") or {}).get("output_dir") or "/tmp/vla_eval"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -484,7 +425,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     urls = [f"ws://{args.host}:{args.port}" for _, args in servers]
 
     unit_timeout = _unit_timeout_sec(config, plan)
-    all_shards: List[tuple] = list(plan)
+    all_shards: List[Shard] = list(plan)
     failed_units: List[int] = []
     repair_rounds = 0
     # watchdog knobs (mainly so a test can shrink the intervals)
@@ -507,15 +448,18 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
             _, failed_units = _run_batch(
                 config, all_shards, list(range(len(all_shards))), urls, concurrency, output_dir, tmp, unit_timeout
             )
-            # Coverage gate: re-dispatch episodes the plan asked for but that produced no
-            # record at all, rather than aborting the run. Only a still-incomplete run
-            # after MAX_REPAIR_ROUNDS is worth a human's attention.
+            # Coverage gate: re-run the shards that came up short rather than aborting.
+            # A re-run lands in a fresh worker dir, so the overlap is deduped by
+            # ``episode_id`` (and a runner with resume only redoes what is missing).
+            # Only a still-incomplete run after MAX_REPAIR_ROUNDS needs a human.
             for _ in range(MAX_REPAIR_ROUNDS):
-                missing = missing_keys(plan, read_records(output_dir, len(all_shards)))
-                if not missing:
+                records = read_records_by_unit(output_dir, len(all_shards))
+                launched = [shard["id"] for shard in all_shards]
+                short = short_shards(expected_by_shard, launched, records)
+                if not short:
                     break
                 first = len(all_shards)
-                all_shards.extend(repair_shards(missing))
+                all_shards.extend(shards_by_id[shard_id] for shard_id in short)
                 _, extra_failed = _run_batch(
                     config, all_shards, list(range(first, len(all_shards))), urls, concurrency, output_dir, tmp, unit_timeout
                 )
@@ -527,7 +471,8 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         for proc, _ in servers:
             _terminate(proc)
 
-    validation = validate(plan, read_records(output_dir, len(all_shards)))
+    launched_ids = [shard["id"] for shard in all_shards]
+    validation = validate(expected_by_shard, launched_ids, read_records_by_unit(output_dir, len(all_shards)))
     print(f"[coordinator] {format_report(validation)}", flush=True)
     if not validation["ok"]:
         print(
@@ -543,8 +488,8 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
             file=sys.stderr,
             flush=True,
         )
-    # Persist the plan so ``python -m ...validation`` can re-check a finished run offline.
-    (output_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    # Persist the plan + launch order so ``python -m ...validation`` can re-check offline.
+    (output_dir / "plan.json").write_text(json.dumps({"shards": plan, "launched": launched_ids}), encoding="utf-8")
     result = {
         "benchmark": (config.get("benchmark") or {}).get("suites")
         or (config.get("benchmark") or {}).get("suite")

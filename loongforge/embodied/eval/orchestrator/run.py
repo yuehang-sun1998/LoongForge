@@ -20,25 +20,13 @@ from loongforge.embodied.eval.orchestrator.runners import libero_runner
 from loongforge.embodied.eval.orchestrator.runners._common import guard_output_dir
 from loongforge.embodied.eval.metrics import repro_metadata
 from loongforge.embodied.eval.orchestrator.config import apply_config, expand_sweep, load_config
+from loongforge.embodied.eval.orchestrator.planning import benchmark_family as _benchmark_family
 from loongforge.embodied.eval.orchestrator.server_manager import (
     ManagedServer,
     apply_runtime_env,
     build_argparser as build_server_argparser,
     ensure_libero_config,
 )
-
-
-def _benchmark_family(config: Dict[str, Any]) -> str:
-    """Run _benchmark_family."""
-    benchmark = config.get("benchmark") or {}
-    if not isinstance(benchmark, dict):
-        raise ValueError("benchmark section must be a mapping")
-    name = str(benchmark.get("name") or "").lower()
-    if name == "libero" or name.startswith("libero_"):
-        return "libero"
-    if name in {"calvin", "simplerenv", "robotwin", "maniskill"}:
-        return name
-    raise ValueError(f"Unsupported benchmark.name: {benchmark.get('name')!r}")
 
 
 def _timestamped_run_config(config: Dict[str, Any]) -> Dict[str, Any]:
