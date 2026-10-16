@@ -43,6 +43,7 @@
 | 2 | **server 自愈（看门狗 + 连接重建）** | ✅ 完成（`57dcef9` + `3cc3a2d`） | `coordinator.py` + `libero_runner.py` | `03_testing.md` T-10 | §2.15 |
 | 2 | **健壮性兜底**（unit 超时 / 收尾信号 / 竞态 / hung 探活） | ✅ 完成（`dc07c75`/`2e28ce0`/`e5f077c`/`cf9abb6`） | `coordinator.py` + `run.py` + `transport/client.py` | `03_testing.md` T-11 | §2.16 |
 | 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
+| 2 | **分片：per-benchmark planner 表** | ✅ 完成 | `planning.py` + `coordinator.py` + `validation.py` | `03_testing.md` T-12 | §2.18 |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -272,6 +273,18 @@
   - **`policy_call_ms` 下限**：`service_ms=500 / policy_call_ms=500 / N=16` → 启动即告警 `below the queue-wait floor 16000ms`。
 - 🔴 **测试中发现的 bug（已修 `683b455`）**：看门狗重启 **hung** server 时**不先终止旧进程** → 旧进程仍占端口 → 重绑失败 → 永远恢复不了。修：`_restart` 先 `_terminate` 仍存活的进程。
 
+### 2.18 分片重构：per-benchmark planner 表（2026-10-15）
+
+- **起因**：用户问"这套 CPU-sim 都支持吗"。查出**分片契约只对 LIBERO 成立**——`episode_offset` 只有 `libero_runner` 有；`_task_ids` 的任务枚举是 libero-only；`task` 被硬编码成 `int`（而 simplerenv/robotwin/maniskill 用**字符串 task name**）。
+- **拆法**：新增 **`orchestrator/planning.py`**——`benchmark_family()`（从 `run.py` 移来，两边共用）+ 5 个 planner（libero / episode_indexed×2 / robotwin / calvin）+ `PLANNERS` 表 + `plan_shards()`。
+  - **shard 变成纯数据**：`{"id", "overrides": {config 段: 补丁}, "expected"}`。
+  - `_shard_config()` 退化成"deepcopy + apply overrides + 去 coordinator-only 键"，**不认任何 benchmark**。
+  - `_shards`/`build_shards`/`_suites`/`_task_ids` 从 coordinator 移除（进 planning）。
+- **校验同步改成 benchmark-无关**（`validation.py` 重写）：不再展开 `(suite, task, episode)` → **按 shard 的 `expected` 计数 + `episode_id` 去重**；`duplicates` = **两个不同 shard 声明了同一集**（同 shard 重跑是预期重叠）；`short_shards()` 找"短了的 shard"，**补跑 = 重跑这些 shard**（新 worker 目录；libero/calvin 有 resume 只补缺的，其余靠去重）。
+- **`run.py`**：`_benchmark_family` 改为从 planning 导入的别名（同一真相来源）。
+- **测试**：新增 `test_planning.py` 7 个 + 重写 `test_validation.py` 7 个；全量 **99 passed / 1 skipped**，ruff clean。
+- **仍未做**（要拿**细粒度**需 runner 支持，见 `01` §5.8）：CALVIN `--sequence-offset`、SimplerEnv/ManiSkill "跑 N 集"循环、RoboTwin 去掉正则 patch。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -354,6 +367,10 @@
 - **依据**：§2.16 / §2.17 的失败模式梳理。
 - **明确不做**：coordinator supervisor（靠 resume 手动重跑）。
 - **只写方案**：GPU-sim 的 `policy_call_ms` 推导（`01` §5.7 末）。
+
+### T2-5 分片 planner 表（让所有 benchmark 进得来）【✅ 已完成，见 §2.18】
+
+- **仍未做**：各 runner 的细粒度分片支持（CALVIN offset / SimplerEnv·ManiSkill N 集循环 / RoboTwin 正式参数）。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 

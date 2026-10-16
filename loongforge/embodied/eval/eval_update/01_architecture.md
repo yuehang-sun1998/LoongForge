@@ -371,6 +371,29 @@ vectorization: { num_envs: 1 }                                          # §7.5
 - **coordinator supervisor：不做。** coordinator 仍是单点（它崩了没人拉起），但**不引入外部 supervisor**——靠 runner 的 **resume 手动重跑**即可（已完成集跳过，代价可接受）。
 - **GPU-sim 的 `policy_call_ms` 推导：只写方案，本次不开发。** GPU-sim 的 `t_service` 更长、且与 sim 渲染争同一张卡，下限必须用**实测的 GPU-sim 服务时间**（见 §4.4 / `03_testing.md` T-07），不能拿 CPU-sim 的数外推。
 
+### 5.8 分片：per-benchmark planner 表【✅ 已实现】
+
+**问题**：原 `_shards()` 把两件事混在一起——**"这个 benchmark 有哪些工作单元"（benchmark 相关）** 和 **"怎么把单元变成 worker"（benchmark 无关）**。前者被写死成 LIBERO 的 `(suite, task, episode)` 网格 → 其他 benchmark 进不来。
+
+**拆法**：shard 变成**纯数据记录**，planner 每族一个，按 `benchmark_family()`（= `run.py` 选 runner 用的**同一个函数**，两边共用一份）查表。
+
+```python
+Shard = {"id": str, "overrides": {<config 段>: {<键>: <值>}}, "expected": int}
+```
+
+| family | planner | 工作单元 | 分片轴 |
+|---|---|---|---|
+| libero | `plan_libero` | `(suite, task, episode)` | suite × task(int) × episode(+offset)，chunk 细到快槽能抢 |
+| simplerenv / maniskill | `plan_episode_indexed` | **单集** | task(str) × episode |
+| robotwin | `plan_robotwin` | `(task, config, seed 区间)` | task(str) × config × `start_seed` + `test_num` |
+| calvin | `plan_calvin` | `(task_suite, sequence)` | suite × `num_sequences`（**runner 无 offset → 目前只能 1 片**） |
+
+**通用侧不变**：`_shard_config()` 退化成"deepcopy + apply overrides + 去 coordinator-only 键"，不认任何 benchmark；派发（全局队列 / 重试 / 看门狗）不变。
+
+**校验也跟着改成 benchmark-无关**：不再展开 `(suite, task, episode)`，改成**按 shard 的 `expected` 计数 + `episode_id` 去重**；"重复"定义为**两个不同 shard 声明了同一集**（同一 shard 的重跑是预期重叠，靠 `episode_id` 去重吸收）；**补跑 = 重跑"短了的 shard"**（落到新 worker 目录）。
+
+**仍未做（要拿细粒度需 runner 支持）**：CALVIN 的 `--sequence-offset`；SimplerEnv/ManiSkill 的"跑 N 集"循环（现在一次 1 集 → 粒度 = 1 集）；RoboTwin 把 `start_seed`/`test_num` 变成正式参数（现在靠**正则 patch RoboTwin 源码**，上游一改就崩）。
+
 ## 6. 标定方法论
 
 > **本方案的核心方法**：对任意 `(model, benchmark, gpu, config)`，先**找出绑定资源**，再按该资源选杠杆；**不要预设**哪个资源是瓶颈——量出来。N 的标定（§6.2 起）只是其中一个环节。
