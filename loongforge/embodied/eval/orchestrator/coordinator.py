@@ -37,6 +37,7 @@ from loongforge.embodied.eval.orchestrator.server_manager import (
     start_server,
     wait_healthz,
 )
+from loongforge.embodied.eval.transport.client import PolicyClient
 from loongforge.embodied.eval.orchestrator.validation import (
     missing_keys,
     read_records,
@@ -51,6 +52,13 @@ DEFAULT_MAX_RETRIES = 2  # episode-level infra retries (episode_error / timeouts
 MAX_REPAIR_ROUNDS = 3  # auto re-dispatch rounds for episodes the plan asked for but that never ran
 WATCHDOG_INTERVAL_SEC = 15.0  # how often the coordinator checks its servers are alive
 WATCHDOG_RESTART_TIMEOUT_SEC = 600.0  # cap on waiting for a restarted server to get healthy
+WATCHDOG_PROBE_INTERVAL_SEC = 60.0  # how often a live server is probed with a real ping
+WATCHDOG_UNHEALTHY_LIMIT = 2  # consecutive failed probes before a hung server is restarted
+PROBE_CONNECT_TIMEOUT_SEC = 3.0  # the probe must never stall the watchdog for long
+PROBE_PING_TIMEOUT_SEC = 15.0  # a ping only waits behind ~N queued inferences (~1s at N=16)
+# PolicyClient pops these while connecting (a proxy breaks a local websocket); the
+# probe runs inside the coordinator, so put them back afterwards.
+_PROXY_ENV_KEYS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
 UNIT_TIMEOUT_SLACK_SEC = 300  # head-room over the episode budget before a unit is killed
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
@@ -253,12 +261,21 @@ class _ServerWatchdog(threading.Thread):
     reconnect on their next retry.
     """
 
-    def __init__(self, servers: List[tuple], gpus: List[int], interval_sec: float = WATCHDOG_INTERVAL_SEC) -> None:
+    def __init__(
+        self,
+        servers: List[tuple],
+        gpus: List[int],
+        interval_sec: float = WATCHDOG_INTERVAL_SEC,
+        probe_interval_sec: float = WATCHDOG_PROBE_INTERVAL_SEC,
+    ) -> None:
         super().__init__(daemon=True, name="server-watchdog")
         self._servers = servers  # list of (proc, args); replaced in place on restart
         self._gpus = gpus
         self._interval = interval_sec
+        self._probe_interval = probe_interval_sec
         self._stop_event = threading.Event()  # NB: not ``_stop`` -- Thread reserves that name
+        self._unhealthy: Dict[int, int] = {}
+        self._last_probe: Dict[int, float] = {}
         self.restarts = 0
 
     def stop(self) -> None:
@@ -266,11 +283,45 @@ class _ServerWatchdog(threading.Thread):
         self._stop_event.set()
 
     def run(self) -> None:
-        """Poll each server and restart the ones whose process has exited."""
+        """Poll each server: restart a dead process, and a live-but-hung one."""
         while not self._stop_event.wait(self._interval):
-            for index, (proc, _) in enumerate(self._servers):
+            now = time.time()
+            for index, (proc, args) in enumerate(self._servers):
                 if proc.poll() is not None:
+                    self._unhealthy[index] = 0
                     self._restart(index)
+                    continue
+                # A live process is not necessarily a *serving* one: the healthz endpoint
+                # is a separate thread, so it stays green even if the policy loop is
+                # wedged. Only a real request proves liveness.
+                if now - self._last_probe.get(index, 0.0) < self._probe_interval:
+                    continue
+                self._last_probe[index] = now
+                if self._alive(args):
+                    self._unhealthy[index] = 0
+                    continue
+                self._unhealthy[index] = self._unhealthy.get(index, 0) + 1
+                if self._unhealthy[index] >= WATCHDOG_UNHEALTHY_LIMIT:
+                    self._unhealthy[index] = 0
+                    self._restart(index)
+
+    def _alive(self, args: Any) -> bool:
+        """A bounded ping round-trip against a live server."""
+        saved = {key: os.environ[key] for key in _PROXY_ENV_KEYS if key in os.environ}
+        client = None
+        try:
+            client = PolicyClient(host=args.host, port=args.port, timeout=PROBE_CONNECT_TIMEOUT_SEC)
+            client.ping(timeout=PROBE_PING_TIMEOUT_SEC)
+            return True
+        except Exception:
+            return False
+        finally:
+            os.environ.update(saved)  # PolicyClient pops these; restore them
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def _restart(self, index: int) -> None:
         """Run _restart."""

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from types import SimpleNamespace
 
@@ -278,3 +279,50 @@ def test_watchdog_does_not_leak_a_restart_started_during_shutdown(monkeypatch: A
     assert watchdog.restarts == 0  # never counted as a successful restart
     assert servers[0][0].returncode == 1  # the original entry is untouched
     assert created and created[0].terminated  # the process we started was cleaned up
+
+
+def test_watchdog_restarts_a_hung_server(monkeypatch: Any) -> None:
+    """A live process that stops answering pings is restarted after the failure limit."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    monkeypatch.setattr(coord, "start_server", lambda args, env=None: _FakeProc(None))
+    monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
+    args = SimpleNamespace(host="127.0.0.1", port=14560, health_port=14561, server_start_timeout_sec=5)
+    servers = [(_FakeProc(None), args)]  # process alive, but wedged
+    watchdog = coord._ServerWatchdog(servers, [0], interval_sec=0.05, probe_interval_sec=0.0)
+    monkeypatch.setattr(watchdog, "_alive", lambda a: False)
+
+    watchdog.start()
+    time.sleep(0.5)
+    watchdog.stop()
+    watchdog.join(timeout=2)
+
+    assert watchdog.restarts >= 1  # it keeps failing the probe, so it may restart more than once
+
+
+def test_watchdog_leaves_a_responding_server_alone(monkeypatch: Any) -> None:
+    """Run test_watchdog_leaves_a_responding_server_alone."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    args = SimpleNamespace(host="127.0.0.1", port=14560, health_port=14561, server_start_timeout_sec=5)
+    live = _FakeProc(None)
+    watchdog = coord._ServerWatchdog([(live, args)], [0], interval_sec=0.05, probe_interval_sec=0.0)
+    monkeypatch.setattr(watchdog, "_alive", lambda a: True)
+
+    watchdog.start()
+    time.sleep(0.3)
+    watchdog.stop()
+    watchdog.join(timeout=2)
+
+    assert watchdog.restarts == 0
+
+
+def test_alive_probe_fails_fast_and_restores_proxy_env(monkeypatch: Any) -> None:
+    """A dead port fails the probe, and the probe puts the proxy env back."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    monkeypatch.setattr(coord, "PROBE_CONNECT_TIMEOUT_SEC", 0.1)
+    monkeypatch.setenv("HTTP_PROXY", "http://example.invalid:1")
+    watchdog = coord._ServerWatchdog([], [], interval_sec=99)
+    assert watchdog._alive(SimpleNamespace(host="127.0.0.1", port=9, health_port=9)) is False
+    assert os.environ.get("HTTP_PROXY") == "http://example.invalid:1"
