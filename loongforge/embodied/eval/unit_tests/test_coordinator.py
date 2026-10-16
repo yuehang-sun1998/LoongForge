@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
+
+import pytest
 from typing import Any
 
 from loongforge.embodied.eval.orchestrator.coordinator import (
@@ -213,3 +215,35 @@ def test_await_slot_kills_a_unit_that_blows_its_budget() -> None:
     proc, timed_out = coord._await_slot(pool, started_at, timeout_sec=0.5)
     assert proc is stuck
     assert timed_out is True
+
+
+def test_run_exits_nonzero_when_coverage_is_incomplete(monkeypatch: Any, tmp_path: Any) -> None:
+    """A coordinated run whose coverage is still incomplete must not exit 0."""
+    import sys as _sys
+
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+    from loongforge.embodied.eval.orchestrator import run as run_mod
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("coordinator: {}\n", encoding="utf-8")
+    monkeypatch.setattr(_sys, "argv", ["run", "--config", str(cfg)])
+    monkeypatch.setattr(run_mod, "load_config", lambda path: {"coordinator": {}})
+    monkeypatch.setattr(coord, "run", lambda config, path: {"validation": {"ok": False}})
+    with pytest.raises(SystemExit) as excinfo:
+        run_mod.main()
+    assert excinfo.value.code == 2
+
+
+def test_run_exits_zero_when_coverage_is_complete(monkeypatch: Any, tmp_path: Any) -> None:
+    """Run test_run_exits_zero_when_coverage_is_complete."""
+    import sys as _sys
+
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+    from loongforge.embodied.eval.orchestrator import run as run_mod
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("coordinator: {}\n", encoding="utf-8")
+    monkeypatch.setattr(_sys, "argv", ["run", "--config", str(cfg)])
+    monkeypatch.setattr(run_mod, "load_config", lambda path: {"coordinator": {}})
+    monkeypatch.setattr(coord, "run", lambda config, path: {"validation": {"ok": True}})
+    run_mod.main()  # must not raise
