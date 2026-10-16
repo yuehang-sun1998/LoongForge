@@ -19,6 +19,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from websockets.exceptions import ConnectionClosed
 
 from loongforge.embodied.eval.adapters.libero import (
     LIBERO_DUMMY_ACTION, LIBERO_ENV_RESOLUTION, SUITE_MAX_STEPS, LiberoAdapter,
@@ -229,7 +230,11 @@ def _classify_exception(exc: Exception) -> str:
         return "env_timeout"
     if isinstance(exc, TimeoutError):
         return "policy_timeout"
-    if isinstance(exc, (ConnectionError, OSError)):
+    if isinstance(exc, (ConnectionError, OSError, ConnectionClosed)):
+        # A dropped websocket (``ConnectionClosedError``) is a *connection* failure, not a
+        # model failure: classify it so the retry loop rebuilds the client instead of
+        # hammering a dead socket (that is what turned a keepalive blip into 16 straight
+        # failures in the static 8-card run).
         return "server_unreachable"
     return "episode_error"
 
@@ -563,7 +568,7 @@ def run_batch(args: argparse.Namespace) -> Dict[str, Any]:
     server_manager = getattr(args, "server_manager", None)
     if server_manager is not None:
         server_manager.ensure_running()
-    client = PolicyClient(host=args.host, port=args.port)
+    client = PolicyClient(host=args.host, port=args.port, timeout=args.server_connect_timeout_sec)
     new_records: List[Dict[str, Any]] = []
     start_time = time.time()
 
@@ -608,7 +613,9 @@ def run_batch(args: argparse.Namespace) -> Dict[str, Any]:
                         if record.get("failure_reason") == "server_unreachable" and server_manager is not None:
                             client.close()
                             server_manager.ensure_running()
-                            client = PolicyClient(host=args.host, port=args.port)
+                            client = PolicyClient(
+                                host=args.host, port=args.port, timeout=args.server_connect_timeout_sec
+                            )
                         time.sleep(min(2**attempt, 8))
                 append_jsonl(results_path, record)
                 new_records.append(record)
@@ -733,6 +740,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--restart", action="store_true")
     parser.add_argument("--policy-call-timeout-ms", type=float, default=5000.0)
+    parser.add_argument("--server-connect-timeout-sec", type=float, default=60.0)
     parser.add_argument("--per-step-timeout-sec", type=float, default=30.0)
     parser.add_argument("--per-episode-timeout-sec", type=float, default=600.0)
     parser.add_argument("--max-retries", type=int, default=0)

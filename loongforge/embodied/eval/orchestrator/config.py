@@ -194,6 +194,7 @@ CONFIG_MAPPING = {
     # action decoder key is non-identity — capability matching drives this).
     "benchmark.control_mode": "control_mode",
     "server.chunk_execute_steps": "chunk_execute_steps",
+    "server.connect_timeout_sec": "server_connect_timeout_sec",
     "benchmark.dataset_path": "dataset_path",
     "benchmark.calvin_config_path": "calvin_config_path",
     "benchmark.eval_sequences_path": "eval_sequences_path",
