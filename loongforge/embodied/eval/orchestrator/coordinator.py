@@ -50,6 +50,7 @@ UNITS_PER_SLOT = 4  # shards per worker slot: slack so fast slots can steal work
 DEFAULT_MAX_RETRIES = 2  # episode-level infra retries (episode_error / timeouts) per unit
 MAX_REPAIR_ROUNDS = 3  # auto re-dispatch rounds for episodes the plan asked for but that never ran
 WATCHDOG_INTERVAL_SEC = 15.0  # how often the coordinator checks its servers are alive
+WATCHDOG_RESTART_TIMEOUT_SEC = 600.0  # cap on waiting for a restarted server to get healthy
 UNIT_TIMEOUT_SLACK_SEC = 300  # head-room over the episode budget before a unit is killed
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
@@ -232,6 +233,17 @@ def _await_slot(
         time.sleep(1)
 
 
+def _terminate(proc: subprocess.Popen, timeout: float = 30) -> None:
+    """Terminate a process, escalating to SIGKILL if it does not exit."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 class _ServerWatchdog(threading.Thread):
     """Restart a policy server that has died, in place (same port).
 
@@ -262,13 +274,25 @@ class _ServerWatchdog(threading.Thread):
 
     def _restart(self, index: int) -> None:
         """Run _restart."""
+        if self._stop_event.is_set():
+            return
         _, args = self._servers[index]
         print(f"[watchdog] server {index} died; restarting on port {args.port}", flush=True)
         try:
             proc = start_server(args, {"CUDA_VISIBLE_DEVICES": str(self._gpus[index])})
-            wait_healthz(f"http://{args.host}:{args.health_port}/healthz", args.server_start_timeout_sec, proc)
+            wait_healthz(
+                f"http://{args.host}:{args.health_port}/healthz",
+                min(args.server_start_timeout_sec, WATCHDOG_RESTART_TIMEOUT_SEC),
+                proc,
+            )
         except Exception as exc:  # a failed restart is retried on the next tick
             print(f"[watchdog] restart of server {index} failed: {exc}", flush=True)
+            return
+        if self._stop_event.is_set():
+            # We were shut down while this restart was in flight: the run's cleanup
+            # has already terminated the old servers, so terminate this one too
+            # rather than leaking a process that would hold a GPU.
+            _terminate(proc)
             return
         self._servers[index] = (proc, args)
         self.restarts += 1
@@ -388,12 +412,9 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
                 repair_rounds += 1
     finally:
         watchdog.stop()
+        watchdog.join(timeout=WATCHDOG_INTERVAL_SEC + 5)
         for proc, _ in servers:
-            proc.terminate()
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            _terminate(proc)
 
     validation = validate(plan, read_records(output_dir, len(all_shards)))
     print(f"[coordinator] {format_report(validation)}", flush=True)
