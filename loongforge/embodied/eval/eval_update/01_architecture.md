@@ -362,8 +362,14 @@ vectorization: { num_envs: 1 }                                          # §7.5
 | **`infra_failed > 0` 却看着正常** | 分数被压低却被当成功 | coordinator 打印覆盖行 + 对 `infra_failed`/`ok=false` 出 **stderr 告警**；**`ok=false` 时 `run.py` exit 2**（"需要人工介入"）。过程中仍不中断 |
 | **看门狗 vs 关闭竞态** | restart 期间 shutdown → **孤儿 server 占卡** | `_restart` 前后都查 stop 标志（期间启动的进程自己收尾）；restart 等待上限 600s（不用 1800s）；teardown 先 `join` 看门狗 |
 | **hung server**（进程活但不服务） | 看门狗查不到（`poll()` 正常，且 healthz 是**独立线程**照样 200） | 每分钟对每个活 server 做**真 ping 探活**（`PolicyClient.ping(timeout=)`），连续 2 次失败 → 重启；探活有界（3s 连接 / 15s pong），并**恢复被 `PolicyClient` 弹掉的代理环境变量** |
+| **两个 coordinator 共用 `output_dir`** | 互相覆盖 `worker_*/` 与结果 | 启动时发现 `coordinator_result.json` 就**拒绝启动**（除非 `run.resume: true`） |
+| **`policy_call_ms` 低于排队等待** | 假 `policy_timeout`，看着像模型失败 | 设了 `timeouts.service_ms`（来自标定报告的 `service_mean_ms`）时，按 `N × service_ms × 2` 算下限，**低于就 stderr 告警** |
+| **server 崩溃循环** | 每 15s 重启一次、每次重载 ~100s → 慢速空转 | 每个 server 重启上限 `MAX_SERVER_RESTARTS=3`；超了**放弃**并记入 `servers_given_up`，`run.py` 同样 **exit 2** |
 
-**仍未覆盖（已知）**：coordinator 本身无 supervisor（它是单点）；两个 coordinator 写同一 `output_dir` 无锁；`policy_call_ms` 需按 N 放宽（目前靠人手设）；崩溃循环（server 反复崩）只能靠看门狗反复重启（有界但慢）。
+**明确不做 / 只写方案（用户 2026-10-15 决定）**：
+
+- **coordinator supervisor：不做。** coordinator 仍是单点（它崩了没人拉起），但**不引入外部 supervisor**——靠 runner 的 **resume 手动重跑**即可（已完成集跳过，代价可接受）。
+- **GPU-sim 的 `policy_call_ms` 推导：只写方案，本次不开发。** GPU-sim 的 `t_service` 更长、且与 sim 渲染争同一张卡，下限必须用**实测的 GPU-sim 服务时间**（见 §4.4 / `03_testing.md` T-07），不能拿 CPU-sim 的数外推。
 
 ## 6. 标定方法论
 

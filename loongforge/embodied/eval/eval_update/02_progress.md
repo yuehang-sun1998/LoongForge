@@ -42,6 +42,7 @@
 | 2 | **运行后覆盖校验 + 自动补跑** | ✅ 完成 | `validation.py` + `coordinator.py` | `03_testing.md` T-09 | — |
 | 2 | **server 自愈（看门狗 + 连接重建）** | ✅ 完成（`57dcef9` + `3cc3a2d`） | `coordinator.py` + `libero_runner.py` | `03_testing.md` T-10 | §2.15 |
 | 2 | **健壮性兜底**（unit 超时 / 收尾信号 / 竞态 / hung 探活） | ✅ 完成（`dc07c75`/`2e28ce0`/`e5f077c`/`cf9abb6`） | `coordinator.py` + `run.py` + `transport/client.py` | `03_testing.md` T-11 | §2.16 |
+| 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -254,6 +255,16 @@
 - **测试**：新增 8 个用例（unit 超时 / 预算推导 / 退出码 / 竞态 / 探活）；全量 **87 passed / 1 skipped**，ruff clean。
 - **仍未覆盖**：coordinator 无 supervisor（单点）；同 `output_dir` 无锁；`policy_call_ms` 未按 N 自动放宽。
 
+### 2.17 运维陷阱兜底（2026-10-15）
+
+用户对剩下 4 项的决定：**① supervisor 不做**；**③ GPU-sim 只写方案**；② ④ 做。
+
+- **② `output_dir` 冲突**（`a01390b`）：启动时若已存在 `coordinator_result.json` → **拒绝启动**（`SystemExit`），除非 `run.resume: true`（runner 按 episode resume，续跑有意义）。防两份协调评测互相覆盖。
+- **③ `policy_call_ms` 下限告警**（`a01390b`）：设了 `timeouts.service_ms`（= 标定报告的 `service_mean_ms`）时，按 `N × service_ms × 2` 算下限，低于就 **stderr 告警**——否则假 `policy_timeout` 会被误当模型失败。**GPU-sim 部分只写进 `01` §5.7，本次不开发**（它的 `t_service` 更长且与 sim 渲染争卡，必须用 GPU-sim 实测值）。
+- **④ server 重启上限**（`2d43e73`）：`MAX_SERVER_RESTARTS=3`；超了**放弃该 server**（stderr 明说"需要人工介入"）并记入 `servers_given_up`；`run.py` 同样 **exit 2**。防崩溃循环慢速空转。
+- **明确不做**：coordinator supervisor —— 它崩了靠 runner 的 **resume 手动重跑**（已完成集跳过），代价可接受。
+- **测试**：新增 5 个用例（拒绝覆盖 / resume 放行 / 下限告警三态 / 重启上限放弃 / given_up → exit 2）；全量 **92 passed / 1 skipped**，ruff clean。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -331,10 +342,11 @@
 - **验收**：✅ kill 掉一个 server → 看门狗**同端口重启**（`server_restarts=1`）、**`infra_failed=0`**、8 集全补齐、218s 跑完（不再 300s 卡死）。见 §2.15 复测。
 - **依据**：§2.15 的故障注入实测；设计见 `01_architecture.md` §5.6。
 
-### T2-4 健壮性兜底（unit 超时 / 收尾信号 / 竞态 / hung 探活）【✅ 已完成，见 §2.16】
+### T2-4 健壮性兜底（unit 超时 / 收尾信号 / 竞态 / hung 探活 / 运维陷阱）【✅ 已完成，见 §2.16 + §2.17】
 
-- **依据**：§2.16 的失败模式梳理。
-- **仍未覆盖**（后续可选）：coordinator supervisor；`output_dir` 锁；`policy_call_ms` 按 N 自动放宽。
+- **依据**：§2.16 / §2.17 的失败模式梳理。
+- **明确不做**：coordinator supervisor（靠 resume 手动重跑）。
+- **只写方案**：GPU-sim 的 `policy_call_ms` 推导（`01` §5.7 末）。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 
