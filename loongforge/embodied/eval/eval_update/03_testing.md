@@ -44,7 +44,7 @@
 | T-03 | 一行命令起 1+N（external + 最小 coordinator） | 1 | CPU-sim | ✅ 通过（N=1 两步 / N=2 一条命令） |
 | T-04 | shard/worker 契约 | 2 | 至少两个 family | ✅ 通过（由 `run.py` 分发吸收，M2 E2E 驱动多 server 分片） |
 | T-05 | 动态队列 + 全量 wall-clock | 2 | 全 benchmark | ✅ 静态基线 94.2 min；**M2 全量 56.2 min / 96.45%**（vs 基线 1.68×、vs 1卡1server 3.09×） |
-| T-06 | 数值一致性（batch>1 vs batch=1） | 3（暂缓） | 任一 | ⏸ 暂缓 |
+| T-06 | 数值一致性（batch>1 vs batch=1） | 3（M3 前置） | 任一 | 📋 **方案已定**（per-row seeds 比对，见下）；待契约落地 |
 | T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | ⏸ 暂缓（环境不支持 GPU-sim，待 CPU-sim 完成后统一做） |
 | T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3（暂缓） | 任一 | ⏸ 暂缓 |
 | T-09 | 运行后覆盖校验（漏/重/多出）+ 自动补跑 | 2 | 任一 | ✅ 通过（单测 5 passed；真实 M2 全量 `ok=true`） |
@@ -286,12 +286,22 @@
   - **总 wall 几乎不变**（583→635ms，8× 工作量 +9%）→ **每请求成本由固定项主导，不是每样本计算**。
 - **结论**：✅ **M3 是 GO，且是量级最大的剩余杠杆**（不是"暂缓"）。**caveats**：① replay 直调 `infer_action`，绕开 `predict_action` 的包装（归一化/cache）→ 量的是 **cache-miss 的真实推理**路径；② 返回值仍把 batch 压掉（`[32,7]`）→ 真实现要修返回路径（小）；③ 批要从 K 个**不同步**的请求里攒（`max_wait_ms` 窗口，批可能不满）→ 实收 < 7.3×；④ 批内噪声：`torch.randn((K,...), generator=g)` 每样本独立 ✓，但批器要按各请求 seed 逐行设；⑤ **端到端上限受 CPU 侧约束**（Amdahl）——server 提速后 CPU 可能成新瓶颈，当前 CPU 仅 8.9%（N=16）有余量，**要实测**。
 
-### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
+### T-06 · 数值一致性（batch>1 vs batch=1） 【📋 方案已定，M3 前置】
 
 - **对应功能**：T3-1 + FastWAM batch 契约。
-- **目的**：确认 batching 不改出分。
-- **通过标准**：batch>1 与 batch=1 在同一分片上出分一致（或差异在噪声范围内），批内噪声语义明确。
-- **数据**：_待填_
+- **目的**：证明 **batching 不改结果**——这是 **M3 的正确性门**，**优先于性能**（T-13 只证明了"跑得动、batch 流进去了"，**没证明"结果没变"**）。
+- **前置改动（本身就是 M3 契约的一部分）**：`infer_action` 接受 **per-row seeds**（`Sequence[int]`），批内第 i 行用第 i 个 seed 构造噪声。
+  - 这既是 **batcher 需要的接口**（每个请求带自己的 seed），也是让比对**可精确归因**的前提——否则 batch=1 与 batch=K 的噪声本身不同，差异无法区分"batching 引入的"还是"噪声不同导致的"。
+- **步骤**：
+  1. **固定输入**：同一条件图 + 同一 proprio + 同一 instruction + 同一 K 个 seed `[s0..s_{K-1}]`。
+  2. **参考**：对每个 seed **各跑一次 batch=1** → `ref_i`（K 次单样本）。
+  3. **批**：用**同一组 seed** 跑一次 batch=K → `bat_i`。
+  4. **比对**：逐样本 `d_i = max|bat_i - ref_i|`；报 `max_i d_i` 与逐样本明细。
+- **通过标准**：
+  - **首要**：`bat_i` 与 `ref_i` 逐位一致（`max_i d_i == 0`）；若有差，须 ≤ **明确阈值**并**说明来源**（批内 GEMM 的归约顺序与 batch=1 不同，**~1e-6 级浮点差属预期**；关键是不能有**结构性**差异，如某行结果错位/串行）。
+  - **附加（防"假批"）**：`bat_i` 与 `ref_j (j≠i)` **必须不同** → 证明不是所有行都用了同一噪声/同一结果（batch_probe 的 `samples_differ` 是弱版，这里要逐行对号）。
+- **工具**：扩 `orchestrator/batch_probe.py` 加 `--equivalence`（或独立入口 `batch_equivalence`）：跑上面 2/3/4 并打印 `max_i d_i` + 是否逐行对号。
+- **数据**：_待填_（依赖 per-row seeds 的契约先落地）
 - **结论**：_待填_
 
 ### T-07 · GPU-sim：sim/server 同卡 vs 异卡

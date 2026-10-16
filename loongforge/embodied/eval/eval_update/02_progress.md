@@ -299,6 +299,7 @@
   - 🔴 **"固定开销主导"假设被证伪**；收益只能来自**大 batch 的 SM 利用率**。
   - ⛔ **batch 契约真的不存在**：batch=1 断言散在 **5 处**（`mot/fastwam.py::_encode_input_image_latents_tensor`、`wan/core.py` ×2、`mot/idm.py`、`mot/joint.py`），且编码器是 `input_image[0].unsqueeze(1)` + `vae.encode([image])` 逐样本 API。
 - 🔑 **第二轮：临时放开契约后实测（跑完已还原，`git status` 干净）**：`total_ms` batch 1/2/4/8 = **583.4 / 584.4 / 595.7 / 635.0**，`per_sample_ms` = **583 / 292 / 149 / 79** → **7.3× @ batch 8**。插桩验证 batch 真进了去噪（`latents_action=(K,32,7)`）。
+- 🔴 **正确性门**：T-13 只证明"跑得动"，**没证明"结果没变"** → M3 必须先过 **T-06**（batch=1 vs batch=K 逐样本比对，需 `infer_action` 接受 **per-row seeds**）——方案已写进 `03_testing.md` T-06。
 - **结论**：✅ **M3 从"暂缓"改为 GO，且是量级最大的剩余杠杆**。前置 = 补 batch 契约（6 处入口断言全在推理侧 + 修返回路径 + 批内噪声逐行 seed + server 侧 batcher）。⚠️ 端到端收益受 CPU 侧约束（Amdahl），**要实测**，别把 7.3× 当端到端。
 
 ### 2.20 全量 chaos 实测：故障零扰动（2026-10-15）
