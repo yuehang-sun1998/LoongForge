@@ -487,7 +487,14 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     all_shards: List[tuple] = list(plan)
     failed_units: List[int] = []
     repair_rounds = 0
-    watchdog = _ServerWatchdog(servers, gpus)  # started once the servers are healthy
+    # watchdog knobs (mainly so a test can shrink the intervals)
+    coordinator_cfg = config.get("coordinator") or {}
+    watchdog = _ServerWatchdog(  # started once the servers are healthy
+        servers,
+        gpus,
+        interval_sec=float(coordinator_cfg.get("watchdog_interval_sec") or WATCHDOG_INTERVAL_SEC),
+        probe_interval_sec=float(coordinator_cfg.get("watchdog_probe_interval_sec") or WATCHDOG_PROBE_INTERVAL_SEC),
+    )
     started = time.time()
     try:
         for proc, args in servers:
