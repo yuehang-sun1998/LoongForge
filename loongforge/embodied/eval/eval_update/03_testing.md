@@ -51,6 +51,7 @@
 | T-10 | 故障注入：漏集补跑 / kill server 自愈 | 2 | 任一 | ✅ 通过（漏集补跑 ✅；kill server → 看门狗重启、`infra_failed=0`） |
 | T-11 | 健壮性兜底（unit 超时 / 收尾信号 / 竞态 / hung 探活） | 2 | 任一 | ✅ 通过（单测 8 个；E2E 冒烟通过） |
 | T-12 | 分片 planner 表（per-benchmark） | 2 | 全 family | ✅ 通过（单测 14 个；E2E 冒烟通过） |
+| T-13 | batch 缩放探针（M3 go/no-go） | 3 | 任一 | 🔄 探针就绪，待跑（需空闲 GPU） |
 
 ---
 
@@ -243,6 +244,17 @@
   4. 校验：漏 → `missing`；跨 shard 撞集 → `duplicates`；同 shard 重跑 → **不算** duplicate；`short_shards()` 只报短的。
 - **数据（2026-10-15）**：`test_planning.py` **7 个** + `test_validation.py` **7 个**全过；全量 **99 passed / 1 skipped**，ruff clean；小规模 E2E 冒烟通过（LIBERO 路径）。
 - **结论**：✅ 通过（**切法**已验证）。**仍未做**：拿**细粒度**需改 runner（CALVIN `--sequence-offset` / SimplerEnv·ManiSkill "跑 N 集" / RoboTwin 去正则 patch）→ 留档为 **T2-6**，**当前环境无法验证**（只有 LIBERO 能跑）。
+
+### T-13 · batch 缩放探针（M3 的 go/no-go）
+
+- **对应功能**：§7.4（M3）+ `orchestrator/batch_probe.py`。
+- **目的**：在**动 FastWAM batch 契约之前**，先量清"一次真实推理的 wall 花在哪"——决定 batching 值不值得做。
+- **步骤**：`python -m loongforge.embodied.eval.orchestrator.batch_probe --config <server yaml> --calls 5 --batches 1,2,4,8`
+- **判据**：
+  - `gpu_share`（cuda_ms / wall_ms）低 + `host_ms` 高 → **固定开销主导 → batching 收益大**；
+  - `gpu_share` 高 → 看 `per_sample_ms` 随 batch 是否显著下降（下降 = 计算可批，收益仍在）。
+- **数据**：_待填_（探针就绪，等空闲 GPU；chaos 全量占用中）
+- **结论**：_待填_
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 
