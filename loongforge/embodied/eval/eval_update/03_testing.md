@@ -50,6 +50,7 @@
 | T-09 | 运行后覆盖校验（漏/重/多出）+ 自动补跑 | 2 | 任一 | ✅ 通过（单测 5 passed；真实 M2 全量 `ok=true`） |
 | T-10 | 故障注入：漏集补跑 / kill server 自愈 | 2 | 任一 | ✅ 通过（漏集补跑 ✅；kill server → 看门狗重启、`infra_failed=0`） |
 | T-11 | 健壮性兜底（unit 超时 / 收尾信号 / 竞态 / hung 探活） | 2 | 任一 | ✅ 通过（单测 8 个；E2E 冒烟通过） |
+| T-12 | 分片 planner 表（per-benchmark） | 2 | 全 family | ✅ 通过（单测 14 个；E2E 冒烟通过） |
 
 ---
 
@@ -230,6 +231,18 @@
   - 单测 **13 个**；全量 **93 passed / 1 skipped**，ruff clean。
   - 🔴 **测试中发现的 bug（已修 `683b455`）**：看门狗重启 **hung** server 时**不先终止旧进程** → 旧进程仍占端口 → 重绑失败 → 永远恢复不了。
 - **结论**：✅ 通过。**明确不做**：coordinator supervisor（靠 resume 手动重跑）。**只写方案**：GPU-sim 的 `policy_call_ms` 推导（`01_architecture.md` §5.7 末）。
+
+### T-12 · 分片 planner 表（per-benchmark）
+
+- **对应功能**：§5.8。
+- **目的**：确认**每个 benchmark family 都能被切成 shard**，且切法正确（无重叠、无遗漏、id 唯一）。
+- **步骤/判据**：
+  1. `benchmark_family()` 把 `libero*` 归一到 `libero`，其余四族原样返回。
+  2. 每族 planner 产出的 shard：`sum(expected)` = 总集数；`id` 唯一；`overrides` 落在该族的真实入参上（libero→`suite/task_ids/episode_offset`；maniskill/simplerenv→`task_name/episode_idx`；robotwin→`task_name/task_config/start_seed/test_num`；calvin→`task_suite_name/num_sequences`）。
+  3. `_shard_config()` 机械套用 overrides 并去掉 coordinator-only 键。
+  4. 校验：漏 → `missing`；跨 shard 撞集 → `duplicates`；同 shard 重跑 → **不算** duplicate；`short_shards()` 只报短的。
+- **数据（2026-10-15）**：`test_planning.py` **7 个** + `test_validation.py` **7 个**全过；全量 **99 passed / 1 skipped**，ruff clean；小规模 E2E 冒烟通过（LIBERO 路径）。
+- **结论**：✅ 通过。**仍未做**：拿**细粒度**需 runner 支持（CALVIN `--sequence-offset`、SimplerEnv/ManiSkill "跑 N 集"、RoboTwin 去正则 patch）——见 `01_architecture.md` §5.8。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 
