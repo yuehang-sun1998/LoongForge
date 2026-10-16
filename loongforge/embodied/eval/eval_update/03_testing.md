@@ -265,8 +265,14 @@
 - **判据**：
   - `gpu_share`（cuda_ms / wall_ms）低 + `host_ms` 高 → **固定开销主导 → batching 收益大**；
   - `gpu_share` 高 → 看 `per_sample_ms` 随 batch 是否显著下降（下降 = 计算可批，收益仍在）。
-- **数据**：_待填_（探针就绪，等空闲 GPU；chaos 全量占用中）
-- **结论**：_待填_
+- **数据（2026-10-15，A800，`libero_10` server 配置，5 次调用取均值）**：
+  - **SPLIT**：`wall_ms=655.5`、**`cuda_ms=680.6`**、`host_ms=-25.1`、**`gpu_share≈1.04`**。top kernels 是大 GEMM（`ampere_bf16_s16816gemm_128x128` 74.8ms、`128x64` 57.1ms）+ flash-attention（66.5ms）+ layer_norm（49.7ms）。
+    - ⚠️ `cuda_ms > wall_ms` 说明**多 stream 有重叠**，比值不精确；但结论明确：**GPU 在推理期间是饱和的，host 开销 ≈ 0**。
+  - **SCALING**：batch 1 得 `total_ms=593.4`（内层 `infer_action`）；**batch 2/4/8 全部报错** `input_image must have shape [1,3,H,W] or [3,H,W], got (8,3,224,448)`。
+- **结论**：🔄 **探针回答了"花在哪"，但答不了"batch 能降多少"**：
+  1. 🔴 **我的"固定开销主导"假设被证伪** —— 一次真实推理 `gpu_share≈1`，**是 GPU 饱和**，不是 host 开销。所以 batching 的收益只能来自**大 batch 下 SM 利用率更高**（batch-1 的 GEMM 效率），**不是**摊薄固定开销。
+  2. ⛔ **缩放测不了**：batch=1 假设**散在 5 处**（`mot/fastwam.py::_encode_input_image_latents_tensor`、`wan/core.py` ×2、`mot/idm.py`、`mot/joint.py`），且编码器是 `input_image[0].unsqueeze(1)` + `vae.encode([image])` 的**逐样本 list API** → **batch 契约是真的不存在**，不是"没接上"。
+  3. **因此 M3 仍暂缓，但理由变精确了**：不是"GPU 空着所以没用"，而是"**要先把 batch 契约补出来（5 处 + VAE list API + 批内噪声语义），才能估出 SM 利用率那点收益**"。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 
