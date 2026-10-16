@@ -60,6 +60,7 @@ PROBE_PING_TIMEOUT_SEC = 15.0  # a ping only waits behind ~N queued inferences (
 # probe runs inside the coordinator, so put them back afterwards.
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
 UNIT_TIMEOUT_SLACK_SEC = 300  # head-room over the episode budget before a unit is killed
+POLICY_TIMEOUT_SAFETY = 2.0  # queue wait is (N-1) x service; keep 2x head-room
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
 
@@ -169,6 +170,31 @@ def _aggregate(output_dir: Path, n_units: int) -> Dict[str, Any]:
     total = len(seen)
     successes = sum(seen.values())
     return {"n_episodes": total, "successes": successes, "success_rate": (successes / total) if total else None}
+
+
+def _warn_policy_timeout(config: Dict[str, Any], n_per_server: int) -> None:
+    """Warn when the per-call timeout is below the queue-wait floor.
+
+    A server serialises requests, so the last of N sims waits about ``(N-1) * t_service``
+    per step. If ``timeouts.policy_call_ms`` is below ``N * service_ms * safety`` the
+    units hit spurious ``policy_timeout`` failures that look like model failures.
+    ``timeouts.service_ms`` is the mean per-request service time from the calibration
+    report (``service_mean_ms``); without it the check is skipped.
+    """
+    timeouts = config.get("timeouts") or {}
+    service_ms = timeouts.get("service_ms")
+    timeout_ms = timeouts.get("policy_call_ms")
+    if not service_ms or not timeout_ms:
+        return
+    floor_ms = n_per_server * float(service_ms) * POLICY_TIMEOUT_SAFETY
+    if float(timeout_ms) < floor_ms:
+        print(
+            f"[coordinator] WARNING: timeouts.policy_call_ms={timeout_ms}ms is below the queue-wait floor "
+            f"{floor_ms:.0f}ms (N={n_per_server} x service={service_ms}ms x {POLICY_TIMEOUT_SAFETY}) -- "
+            "units will hit spurious policy_timeout failures; raise it",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _resolve_placement(config: Dict[str, Any]) -> tuple[List[int], int]:
@@ -401,6 +427,13 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
 
     output_dir = Path(str((config.get("run") or {}).get("output_dir") or "/tmp/vla_eval"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    finished = output_dir / "coordinator_result.json"
+    if finished.exists() and not (config.get("run") or {}).get("resume"):
+        raise SystemExit(
+            f"{finished} already exists -- refusing to overwrite a finished run. "
+            "Use a fresh run.output_dir, or set run.resume: true to continue it."
+        )
+    _warn_policy_timeout(config, n_per_server)
 
     base_args = apply_config(build_server_argparser().parse_args([]), config)
     base_args.config = config_path

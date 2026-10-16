@@ -326,3 +326,53 @@ def test_alive_probe_fails_fast_and_restores_proxy_env(monkeypatch: Any) -> None
     watchdog = coord._ServerWatchdog([], [], interval_sec=99)
     assert watchdog._alive(SimpleNamespace(host="127.0.0.1", port=9, health_port=9)) is False
     assert os.environ.get("HTTP_PROXY") == "http://example.invalid:1"
+
+
+def _mini_config(output_dir: str, **run_extra: Any) -> dict:
+    return {
+        "benchmark": {"suite": "libero_10", "task_ids": [0], "episodes_per_task": 1},
+        "servers": [{"gpus": [0]}],
+        "pools": {"cpu_sim": {"n_sims_per_server": 1}},
+        "run": {"output_dir": output_dir, **run_extra},
+    }
+
+
+def test_run_refuses_to_clobber_a_finished_run(tmp_path: Any) -> None:
+    """An existing coordinator_result.json means "already run" -- refuse unless resuming."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "coordinator_result.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo:
+        coord.run(_mini_config(str(out)), "")
+    assert "already exists" in str(excinfo.value)
+
+
+def test_run_allows_a_finished_dir_when_resuming(monkeypatch: Any, tmp_path: Any) -> None:
+    """Run test_run_allows_a_finished_dir_when_resuming."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "coordinator_result.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(coord, "start_server", lambda args, env=None: _FakeProc(0))
+    monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
+    monkeypatch.setattr(coord, "_launch_unit", lambda *args, **kwargs: _FakeProc(0))
+    monkeypatch.setattr(coord, "missing_keys", lambda *args, **kwargs: [])
+    result = coord.run(_mini_config(str(out), resume=True), "")
+    assert result["n_units"] == 1
+
+
+def test_policy_timeout_warning_fires_only_when_below_the_floor(capsys: Any) -> None:
+    """The floor is N x service_ms x safety; warn below it, stay quiet above (or unknown)."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    coord._warn_policy_timeout({"timeouts": {"service_ms": 500, "policy_call_ms": 5000}}, 16)
+    assert "below the queue-wait floor" in capsys.readouterr().err
+
+    coord._warn_policy_timeout({"timeouts": {"service_ms": 500, "policy_call_ms": 60000}}, 16)
+    assert capsys.readouterr().err == ""
+
+    coord._warn_policy_timeout({"timeouts": {"policy_call_ms": 5000}}, 16)  # no service_ms -> skipped
+    assert capsys.readouterr().err == ""
