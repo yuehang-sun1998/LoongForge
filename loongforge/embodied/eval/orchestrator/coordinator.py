@@ -29,7 +29,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from loongforge.embodied.eval.orchestrator.config import apply_config
 from loongforge.embodied.eval.orchestrator.server_manager import (
@@ -49,6 +49,7 @@ UNITS_PER_SLOT = 4  # shards per worker slot: slack so fast slots can steal work
 DEFAULT_MAX_RETRIES = 2  # episode-level infra retries (episode_error / timeouts) per unit
 MAX_REPAIR_ROUNDS = 3  # auto re-dispatch rounds for episodes the plan asked for but that never ran
 WATCHDOG_INTERVAL_SEC = 15.0  # how often the coordinator checks its servers are alive
+UNIT_TIMEOUT_SLACK_SEC = 300  # head-room over the episode budget before a unit is killed
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
 
@@ -186,14 +187,47 @@ def _launch_unit(
     )
 
 
-def _drain_pool(pool: Dict[subprocess.Popen, int], wait: bool) -> Optional[subprocess.Popen]:
-    """Return a finished process (or None if none finished and wait is False)."""
+def _unit_timeout_sec(config: Dict[str, Any], shards: List[tuple]) -> float:
+    """Wall-clock budget for one unit.
+
+    A unit runs ``episodes_per_task`` episodes of one task, so its budget is that
+    many ``per_episode_sec`` timeouts plus connection setup and slack. This is a
+    backstop against a unit that hangs in native code (where the runner's SIGALRM
+    cannot fire) -- without it ``_await_slot`` would block forever. Override with
+    ``run.unit_timeout_sec``.
+    """
+    explicit = float((config.get("run") or {}).get("unit_timeout_sec") or 0)
+    if explicit > 0:
+        return explicit
+    per_episode = float((config.get("timeouts") or {}).get("per_episode_sec") or 1800)
+    connect = float((config.get("server") or {}).get("connect_timeout_sec") or 60)
+    max_episodes = max((count for *_, count in shards), default=1)
+    return max_episodes * per_episode + connect + UNIT_TIMEOUT_SLACK_SEC
+
+
+def _await_slot(
+    pool: Dict[subprocess.Popen, tuple], started_at: Dict[int, float], timeout_sec: float
+) -> Tuple[subprocess.Popen, bool]:
+    """Block until a unit finishes or blows its wall-clock budget.
+
+    Returns ``(proc, timed_out)``; a timed-out unit is killed here so its slot frees
+    and it goes through the usual retry/repair path.
+    """
     while True:
         for proc in list(pool):
             if proc.poll() is not None:
-                return proc
-        if not wait:
-            return None
+                return proc, False
+        if timeout_sec > 0:
+            now = time.time()
+            for proc, (_, index) in list(pool.items()):
+                if now - started_at[index] > timeout_sec:
+                    print(f"[coordinator] unit {index} exceeded {timeout_sec:.0f}s; killing it", flush=True)
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return proc, True
         time.sleep(1)
 
 
@@ -248,10 +282,12 @@ def _run_batch(
     concurrency: int,
     output_dir: Path,
     tmp: Path,
+    timeout_sec: float = 0.0,
 ) -> Tuple[Dict[int, int], List[int]]:
     """Run ``indices`` (into ``shards``) through a bounded pool fed by a global queue.
 
-    A unit that exits non-zero is re-queued once, then reported as failed.
+    A unit that exits non-zero -- or that blows its ``timeout_sec`` budget -- is
+    re-queued once, then reported as failed.
     Returns ``(returncodes_by_index, failed_indices)``.
     """
     returncodes: Dict[int, int] = {}
@@ -259,18 +295,20 @@ def _run_batch(
     pending = list(indices)
     free_slots = list(range(concurrency))  # slot -> server = slot % len(urls)
     attempts: Dict[int, int] = {}
+    started_at: Dict[int, float] = {}
     pool: Dict[subprocess.Popen, tuple] = {}
     while pending or pool:
         while pending and free_slots:
             slot = free_slots.pop()
             index = pending.pop(0)
             url = urls[slot % len(urls)]
+            started_at[index] = time.time()
             pool[_launch_unit(config, shards[index], index, url, output_dir, tmp)] = (slot, index)
-        finished = _drain_pool(pool, wait=True)
+        finished, timed_out = _await_slot(pool, started_at, timeout_sec)
         slot, index = pool.pop(finished)
         free_slots.append(slot)
         returncodes[index] = finished.returncode
-        if finished.returncode != 0:
+        if finished.returncode != 0 or timed_out:
             attempts[index] = attempts.get(index, 0) + 1
             if attempts[index] < MAX_ATTEMPTS:
                 pending.append(index)  # re-queue once; a fresh unit may just be a flaky sim
@@ -316,6 +354,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         servers.append((start_server(server_args, {"CUDA_VISIBLE_DEVICES": str(gpu)}), server_args))
     urls = [f"ws://{args.host}:{args.port}" for _, args in servers]
 
+    unit_timeout = _unit_timeout_sec(config, plan)
     all_shards: List[tuple] = list(plan)
     failed_units: List[int] = []
     repair_rounds = 0
@@ -330,7 +369,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             _, failed_units = _run_batch(
-                config, all_shards, list(range(len(all_shards))), urls, concurrency, output_dir, tmp
+                config, all_shards, list(range(len(all_shards))), urls, concurrency, output_dir, tmp, unit_timeout
             )
             # Coverage gate: re-dispatch episodes the plan asked for but that produced no
             # record at all, rather than aborting the run. Only a still-incomplete run
@@ -342,7 +381,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
                 first = len(all_shards)
                 all_shards.extend(repair_shards(missing))
                 _, extra_failed = _run_batch(
-                    config, all_shards, list(range(first, len(all_shards))), urls, concurrency, output_dir, tmp
+                    config, all_shards, list(range(first, len(all_shards))), urls, concurrency, output_dir, tmp, unit_timeout
                 )
                 failed_units.extend(extra_failed)
                 repair_rounds += 1
@@ -368,6 +407,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         "n_units": len(plan),
         "n_units_launched": len(all_shards),
         "repair_rounds": repair_rounds,
+        "unit_timeout_sec": unit_timeout,
         "failed_units": failed_units,
         "server_restarts": watchdog.restarts,
         "elapsed_sec": round(time.time() - started, 1),
