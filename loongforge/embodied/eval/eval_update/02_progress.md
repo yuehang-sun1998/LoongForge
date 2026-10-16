@@ -41,6 +41,7 @@
 | 2 | episode-chunk 粒度抢占 | ✅ 完成（chunk 细到 1 集，快槽可抢下一个 unit） | `coordinator.py` | `03_testing.md` T-05 | 队列 |
 | 2 | **运行后覆盖校验 + 自动补跑** | ✅ 完成 | `validation.py` + `coordinator.py` | `03_testing.md` T-09 | — |
 | 2 | **server 自愈（看门狗 + 连接重建）** | ✅ 完成（`57dcef9` + `3cc3a2d`） | `coordinator.py` + `libero_runner.py` | `03_testing.md` T-10 | §2.15 |
+| 2 | **健壮性兜底**（unit 超时 / 收尾信号 / 竞态 / hung 探活） | ✅ 完成（`dc07c75`/`2e28ce0`/`e5f077c`/`cf9abb6`） | `coordinator.py` + `run.py` + `transport/client.py` | `03_testing.md` T-11 | §2.16 |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -242,6 +243,17 @@
 
 **修复后复测（2026-10-15）**：同一 kill-server 实验重跑 → **看门狗检测并重启**（`server_restarts=1`，日志 `server 0 died; restarting on port 18100` → `server 0 back up`）→ **`validation.ok=true`、`infra_failed=0`、`failed_units=[]`**、8 集全在（失败全是 `not_successful_within_max_steps`）、`elapsed=218s`。**自愈链打通**：server 挂 → 同端口重启 → unit 重建 client 重连 → episode 重试补齐。代价 = 重启要重载模型（~100s），期间命中的 unit 靠重试等待。
 
+### 2.16 M2 健壮性加固（2026-10-15）
+
+用户问"还有其他可能 fail 的 case 吗"，梳理出 4 类并逐一实现：
+
+- **① unit 级 wall-clock 超时**（`dc07c75`）：把 `_drain_pool`（无限等）换成 `_await_slot`——超预算就 kill，走重试/补跑。防 native 层死锁把整轮挂死。预算 = `max episodes × per_episode_sec + connect + slack`，`run.unit_timeout_sec` 可覆盖，有效值落结果 JSON。
+- **② 收尾信号**（`2e28ce0`）：coordinator 打印覆盖行 + 对 `infra_failed`/`ok=false` 出 stderr 告警；**`run.py` 在 `ok=false` 时 `exit(2)`**（"需要人工介入"）。**过程中仍不中断**（补跑照常）。
+- **③ 看门狗竞态**（`e5f077c`）：`_restart` 前后都查 stop 标志（shutdown 期间启动的 server 自己 terminate）；restart 等待上限从 1800s 降到 **600s**；teardown 先 `join` 看门狗。防**孤儿 server 占卡**。
+- **④ hung server 探活**（`cf9abb6`）：进程活着但不服务时 `poll()` 查不到、healthz（独立线程）照样 200 → 改为每分钟**真 ping**（`PolicyClient.ping` 新增 `timeout`，走 `recv(timeout=)`），连续 2 次失败重启；探活有界（3s/15s）且恢复被弹掉的代理环境变量。
+- **测试**：新增 8 个用例（unit 超时 / 预算推导 / 退出码 / 竞态 / 探活）；全量 **87 passed / 1 skipped**，ruff clean。
+- **仍未覆盖**：coordinator 无 supervisor（单点）；同 `output_dir` 无锁；`policy_call_ms` 未按 N 自动放宽。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -318,6 +330,11 @@
 - **改动**：① coordinator 加看门狗线程（查进程 + `/healthz`，死了**原地重启**）；② runner 把 websocket 连接类异常（`ConnectionClosed*`）归为 `server_unreachable`（触发 client 重建 + `ensure_running`）；③ client 的 `_wait_for_server` 300s 对 unit 级缩短 / 或让 unit 快速失败。
 - **验收**：✅ kill 掉一个 server → 看门狗**同端口重启**（`server_restarts=1`）、**`infra_failed=0`**、8 集全补齐、218s 跑完（不再 300s 卡死）。见 §2.15 复测。
 - **依据**：§2.15 的故障注入实测；设计见 `01_architecture.md` §5.6。
+
+### T2-4 健壮性兜底（unit 超时 / 收尾信号 / 竞态 / hung 探活）【✅ 已完成，见 §2.16】
+
+- **依据**：§2.16 的失败模式梳理。
+- **仍未覆盖**（后续可选）：coordinator supervisor；`output_dir` 锁；`policy_call_ms` 按 N 自动放宽。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 

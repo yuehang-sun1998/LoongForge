@@ -352,6 +352,19 @@ vectorization: { num_envs: 1 }                                          # §7.5
 
 **实测（2026-10-15，T-10）**：跑到中途 `kill -9` 掉一个 server → 看门狗日志 `server 0 died; restarting on port 18100` → `server 0 back up`；结果 **`server_restarts=1`、`validation.ok=true`、`infra_failed=0`、`failed_units=[]`**，218s 跑完（修复前是无限 300s 卡死）。**代价**：重启要重新加载模型（~100s），期间命中的 unit 靠重试/补跑等它起来——**可接受，远好于不恢复**。
 
+### 5.7 健壮性兜底（M2 加固，2026-10-15）【✅ 已实现】
+
+除了 server 自愈（§5.6），还有四类失败模式，已一并兜住：
+
+| 失败模式 | 后果 | 兜底 |
+|---|---|---|
+| **unit 卡死**（native 层死锁，SIGALRM 穿不透） | 等待单元永久阻塞 → **整轮挂死** | 每个 unit 有 wall-clock 预算（`max episodes × per_episode_sec + connect + slack`，`run.unit_timeout_sec` 可覆盖）；超预算 kill → 走重试/补跑。有效值落 `coordinator_result.json` |
+| **`infra_failed > 0` 却看着正常** | 分数被压低却被当成功 | coordinator 打印覆盖行 + 对 `infra_failed`/`ok=false` 出 **stderr 告警**；**`ok=false` 时 `run.py` exit 2**（"需要人工介入"）。过程中仍不中断 |
+| **看门狗 vs 关闭竞态** | restart 期间 shutdown → **孤儿 server 占卡** | `_restart` 前后都查 stop 标志（期间启动的进程自己收尾）；restart 等待上限 600s（不用 1800s）；teardown 先 `join` 看门狗 |
+| **hung server**（进程活但不服务） | 看门狗查不到（`poll()` 正常，且 healthz 是**独立线程**照样 200） | 每分钟对每个活 server 做**真 ping 探活**（`PolicyClient.ping(timeout=)`），连续 2 次失败 → 重启；探活有界（3s 连接 / 15s pong），并**恢复被 `PolicyClient` 弹掉的代理环境变量** |
+
+**仍未覆盖（已知）**：coordinator 本身无 supervisor（它是单点）；两个 coordinator 写同一 `output_dir` 无锁；`policy_call_ms` 需按 N 放宽（目前靠人手设）；崩溃循环（server 反复崩）只能靠看门狗反复重启（有界但慢）。
+
 ## 6. 标定方法论
 
 > **本方案的核心方法**：对任意 `(model, benchmark, gpu, config)`，先**找出绑定资源**，再按该资源选杠杆；**不要预设**哪个资源是瓶颈——量出来。N 的标定（§6.2 起）只是其中一个环节。

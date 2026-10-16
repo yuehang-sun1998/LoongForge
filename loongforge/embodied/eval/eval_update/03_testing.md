@@ -49,6 +49,7 @@
 | T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3（暂缓） | 任一 | ⏸ 暂缓 |
 | T-09 | 运行后覆盖校验（漏/重/多出）+ 自动补跑 | 2 | 任一 | ✅ 通过（单测 5 passed；真实 M2 全量 `ok=true`） |
 | T-10 | 故障注入：漏集补跑 / kill server 自愈 | 2 | 任一 | ✅ 通过（漏集补跑 ✅；kill server → 看门狗重启、`infra_failed=0`） |
+| T-11 | 健壮性兜底（unit 超时 / 收尾信号 / 竞态 / hung 探活） | 2 | 任一 | ✅ 通过（单测 8 个；E2E 冒烟通过） |
 
 ---
 
@@ -203,6 +204,18 @@
   - **B kill server**：`kill -9` 掉 `server_0` → ① **无重启**（external 模式 `ensure_running` 空转）；② 命中它的 unit 记 `episode_error`/`ConnectionClosedError`、`attempt: 2`（重试 3 次全败）；③ 走到 client 重建的 unit **卡满 300s**（`TimeoutError: Failed to connect to server within 300 seconds`）。**⚠️ 暴露 3 个缺口。**
   - **B 修复后复测**（`57dcef9` 连接重建 + `3cc3a2d` 看门狗）：同实验重跑 → `server_restarts=1`（日志 `server 0 died; restarting on port 18100` → `server 0 back up`）、**`validation.ok=true`、`infra_failed=0`、`failed_units=[]`**、8 集全在、`elapsed=218s`。**✅ 自愈生效**（代价：重启重载模型 ~100s）。
 - **结论**：✅ 通过。漏集由补跑闭环补齐；server 挂掉由看门狗同端口重启 + client 重建 + episode 重试恢复，`infra_failed` 归零、不再被 300s 拖尾。
+
+### T-11 · 健壮性兜底：unit 超时 / 收尾信号 / 竞态 / hung 探活
+
+- **对应功能**：§5.7。
+- **目的**：覆盖"会挂死 / 会静默出错分 / 会漏进程 / 查不到"的四类失败模式。
+- **步骤/判据**：
+  1. **unit 超时**：unit 卡死超过预算 → 被 kill、走重试/补跑（单测：`_await_slot` 超预算返回 `timed_out=True`；`_unit_timeout_sec` 按 episode 预算推导）。
+  2. **收尾信号**：`ok=false` → `run.py` **exit 2**；`infra_failed>0` → stderr 告警（单测：两个退出码用例）。
+  3. **看门狗竞态**：shutdown 落在 restart 中途 → 期间启动的 server 被自己 terminate、不进 `servers`（单测：`created[0].terminated`）。
+  4. **hung 探活**：进程活但 ping 不通 → 连续 2 次失败后重启；活着的正常 server 不误杀；探活有界且恢复代理环境变量（单测 3 个）。
+- **数据（2026-10-15）**：单测 **8 个**全过；全量 **87 passed / 1 skipped**，ruff clean；小规模 E2E 冒烟通过（覆盖行打印 + 无告警）。
+- **结论**：✅ 通过。四类失败模式均已兜底；**未覆盖项**列在 `01_architecture.md` §5.7 末（coordinator 单点 / output_dir 无锁 / `policy_call_ms` 未自动放宽）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 
