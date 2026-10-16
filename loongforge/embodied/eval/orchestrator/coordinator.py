@@ -28,7 +28,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loongforge.embodied.eval.orchestrator.config import apply_config
 from loongforge.embodied.eval.orchestrator.server_manager import (
@@ -36,10 +36,17 @@ from loongforge.embodied.eval.orchestrator.server_manager import (
     start_server,
     wait_healthz,
 )
+from loongforge.embodied.eval.orchestrator.validation import (
+    missing_keys,
+    read_records,
+    repair_shards,
+    validate,
+)
 
 PORT_STRIDE = 20
 UNITS_PER_SLOT = 4  # shards per worker slot: slack so fast slots can steal work
 DEFAULT_MAX_RETRIES = 2  # episode-level infra retries (episode_error / timeouts) per unit
+MAX_REPAIR_ROUNDS = 3  # auto re-dispatch rounds for episodes the plan asked for but that never ran
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
 
@@ -188,11 +195,50 @@ def _drain_pool(pool: Dict[subprocess.Popen, int], wait: bool) -> Optional[subpr
         time.sleep(1)
 
 
+def _run_batch(
+    config: Dict[str, Any],
+    shards: List[tuple],
+    indices: List[int],
+    urls: List[str],
+    concurrency: int,
+    output_dir: Path,
+    tmp: Path,
+) -> Tuple[Dict[int, int], List[int]]:
+    """Run ``indices`` (into ``shards``) through a bounded pool fed by a global queue.
+
+    A unit that exits non-zero is re-queued once, then reported as failed.
+    Returns ``(returncodes_by_index, failed_indices)``.
+    """
+    returncodes: Dict[int, int] = {}
+    failures: List[int] = []
+    pending = list(indices)
+    free_slots = list(range(concurrency))  # slot -> server = slot % len(urls)
+    attempts: Dict[int, int] = {}
+    pool: Dict[subprocess.Popen, tuple] = {}
+    while pending or pool:
+        while pending and free_slots:
+            slot = free_slots.pop()
+            index = pending.pop(0)
+            url = urls[slot % len(urls)]
+            pool[_launch_unit(config, shards[index], index, url, output_dir, tmp)] = (slot, index)
+        finished = _drain_pool(pool, wait=True)
+        slot, index = pool.pop(finished)
+        free_slots.append(slot)
+        returncodes[index] = finished.returncode
+        if finished.returncode != 0:
+            attempts[index] = attempts.get(index, 0) + 1
+            if attempts[index] < MAX_ATTEMPTS:
+                pending.append(index)  # re-queue once; a fresh unit may just be a flaky sim
+            else:
+                failures.append(index)
+    return returncodes, failures
+
+
 def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     """Run a coordinated (G server : G x N worker) evaluation with dynamic dispatch."""
     gpus, n_per_server = _resolve_placement(config)
     concurrency = max(1, len(gpus) * n_per_server)
-    shards = _shards(config, concurrency)
+    plan = _shards(config, concurrency)
 
     output_dir = Path(str((config.get("run") or {}).get("output_dir") or "/tmp/vla_eval"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -225,36 +271,34 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         servers.append((start_server(server_args, {"CUDA_VISIBLE_DEVICES": str(gpu)}), server_args))
     urls = [f"ws://{args.host}:{args.port}" for _, args in servers]
 
-    returncodes: List[Optional[int]] = [None] * len(shards)
-    failures: List[int] = []
+    all_shards: List[tuple] = list(plan)
+    failed_units: List[int] = []
+    repair_rounds = 0
     started = time.time()
     try:
         for proc, args in servers:
             wait_healthz(f"http://{args.host}:{args.health_port}/healthz", args.server_start_timeout_sec, proc)
         started = time.time()  # worker wall only (exclude model load)
 
-        pending = list(range(len(shards)))
-        free_slots = list(range(concurrency))  # slot -> server = slot % len(servers)
-        attempts: Dict[int, int] = {}
-        pool: Dict[subprocess.Popen, tuple] = {}
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            while pending or pool:
-                while pending and free_slots:
-                    slot = free_slots.pop()
-                    index = pending.pop(0)
-                    url = urls[slot % len(urls)]
-                    pool[_launch_unit(config, shards[index], index, url, output_dir, tmp)] = (slot, index)
-                finished = _drain_pool(pool, wait=True)
-                slot, index = pool.pop(finished)
-                free_slots.append(slot)
-                returncodes[index] = finished.returncode
-                if finished.returncode != 0:
-                    attempts[index] = attempts.get(index, 0) + 1
-                    if attempts[index] < MAX_ATTEMPTS:
-                        pending.append(index)  # re-queue once; a fresh unit may just be a flaky sim
-                    else:
-                        failures.append(index)
+            _, failed_units = _run_batch(
+                config, all_shards, list(range(len(all_shards))), urls, concurrency, output_dir, tmp
+            )
+            # Coverage gate: re-dispatch episodes the plan asked for but that produced no
+            # record at all, rather than aborting the run. Only a still-incomplete run
+            # after MAX_REPAIR_ROUNDS is worth a human's attention.
+            for _ in range(MAX_REPAIR_ROUNDS):
+                missing = missing_keys(plan, read_records(output_dir, len(all_shards)))
+                if not missing:
+                    break
+                first = len(all_shards)
+                all_shards.extend(repair_shards(missing))
+                _, extra_failed = _run_batch(
+                    config, all_shards, list(range(first, len(all_shards))), urls, concurrency, output_dir, tmp
+                )
+                failed_units.extend(extra_failed)
+                repair_rounds += 1
     finally:
         for proc, _ in servers:
             proc.terminate()
@@ -263,6 +307,9 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
             except subprocess.TimeoutExpired:
                 proc.kill()
 
+    validation = validate(plan, read_records(output_dir, len(all_shards)))
+    # Persist the plan so ``python -m ...validation`` can re-check a finished run offline.
+    (output_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
     result = {
         "benchmark": (config.get("benchmark") or {}).get("suites")
         or (config.get("benchmark") or {}).get("suite")
@@ -270,11 +317,14 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         "gpus": gpus,
         "n_sims_per_server": n_per_server,
         "concurrency": concurrency,
-        "n_units": len(shards),
-        "failed_units": failures,
+        "n_units": len(plan),
+        "n_units_launched": len(all_shards),
+        "repair_rounds": repair_rounds,
+        "failed_units": failed_units,
         "elapsed_sec": round(time.time() - started, 1),
         "output_dir": str(output_dir),
-        "summary": _aggregate(output_dir, len(shards)),
+        "validation": validation,
+        "summary": _aggregate(output_dir, len(all_shards)),
     }
     (output_dir / "coordinator_result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result

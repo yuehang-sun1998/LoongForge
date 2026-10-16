@@ -119,6 +119,7 @@ def test_run_retries_a_failed_unit_once(monkeypatch: Any, tmp_path: Any) -> None
     monkeypatch.setattr(coord, "start_server", lambda args, env=None: _FakeProc(0))
     monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
     monkeypatch.setattr(coord, "_aggregate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(coord, "missing_keys", lambda *args, **kwargs: [])
 
     config = {
         "benchmark": {"suite": "libero_10", "task_ids": [0], "episodes_per_task": 2},
