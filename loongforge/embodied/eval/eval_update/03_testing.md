@@ -217,7 +217,18 @@
   5. **`output_dir` 冲突**：已有 `coordinator_result.json` → 拒绝启动（`SystemExit`）；`run.resume: true` 放行（单测 2 个）。
   6. **`policy_call_ms` 下限**：`N × service_ms × 2` 之上不告警、之下告警、未给 `service_ms` 跳过（单测 1 个，三态）。
   7. **server 崩溃循环**：连续失败超过 `MAX_SERVER_RESTARTS` → 放弃并记入 `servers_given_up`；`run.py` **exit 2**（单测 2 个）。
-- **数据（2026-10-15）**：单测 **13 个**全过；全量 **92 passed / 1 skipped**，ruff clean；小规模 E2E 冒烟通过（覆盖行打印 + 无告警）。
+- **数据（2026-10-15，真实小评测逐个注入：2 卡 / 8 unit / 8 集 / `max_steps=150`）**：
+
+  | case | 注入 | 结果 |
+  |---|---|---|
+  | unit 超时 | `run.unit_timeout_sec: 5`（每 unit 必超） | 14 unit 被 kill；`repair_rounds=3`、`ok=False missing=8`、**exit 2**、打印 `coverage INCOMPLETE … needs a human` |
+  | hung server | `SIGSTOP` server_0 | `server 0 is hung; terminating it before restart` → `back up`；`server_restarts=1`、`repair_rounds=2`、**`ok=True missing=0 infra_failed=0`**、exit 0 |
+  | 崩溃循环 | 反复 `SIGKILL` server_0 | 3 次 restart 全失败 → `giving up … needs a human`；`servers_given_up=[0]`、**exit 2**；且 `ok=True missing=0`（剩余 server + 补跑兜住） |
+  | `output_dir` 冲突 | 同目录重跑 | **exit 1** + `already exists -- refusing to overwrite` |
+  | `policy_call_ms` 下限 | `service_ms=500 / policy_call_ms=500 / N=16` | 启动即告警 `below the queue-wait floor 16000ms` |
+
+  - 单测 **13 个**；全量 **93 passed / 1 skipped**，ruff clean。
+  - 🔴 **测试中发现的 bug（已修 `683b455`）**：看门狗重启 **hung** server 时**不先终止旧进程** → 旧进程仍占端口 → 重绑失败 → 永远恢复不了。
 - **结论**：✅ 通过。**明确不做**：coordinator supervisor（靠 resume 手动重跑）。**只写方案**：GPU-sim 的 `policy_call_ms` 推导（`01_architecture.md` §5.7 末）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
