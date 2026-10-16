@@ -242,7 +242,7 @@
   3. `_shard_config()` 机械套用 overrides 并去掉 coordinator-only 键。
   4. 校验：漏 → `missing`；跨 shard 撞集 → `duplicates`；同 shard 重跑 → **不算** duplicate；`short_shards()` 只报短的。
 - **数据（2026-10-15）**：`test_planning.py` **7 个** + `test_validation.py` **7 个**全过；全量 **99 passed / 1 skipped**，ruff clean；小规模 E2E 冒烟通过（LIBERO 路径）。
-- **结论**：✅ 通过。**仍未做**：拿**细粒度**需 runner 支持（CALVIN `--sequence-offset`、SimplerEnv/ManiSkill "跑 N 集"、RoboTwin 去正则 patch）——见 `01_architecture.md` §5.8。
+- **结论**：✅ 通过（**切法**已验证）。**仍未做**：拿**细粒度**需改 runner（CALVIN `--sequence-offset` / SimplerEnv·ManiSkill "跑 N 集" / RoboTwin 去正则 patch）→ 留档为 **T2-6**，**当前环境无法验证**（只有 LIBERO 能跑）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 

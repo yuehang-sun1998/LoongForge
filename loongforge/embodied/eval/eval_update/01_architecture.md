@@ -392,7 +392,16 @@ Shard = {"id": str, "overrides": {<config 段>: {<键>: <值>}}, "expected": int
 
 **校验也跟着改成 benchmark-无关**：不再展开 `(suite, task, episode)`，改成**按 shard 的 `expected` 计数 + `episode_id` 去重**；"重复"定义为**两个不同 shard 声明了同一集**（同一 shard 的重跑是预期重叠，靠 `episode_id` 去重吸收）；**补跑 = 重跑"短了的 shard"**（落到新 worker 目录）。
 
-**仍未做（要拿细粒度需 runner 支持）**：CALVIN 的 `--sequence-offset`；SimplerEnv/ManiSkill 的"跑 N 集"循环（现在一次 1 集 → 粒度 = 1 集）；RoboTwin 把 `start_seed`/`test_num` 变成正式参数（现在靠**正则 patch RoboTwin 源码**，上游一改就崩）。
+**后续 TODO（要拿细粒度必须改 runner；环境无法验证，先留档）**：
+
+| # | runner | 现状 | 改成 | 买到 |
+|---|---|---|---|---|
+| 1 | `calvin_runner` | `eval_sequences[:num_sequences]` —— **只能从头取 N 条** | 加 `--sequence-offset` → `eval_sequences[off:off+n]` | CALVIN 从**1 片**变 N 片，能进全局队列 |
+| 2 | `simplerenv_runner` / `maniskill_runner` | 一次进程**只跑 1 集**（`--episode-idx`） | 支持"跑 N 集"（`--episodes-per-task` + offset，内部循环） | 一片 = N 集，env/scene 只建一次，摊薄启动开销；planner 能按 chunk 切 |
+| 3 | `robotwin_runner` | 靠**正则 patch RoboTwin 源码**设 `st_seed`/`test_num`（`text.replace(...)`） | 走正式入参；**至少校验 patch 命中，不命中就报错** | 分片不再静默失效 |
+
+> **边界提醒**：本方案的约定是"改动落点在**编排层**，不动 runner"。以上三项**要动 runner** → 建议**单独一轮、按 family 分开提交**，别和编排层混。
+> **为什么现在不做**：环境里**只有 LIBERO 能跑**（CALVIN 依赖未装、RoboTwin 缺 EGL 驱动、SimplerEnv/ManiSkill 依赖未装）→ **写了也没法验证**。
 
 ## 6. 标定方法论
 
