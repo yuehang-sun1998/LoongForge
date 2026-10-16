@@ -332,7 +332,7 @@ vectorization: { num_envs: 1 }                                          # §7.5
 - **闭环（不中断评测）**：`missing` 非空 → 把缺失键**合并回连续区间**成补跑分片 → 复用同一个有界池再跑 → 再校验，最多 `MAX_REPAIR_ROUNDS=3` 轮。**只有 3 轮后仍不完整**才 `ok=false`（此时才值得人工介入）；**过程中不抛异常、不中断**。
 - **实现**：`orchestrator/validation.py`（`expected_keys` / `key_of` / `read_records` / `validate` / `missing_keys` / `repair_shards` / `format_report` + CLI）；报告随 `coordinator_result.json` 落盘。
 
-### 5.6 server 自愈：看门狗 + 连接重建【⬜ 待实现】
+### 5.6 server 自愈：看门狗 + 连接重建【✅ 已实现】
 
 覆盖校验（§5.5）解决"漏集"，但 **server 挂掉**是另一类故障。实测（`03_testing.md` T-10）暴露三个缺口：
 
@@ -340,7 +340,7 @@ vectorization: { num_envs: 1 }                                          # §7.5
 2. **连接不重建 → 级联失败**：`ConnectionClosedError` 被 `_classify_exception` 归为 `episode_error`，而 runner 只在 `server_unreachable` 时重建 client（`libero_runner.py:513`）→ 同一条死连接继续失败。
 3. **连接等待 300s**：一旦重建，`PolicyClient._wait_for_server(timeout=300)` 对着死 server 等满 300s → 每次尝试 300s × 重试 × 补跑轮 = 分钟级到几十分钟级拖尾。
 
-**设计（三件一起做）**：
+**实现（三件，`57dcef9` + `3cc3a2d`）**：
 
 | # | 位置 | 改动 |
 |---|---|---|
@@ -348,7 +348,9 @@ vectorization: { num_envs: 1 }                                          # §7.5
 | 2 | **runner** | `_classify_exception` 把 websocket 连接类异常（`ConnectionClosed*`）归为 `server_unreachable` → 触发 client 重建 + `ensure_running`。 |
 | 3 | **client / unit** | `_wait_for_server` 的 300s 对 unit 级过长 → 缩短/可配；或 unit 连接失败**快速失败**，把恢复交给 coordinator（unit 重试 + §5.5 补跑）。 |
 
-**自愈链**：server 挂 → coordinator 重启 → unit 重建 client 重连 → episode 级重试 + §5.5 补跑补齐覆盖。
+**自愈链**：server 挂 → coordinator 看门狗重启（**同端口**）→ unit 重建 client 重连 → episode 级重试 + §5.5 补跑补齐覆盖。
+
+**实测（2026-10-15，T-10）**：跑到中途 `kill -9` 掉一个 server → 看门狗日志 `server 0 died; restarting on port 18100` → `server 0 back up`；结果 **`server_restarts=1`、`validation.ok=true`、`infra_failed=0`、`failed_units=[]`**，218s 跑完（修复前是无限 300s 卡死）。**代价**：重启要重新加载模型（~100s），期间命中的 unit 靠重试/补跑等它起来——**可接受，远好于不恢复**。
 
 ## 6. 标定方法论
 
@@ -590,7 +592,7 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 6. **批内噪声 / 数值一致性**（仅阶段 3）：见 §7.4。
 7. **排队等待撞客户端超时**：server 串行处理 → 第 N 个 sim 每步要等 `≈(N-1)×t_infer`。客户端 per-call 超时 `--policy-call-timeout-ms` **默认 5000ms**（`libero_runner.py:588`，`:294` 用 SIGALRM）→ N=8、`t_infer`=0.5s 就 ~3.5s（贴着 5s），**N>10 直接爆**；GPU-sim 同卡 `t_infer` 变长会更早爆。**超时必须按 N 放宽**（≥ `N × t_infer` + margin）。
 
-8. **server 挂掉无自愈**（2026-10-15 实测，T-10）：coordinator 路径上 unit 全是 external 模式 → **没人重启 server**；且 `ConnectionClosedError` 不触发 client 重建 → 死连接级联失败；client 重建又会对着死 server 等满 300s。**修法见 §5.6**（看门狗 + 连接异常归类 + 快速失败）。
+8. ~~**server 挂掉无自愈**~~ **【已修 `57dcef9` + `3cc3a2d`】**（2026-10-15 实测，T-10）：coordinator 路径上 unit 全是 external 模式 → 没人重启 server；`ConnectionClosedError` 不触发 client 重建 → 死连接级联失败；client 重建又会对着死 server 等满 300s。**已按 §5.6 修**（看门狗同端口重启 + 连接异常归类 + 连接超时 60s）；复测 `server_restarts=1`、`infra_failed=0`。残留代价：重启需重载模型 ~100s。
 
 ---
 

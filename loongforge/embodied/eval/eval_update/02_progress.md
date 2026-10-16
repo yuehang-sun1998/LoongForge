@@ -40,7 +40,7 @@
 | 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ✅ 完成 + 全量对照（**全局队列 + 有界进程池 + 失败重试**；56.2 min / 3.09×，见 §2.11–§2.13） | `coordinator.py` | `03_testing.md` T-05 | 契约 |
 | 2 | episode-chunk 粒度抢占 | ✅ 完成（chunk 细到 1 集，快槽可抢下一个 unit） | `coordinator.py` | `03_testing.md` T-05 | 队列 |
 | 2 | **运行后覆盖校验 + 自动补跑** | ✅ 完成 | `validation.py` + `coordinator.py` | `03_testing.md` T-09 | — |
-| 2 | **server 自愈（看门狗 + 连接重建）** | ⬜ 待实现 | `coordinator.py` + `libero_runner.py` + `transport/client.py` | `03_testing.md` T-10 | §2.15 |
+| 2 | **server 自愈（看门狗 + 连接重建）** | ✅ 完成（`57dcef9` + `3cc3a2d`） | `coordinator.py` + `libero_runner.py` | `03_testing.md` T-10 | §2.15 |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -238,7 +238,9 @@
   2. **client 不重建 → 级联失败**：`ConnectionClosedError` 归为 `episode_error`，runner 只在 `server_unreachable` 时重建 client → 死连接继续失败（记录里 `attempt: 2`，重试 3 次全败）。**这正是基线那 16 连败的成因。**
   3. **unit 卡死 300s**：`PolicyClient._wait_for_server(timeout=300)` 对着死 server 等满 300s（`TimeoutError: Failed to connect to server within 300 seconds`）→ 一次 server 挂掉可把评测拖成几十分钟。
 
-**结论**：覆盖校验解决"漏集"，但 **server 挂掉需要独立的"自愈"机制**（看门狗 + 连接重建 + 快速失败）——设计见 `01_architecture.md` §5.6，实现见待办 **T2-3**。
+**结论**：覆盖校验解决"漏集"，但 **server 挂掉需要独立的"自愈"机制**（看门狗 + 连接重建 + 快速失败）——设计见 `01_architecture.md` §5.6，实现见 **T2-3**。
+
+**修复后复测（2026-10-15）**：同一 kill-server 实验重跑 → **看门狗检测并重启**（`server_restarts=1`，日志 `server 0 died; restarting on port 18100` → `server 0 back up`）→ **`validation.ok=true`、`infra_failed=0`、`failed_units=[]`**、8 集全在（失败全是 `not_successful_within_max_steps`）、`elapsed=218s`。**自愈链打通**：server 挂 → 同端口重启 → unit 重建 client 重连 → episode 重试补齐。代价 = 重启要重载模型（~100s），期间命中的 unit 靠重试等待。
 
 ---
 
@@ -310,11 +312,11 @@
 - **粒度**：**episode-chunk 级**（不是 task 级）。
 - **验收**：✅ 多卡 E2E（2 server / 4 并发 / 8 unit）动态补位、无重叠无缺失、失败重试；✅ 全量对照已量化（静态基线 §2.12 + **M2 全量 §2.13：56.2 min / 96.45%，vs 基线 1.68×、vs 1卡1server 3.09×**）。
 
-### T2-3 server 自愈（看门狗 + 连接重建）【⬜ 待实现】
+### T2-3 server 自愈（看门狗 + 连接重建）【✅ 已完成，`57dcef9` + `3cc3a2d`】
 
 - **目标**：server 挂掉后自动恢复，不让评测中断、也不被 300s 连接等待拖尾。
 - **改动**：① coordinator 加看门狗线程（查进程 + `/healthz`，死了**原地重启**）；② runner 把 websocket 连接类异常（`ConnectionClosed*`）归为 `server_unreachable`（触发 client 重建 + `ensure_running`）；③ client 的 `_wait_for_server` 300s 对 unit 级缩短 / 或让 unit 快速失败。
-- **验收**：kill 掉一个 server → 评测**自动恢复**、受影响 episode 最终补齐、`infra_failed` 归零、wall-clock 不被 300s 拖尾（`03_testing.md` T-10）。
+- **验收**：✅ kill 掉一个 server → 看门狗**同端口重启**（`server_restarts=1`）、**`infra_failed=0`**、8 集全补齐、218s 跑完（不再 300s 卡死）。见 §2.15 复测。
 - **依据**：§2.15 的故障注入实测；设计见 `01_architecture.md` §5.6。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
