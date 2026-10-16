@@ -436,12 +436,14 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         interval_sec=float(coordinator_cfg.get("watchdog_interval_sec") or WATCHDOG_INTERVAL_SEC),
         probe_interval_sec=float(coordinator_cfg.get("watchdog_probe_interval_sec") or WATCHDOG_PROBE_INTERVAL_SEC),
     )
+    watchdog_started = False
     started = time.time()
     try:
         for proc, args in servers:
             wait_healthz(f"http://{args.host}:{args.health_port}/healthz", args.server_start_timeout_sec, proc)
         started = time.time()  # worker wall only (exclude model load)
         watchdog.start()
+        watchdog_started = True
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -467,9 +469,14 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
                 repair_rounds += 1
     finally:
         watchdog.stop()
-        watchdog.join(timeout=WATCHDOG_INTERVAL_SEC + 5)
-        for proc, _ in servers:
-            _terminate(proc)
+        try:
+            # Only join if it was actually started: joining a never-started thread raises,
+            # and that exception would skip the server teardown below (leaking GPUs).
+            if watchdog_started:
+                watchdog.join(timeout=WATCHDOG_INTERVAL_SEC + 5)
+        finally:
+            for proc, _ in servers:
+                _terminate(proc)
 
     launched_ids = [shard["id"] for shard in all_shards]
     validation = validate(expected_by_shard, launched_ids, read_records_by_unit(output_dir, len(all_shards)))

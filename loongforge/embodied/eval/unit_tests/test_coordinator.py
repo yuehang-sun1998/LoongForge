@@ -395,3 +395,29 @@ def test_watchdog_terminates_a_hung_server_before_restarting(monkeypatch: Any) -
 
     assert hung.terminated  # otherwise the new server cannot bind the port
     assert watchdog.restarts >= 1
+
+
+def test_run_tears_down_servers_when_startup_fails(monkeypatch: Any, tmp_path: Any) -> None:
+    """A failure before the watchdog starts must still terminate the servers.
+
+    Regression: ``watchdog.join()`` on a never-started thread raised, and that
+    exception skipped the teardown loop, leaking a policy server per GPU.
+    """
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    server = _FakeProc(None)  # alive
+    monkeypatch.setattr(coord, "start_server", lambda args, env=None: server)
+
+    def never_healthy(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("never healthy")
+
+    monkeypatch.setattr(coord, "wait_healthz", never_healthy)
+    config = {
+        "benchmark": {"name": "libero", "suite": "libero_10", "task_ids": [0], "episodes_per_task": 1},
+        "servers": [{"gpus": [0]}],
+        "pools": {"cpu_sim": {"n_sims_per_server": 1}},
+        "run": {"output_dir": str(tmp_path)},
+    }
+    with pytest.raises(RuntimeError, match="never healthy"):
+        coord.run(config, "")
+    assert server.terminated  # not leaked
