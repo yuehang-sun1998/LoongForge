@@ -44,7 +44,7 @@
 | 2 | **健壮性兜底**（unit 超时 / 收尾信号 / 竞态 / hung 探活） | ✅ 完成（`dc07c75`/`2e28ce0`/`e5f077c`/`cf9abb6`） | `coordinator.py` + `run.py` + `transport/client.py` | `03_testing.md` T-11 | §2.16 |
 | 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
 | 2 | **分片：per-benchmark planner 表** | ✅ 完成 | `planning.py` + `coordinator.py` + `validation.py` | `03_testing.md` T-12 | §2.18 |
-| 3 | server 侧 batcher（M3） | 🔄 **判据修正 + 探针就绪，待测**（旧"GPU 空转所以不做"的推论已作废） | `orchestrator/batch_probe.py`（诊断） | `03_testing.md` T-13 | FastWAM batch 契约 |
+| 3 | server 侧 batcher（M3） | 🔄 **探针已测：推理是 GPU 饱和（gpu_share≈1），但 batch 契约不存在（5 处断言）→ 收益未量化，仍暂缓** | `orchestrator/batch_probe.py`（诊断） | `03_testing.md` T-13 | FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
 
@@ -293,7 +293,12 @@
 - **探针**：新增 `orchestrator/batch_probe.py`（诊断入口，不动评测路径）：
   1. **拆分**：profile 真实 `predict_action` → `wall_ms / cuda_ms / host_ms / gpu_share` + top 5 kernels；
   2. **缩放**：抓真实 `FastWAM.infer_action` 调用（**内层已是 batch-general**，从张量读 `batch_size`），按 batch 展开重放 → `total_ms / per_sample_ms` vs batch 1/2/4/8。绕开 `predict_action` 的 `batch==1` 断言（`modeling_fastwam.py:349`，且它只取 `images[0]`）。
-- **待做**：GPU 空出来后跑探针 → 按 `gpu_share` 与 `per_sample_ms` 的缩放曲线决定 M3 做不做。
+- **探针实测（2026-10-15，chaos 全量跑完后在空闲卡上跑）**：
+  - **SPLIT**：`wall_ms=655.5`、**`cuda_ms=680.6`**、`host_ms=-25.1`、**`gpu_share≈1.04`**（多 stream 重叠 → 比值不精确，但**推理期间 GPU 饱和、host 开销 ≈ 0** 是确定的）。
+  - **SCALING**：batch=1 得 `total_ms=593.4`；**batch 2/4/8 全报错** —— `input_image must have shape [1,3,H,W]`。
+  - 🔴 **"固定开销主导"假设被证伪**；收益只能来自**大 batch 的 SM 利用率**。
+  - ⛔ **batch 契约真的不存在**：batch=1 断言散在 **5 处**（`mot/fastwam.py::_encode_input_image_latents_tensor`、`wan/core.py` ×2、`mot/idm.py`、`mot/joint.py`），且编码器是 `input_image[0].unsqueeze(1)` + `vae.encode([image])` 逐样本 API。
+- **结论**：**M3 仍暂缓，但理由修正**——不是"GPU 空着"，而是"**要先补 batch 契约才能估收益**"；收益量级仍未量化。
 
 ### 2.20 全量 chaos 实测：故障零扰动（2026-10-15）
 
