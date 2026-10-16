@@ -308,9 +308,11 @@ def main() -> None:
 
         result = run_coordinated(config, config_path)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-        if not (result.get("validation") or {}).get("ok", True):
-            # Coverage is still incomplete after the repair rounds: signal it so a
-            # pipeline does not read the partial score as a success.
+        incomplete = not (result.get("validation") or {}).get("ok", True)
+        if incomplete or result.get("servers_given_up"):
+            # Coverage still incomplete after the repair rounds, or a server that could
+            # not be brought back: signal it so a pipeline does not read the partial
+            # score as a success.
             sys.exit(2)
         return
     results = []
