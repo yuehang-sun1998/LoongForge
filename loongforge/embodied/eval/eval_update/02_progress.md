@@ -263,7 +263,14 @@
 - **③ `policy_call_ms` 下限告警**（`a01390b`）：设了 `timeouts.service_ms`（= 标定报告的 `service_mean_ms`）时，按 `N × service_ms × 2` 算下限，低于就 **stderr 告警**——否则假 `policy_timeout` 会被误当模型失败。**GPU-sim 部分只写进 `01` §5.7，本次不开发**（它的 `t_service` 更长且与 sim 渲染争卡，必须用 GPU-sim 实测值）。
 - **④ server 重启上限**（`2d43e73`）：`MAX_SERVER_RESTARTS=3`；超了**放弃该 server**（stderr 明说"需要人工介入"）并记入 `servers_given_up`；`run.py` 同样 **exit 2**。防崩溃循环慢速空转。
 - **明确不做**：coordinator supervisor —— 它崩了靠 runner 的 **resume 手动重跑**（已完成集跳过），代价可接受。
-- **测试**：新增 5 个用例（拒绝覆盖 / resume 放行 / 下限告警三态 / 重启上限放弃 / given_up → exit 2）；全量 **92 passed / 1 skipped**，ruff clean。
+- **测试**：新增 5 个用例（拒绝覆盖 / resume 放行 / 下限告警三态 / 重启上限放弃 / given_up → exit 2）；全量 **93 passed / 1 skipped**，ruff clean。
+- **真实评测 E2E（2026-10-15，2 卡 / 8 unit / 8 集 / `max_steps=150`，逐个注入）**：
+  - **unit 超时**（`run.unit_timeout_sec: 5`）：14 unit 被 kill → `repair_rounds=3`、`ok=False missing=8`、**exit 2**、打印 `coverage INCOMPLETE … needs a human`。
+  - **hung server**（`SIGSTOP` server_0）：看门狗日志 `server 0 is hung; terminating it before restart` → `back up`；`server_restarts=1`、`repair_rounds=2`、**`ok=True missing=0 infra_failed=0`**、exit 0。
+  - **崩溃循环**（反复 `SIGKILL` server_0）：3 次 restart 全失败 → `giving up … needs a human`；`servers_given_up=[0]`、**exit 2**；且 `ok=True missing=0`（剩余 server + 补跑兜住）。
+  - **`output_dir` 冲突**：同目录重跑 → **exit 1** + `already exists -- refusing to overwrite`。
+  - **`policy_call_ms` 下限**：`service_ms=500 / policy_call_ms=500 / N=16` → 启动即告警 `below the queue-wait floor 16000ms`。
+- 🔴 **测试中发现的 bug（已修 `683b455`）**：看门狗重启 **hung** server 时**不先终止旧进程** → 旧进程仍占端口 → 重绑失败 → 永远恢复不了。修：`_restart` 先 `_terminate` 仍存活的进程。
 
 ---
 
