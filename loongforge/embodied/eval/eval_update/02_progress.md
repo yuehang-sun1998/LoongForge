@@ -283,7 +283,7 @@
 - **校验同步改成 benchmark-无关**（`validation.py` 重写）：不再展开 `(suite, task, episode)` → **按 shard 的 `expected` 计数 + `episode_id` 去重**；`duplicates` = **两个不同 shard 声明了同一集**（同 shard 重跑是预期重叠）；`short_shards()` 找"短了的 shard"，**补跑 = 重跑这些 shard**（新 worker 目录；libero/calvin 有 resume 只补缺的，其余靠去重）。
 - **`run.py`**：`_benchmark_family` 改为从 planning 导入的别名（同一真相来源）。
 - **测试**：新增 `test_planning.py` 7 个 + 重写 `test_validation.py` 7 个；全量 **99 passed / 1 skipped**，ruff clean。
-- **仍未做**（要拿**细粒度**需 runner 支持，见 `01` §5.8）：CALVIN `--sequence-offset`、SimplerEnv/ManiSkill "跑 N 集"循环、RoboTwin 去掉正则 patch。
+- **仍未做**：runner 侧的细粒度支持 → 见待办 **T2-6**（`01` §5.8 有对照表）。
 
 ---
 
@@ -371,6 +371,16 @@
 ### T2-5 分片 planner 表（让所有 benchmark 进得来）【✅ 已完成，见 §2.18】
 
 - **仍未做**：各 runner 的细粒度分片支持（CALVIN offset / SimplerEnv·ManiSkill N 集循环 / RoboTwin 正式参数）。
+
+### T2-6 runner 侧细粒度分片支持【⬜ 待做，无环境验证】
+
+- **背景**：§2.18 的 planner 表让 5 个 family 都能被切，但**粒度**受 runner 限制。
+- **三项**（对照表见 `01_architecture.md` §5.8）：
+  1. `calvin_runner` 加 `--sequence-offset`（现在 `eval_sequences[:n]` 只能取前 N 条 → **整个 CALVIN 只能 1 片**）；
+  2. `simplerenv_runner` / `maniskill_runner` 支持"跑 N 集"（现在 **1 集/进程** → 每集重建 SAPIEN scene）；
+  3. `robotwin_runner` 别用**正则 patch 源码**设 `st_seed`/`test_num`（现在静默易失效）。
+- **为什么先不做**：环境里**只有 LIBERO 能跑**（CALVIN 依赖未装 / RoboTwin 缺 EGL 驱动 / SimplerEnv·ManiSkill 依赖未装）→ **改了没法验证**。
+- **边界**：这三项**要动 runner**，超出"编排层"约定 → 建议**单独一轮、按 family 分开提交**。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 
