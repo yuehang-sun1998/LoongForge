@@ -257,7 +257,12 @@ def main() -> None:
     if any(key in config for key in ("coordinator", "servers", "pools")):
         from loongforge.embodied.eval.orchestrator.coordinator import run as run_coordinated
 
-        print(json.dumps(run_coordinated(config, config_path), ensure_ascii=False, indent=2, default=str))
+        result = run_coordinated(config, config_path)
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        if not (result.get("validation") or {}).get("ok", True):
+            # Coverage is still incomplete after the repair rounds: signal it so a
+            # pipeline does not read the partial score as a success.
+            sys.exit(2)
         return
     results = [_run_once(_timestamped_run_config(sweep_config), config_path) for sweep_config in expand_sweep(config)]
     if len(results) > 1:

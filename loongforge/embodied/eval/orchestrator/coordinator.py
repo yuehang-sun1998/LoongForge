@@ -41,6 +41,7 @@ from loongforge.embodied.eval.orchestrator.validation import (
     missing_keys,
     read_records,
     repair_shards,
+    format_report,
     validate,
 )
 
@@ -395,6 +396,21 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
                 proc.kill()
 
     validation = validate(plan, read_records(output_dir, len(all_shards)))
+    print(f"[coordinator] {format_report(validation)}", flush=True)
+    if not validation["ok"]:
+        print(
+            f"[coordinator] WARNING: coverage still incomplete after {repair_rounds} repair round(s) "
+            "-- this run needs a human; the score is partial",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif validation["infra_failed"]:
+        print(
+            f"[coordinator] WARNING: {validation['infra_failed']} episode(s) failed at the infra level "
+            "(they did not really run) -- the score understates the model; see validation.failures",
+            file=sys.stderr,
+            flush=True,
+        )
     # Persist the plan so ``python -m ...validation`` can re-check a finished run offline.
     (output_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
     result = {
