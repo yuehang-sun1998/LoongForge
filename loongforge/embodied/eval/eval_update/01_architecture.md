@@ -576,7 +576,9 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 - **正确判据**：**一次真实推理的 wall 花在哪**？① 固定开销占主导 → batching K 个请求把固定开销只付一次 → 收益大；② 串行依赖链占主导（逐步去噪 / 无法批的 VAE decode）→ 收益有限。
 - **怎么量（go/no-go 探针）**：`orchestrator/batch_probe.py`（诊断入口，**不动评测路径**）—— ① profile 真实 `predict_action` → `wall / cuda / host / gpu_share` + top kernels；② 抓真实 `FastWAM.infer_action` 调用、按 batch 展开重放 → `per_sample_ms` vs batch。
 - 🟡 **实测结论（2026-10-15，`03_testing.md` T-13）**：① **`gpu_share ≈ 1.04`**（`cuda_ms 680.6 > wall_ms 655.5`，host ≈ 0）→ **一次真实推理是 GPU 饱和的**，所以上面"固定开销占主导"那条**被证伪**；batching 的收益只可能来自**大 batch 下 SM 利用率更高**（batch-1 的 GEMM 效率）。② **缩放测不出来**：batch=1 假设**散在 5 处**（`mot/fastwam.py` / `wan/core.py` ×2 / `mot/idm.py` / `mot/joint.py`），编码器还是逐样本 list API → **batch 契约是真的不存在**。
-- **因此 M3 暂缓的理由已修正为**：不是"GPU 空着所以没用"，而是"**得先补出 batch 契约（5 处 + VAE list API + 批内噪声语义），才能估出 SM 利用率那点收益**"；收益量级**仍未量化**。
+- 🔑 **实测收益（2026-10-15，T-13 第二轮：临时放开契约后测，已还原）**：**batch 8 的 `total_ms` 与 batch 1 几乎相同**（583→635ms，+9%），即 **`per_sample_ms` 583→79ms，7.3×**（batch 2/4 分别 2.0×/3.9×）。正确性已验证（编码器实测收到 K 张、`latents_action=(K,32,7)`）→ **batch 真的进了去噪**。
+- **因此 M3 的结论改为 GO，且是量级最大的剩余杠杆**（server 是绑定资源；把它每请求成本降 ~7× 直接抬上限）。**做的前置 = 补 batch 契约**：放开 6 处入口断言（`mot/fastwam.py`×2 / `wan/core.py`×2 / `mot/idm.py` / `mot/joint.py`，**全在推理侧**；训练 bs=16 已证明 DiT 能批、VAE `encode(list)` 会 stack）+ 修返回路径（现在返回仍压掉 batch）+ **批内噪声按各请求 seed 逐行设** + server 侧 batcher（`max_wait_ms` 窗口聚批，sim 不同步 → 批可能不满）。
+- ⚠️ **端到端上限受 CPU 侧约束**（Amdahl）：server 提速 ~7× 后 CPU 可能成为新绑定资源。当前 CPU 仅 8.9%（N=16，§6.2）→ 有余量，但**最终收益要实测**，不能把 7.3× 直接当端到端加速。
 - 真要做的位置是 **server 侧**（`_route_message` 与 `policy` 之间插 batcher：请求入队挂 `Future`，在 `max_wait_ms` 窗口内聚合 `max_batch_size` 个请求）。fan-out 的 sim 会漂移出相位，所以要等窗口、batch 可能不满；env 向量化的 lockstep 天然满 batch。
 - 前置：先补齐 FastWAM 的 batch 契约（`modeling_fastwam.py:349` 硬断言 `batch==1`，`mot/fastwam.py::infer_action` 另有 4 处 batch=1），并重新定义批内噪声语义（固定 seed 的 per-sample 定义）、验证 batch>1 出分不漂移。逐处改动见**附录 A**。
 - **对 GPU-sim 的耦合**：向量化 env 天然产出 lockstep 的 batched obs → 直接喂 batch 路径。所以对 GPU-sim，**batch 与向量化强耦合**，不是"GPU 成瓶颈后才做"（见 §7.5）。

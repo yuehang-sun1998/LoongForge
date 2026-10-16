@@ -35,18 +35,22 @@ import numpy as np
 import torch
 
 
-def _build_model(config_path: str) -> Any:
-    """Build the eval model exactly the way the policy server does."""
+def _build_model(config_path: str) -> Tuple[Any, Dict[str, Any]]:
+    """Build the eval model exactly the way the policy server does.
+
+    The camera layout lives on the *spec*, not the model (the server's warmup reads
+    it from there too), and FastWAM's ``horizontal2`` layout rejects a single view.
+    """
     from loongforge.embodied.eval.factories.registry import build_model_spec
     from loongforge.embodied.eval.servers.eval_server_config import parse_eval_server_config
 
     server_args, raw_model_dict = parse_eval_server_config(config_path)
-    return build_model_spec(server_args, raw_model_dict).model
+    spec = build_model_spec(server_args, raw_model_dict)
+    return spec.model, (getattr(spec, "metadata", {}) or {})
 
 
-def _dummy_call(model: Any) -> None:
+def _dummy_call(model: Any, metadata: Dict[str, Any]) -> None:
     """One representative call, shaped like the server's warmup."""
-    metadata = getattr(model, "metadata", {}) or {}
     n_views = max(1, int(metadata.get("num_camera_views", 1) or 1))
     state_dim = int(metadata.get("state_dim", 0) or 0) or (14 if n_views == 3 else 8)
     image = np.zeros((224, 224, 3), dtype=np.uint8)
@@ -58,15 +62,15 @@ def _dummy_call(model: Any) -> None:
     )
 
 
-def _profile(model: Any, calls: int) -> Dict[str, Any]:
+def _profile(model: Any, metadata: Dict[str, Any], calls: int) -> Dict[str, Any]:
     """Wall time vs CUDA kernel time for a real predict_action."""
-    _dummy_call(model)  # warmup (lazy imports, cudnn autotune)
+    _dummy_call(model, metadata)  # warmup (lazy imports, cudnn autotune)
     torch.cuda.synchronize()
     walls: List[float] = []
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
         for _ in range(calls):
             start = time.perf_counter()
-            _dummy_call(model)
+            _dummy_call(model, metadata)
             torch.cuda.synchronize()
             walls.append((time.perf_counter() - start) * 1000.0)
     cuda_ms = sum(event.device_time_total for event in prof.key_averages()) / 1000.0  # us -> ms
@@ -84,7 +88,7 @@ def _profile(model: Any, calls: int) -> Dict[str, Any]:
     }
 
 
-def _capture_infer_call(model: Any) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+def _capture_infer_call(model: Any, metadata: Dict[str, Any]) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
     """Run one predict_action and capture the kwargs it hands to FastWAM.infer_action."""
     from loongforge.embodied.model.fastwam.mot.fastwam import FastWAM
 
@@ -99,45 +103,72 @@ def _capture_infer_call(model: Any) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
 
     FastWAM.infer_action = spy
     try:
-        _dummy_call(model)
+        _dummy_call(model, metadata)
     finally:
         FastWAM.infer_action = original
     return captured["args"], captured["kwargs"]
 
 
 def _expand(value: Any, batch: int) -> Any:
-    """Tile a batch-1 tensor along a leading batch dim; leave everything else alone."""
+    """Tile a batch-1 tensor (or a prompt string) up to batch; leave the rest alone."""
     if torch.is_tensor(value) and value.ndim >= 2 and value.shape[0] == 1:
         return value.repeat(batch, *([1] * (value.ndim - 1)))
+    if isinstance(value, str):
+        return [value] * batch  # the text encoder takes a Sequence[str]
     return value
 
 
-def _scaling(model: Any, batches: List[int]) -> List[Dict[str, Any]]:
+def _as_tensor(out: Any) -> Any:
+    """Best-effort: pull the action tensor out of whatever infer_action returned."""
+    if torch.is_tensor(out):
+        return out
+    if isinstance(out, dict):
+        for value in out.values():
+            if torch.is_tensor(value):
+                return value
+    if isinstance(out, (list, tuple)) and out and torch.is_tensor(out[0]):
+        return out[0]
+    return None
+
+
+def _scaling(model: Any, metadata: Dict[str, Any], batches: List[int]) -> List[Dict[str, Any]]:
     """Replay the captured inner call with an expanded batch and time per sample."""
     from loongforge.embodied.model.fastwam.mot.fastwam import FastWAM
 
-    args, kwargs = _capture_infer_call(model)
+    args, kwargs = _capture_infer_call(model, metadata)
     core = model.core
     rows: List[Dict[str, Any]] = []
     for batch in batches:
         big_args = tuple(_expand(a, batch) for a in args)
         big_kwargs = {k: _expand(v, batch) for k, v in kwargs.items()}
         try:
-            FastWAM.infer_action(core, *big_args, **big_kwargs)  # warmup
+            out = FastWAM.infer_action(core, *big_args, **big_kwargs)  # warmup
             torch.cuda.synchronize()
+            # Sanity: did the batch actually flow through, or did the model quietly
+            # process one sample? K identical inputs with per-sample noise must give
+            # K different actions, and the leading dim must be K.
+            actions = _as_tensor(out)
+            shape = tuple(actions.shape) if actions is not None else None
+            differ = bool(actions is not None and actions.shape[0] >= 2 and not torch.allclose(actions[0], actions[1]))
             start = time.perf_counter()
             for _ in range(3):
                 FastWAM.infer_action(core, *big_args, **big_kwargs)
             torch.cuda.synchronize()
             total_ms = (time.perf_counter() - start) / 3 * 1000.0
         except Exception as exc:  # the inner path may still not be batch-general
-            rows.append({"batch": batch, "error": f"{type(exc).__name__}: {exc}"})
+            import traceback
+
+            frames = traceback.extract_tb(exc.__traceback__)
+            where = f"{frames[-1].filename.split('/')[-1]}:{frames[-1].lineno}" if frames else "?"
+            rows.append({"batch": batch, "error": f"{type(exc).__name__} at {where}: {exc}"})
             continue
         rows.append(
             {
                 "batch": batch,
                 "total_ms": round(total_ms, 1),
                 "per_sample_ms": round(total_ms / batch, 1),
+                "out_shape": shape,
+                "samples_differ": differ,
             }
         )
     return rows
@@ -151,9 +182,9 @@ def main() -> None:
     parser.add_argument("--batches", default="1,2,4,8")
     args = parser.parse_args()
 
-    model = _build_model(args.config)
-    split = _profile(model, args.calls)
-    scaling = _scaling(model, [int(b) for b in args.batches.split(",") if b])
+    model, metadata = _build_model(args.config)
+    split = _profile(model, metadata, args.calls)
+    scaling = _scaling(model, metadata, [int(b) for b in args.batches.split(",") if b])
     print(json.dumps({"split": split, "scaling": scaling}, indent=2))
 
 
