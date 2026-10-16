@@ -376,3 +376,41 @@ def test_policy_timeout_warning_fires_only_when_below_the_floor(capsys: Any) -> 
 
     coord._warn_policy_timeout({"timeouts": {"policy_call_ms": 5000}}, 16)  # no service_ms -> skipped
     assert capsys.readouterr().err == ""
+
+
+def test_watchdog_gives_up_after_repeated_failed_restarts(monkeypatch: Any) -> None:
+    """A server that cannot come back is not restarted forever -- it is given up on."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("cannot start")
+
+    monkeypatch.setattr(coord, "start_server", lambda args, env=None: _FakeProc(0))
+    monkeypatch.setattr(coord, "wait_healthz", boom)
+    args = SimpleNamespace(host="127.0.0.1", port=14560, health_port=14561, server_start_timeout_sec=5)
+    watchdog = coord._ServerWatchdog([(_FakeProc(1), args)], [0], interval_sec=0.05, probe_interval_sec=999)
+
+    watchdog.start()
+    time.sleep(0.6)
+    watchdog.stop()
+    watchdog.join(timeout=2)
+
+    assert 0 in watchdog.given_up
+    assert watchdog.restarts == 0  # nothing ever came back
+
+
+def test_run_exits_nonzero_when_a_server_was_given_up(monkeypatch: Any, tmp_path: Any) -> None:
+    """Run test_run_exits_nonzero_when_a_server_was_given_up."""
+    import sys as _sys
+
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+    from loongforge.embodied.eval.orchestrator import run as run_mod
+
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("coordinator: {}\n", encoding="utf-8")
+    monkeypatch.setattr(_sys, "argv", ["run", "--config", str(cfg)])
+    monkeypatch.setattr(run_mod, "load_config", lambda path: {"coordinator": {}})
+    monkeypatch.setattr(coord, "run", lambda config, path: {"validation": {"ok": True}, "servers_given_up": [0]})
+    with pytest.raises(SystemExit) as excinfo:
+        run_mod.main()
+    assert excinfo.value.code == 2

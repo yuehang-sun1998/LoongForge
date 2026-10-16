@@ -54,6 +54,7 @@ WATCHDOG_INTERVAL_SEC = 15.0  # how often the coordinator checks its servers are
 WATCHDOG_RESTART_TIMEOUT_SEC = 600.0  # cap on waiting for a restarted server to get healthy
 WATCHDOG_PROBE_INTERVAL_SEC = 60.0  # how often a live server is probed with a real ping
 WATCHDOG_UNHEALTHY_LIMIT = 2  # consecutive failed probes before a hung server is restarted
+MAX_SERVER_RESTARTS = 3  # a server that keeps dying is not worth restarting forever
 PROBE_CONNECT_TIMEOUT_SEC = 3.0  # the probe must never stall the watchdog for long
 PROBE_PING_TIMEOUT_SEC = 15.0  # a ping only waits behind ~N queued inferences (~1s at N=16)
 # PolicyClient pops these while connecting (a proxy breaks a local websocket); the
@@ -302,6 +303,8 @@ class _ServerWatchdog(threading.Thread):
         self._stop_event = threading.Event()  # NB: not ``_stop`` -- Thread reserves that name
         self._unhealthy: Dict[int, int] = {}
         self._last_probe: Dict[int, float] = {}
+        self._restart_attempts: Dict[int, int] = {}
+        self.given_up: set = set()
         self.restarts = 0
 
     def stop(self) -> None:
@@ -351,7 +354,19 @@ class _ServerWatchdog(threading.Thread):
 
     def _restart(self, index: int) -> None:
         """Run _restart."""
-        if self._stop_event.is_set():
+        if self._stop_event.is_set() or index in self.given_up:
+            return
+        self._restart_attempts[index] = self._restart_attempts.get(index, 0) + 1
+        if self._restart_attempts[index] > MAX_SERVER_RESTARTS:
+            # A server that cannot come back (bad GPU, CUDA OOM, broken ckpt) is not
+            # worth reloading forever -- stop, say so, and let the run report it.
+            self.given_up.add(index)
+            print(
+                f"[watchdog] server {index} failed to come back {MAX_SERVER_RESTARTS} times; giving up "
+                "-- this run needs a human",
+                file=sys.stderr,
+                flush=True,
+            )
             return
         _, args = self._servers[index]
         print(f"[watchdog] server {index} died; restarting on port {args.port}", flush=True)
@@ -531,6 +546,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         "unit_timeout_sec": unit_timeout,
         "failed_units": failed_units,
         "server_restarts": watchdog.restarts,
+        "servers_given_up": sorted(watchdog.given_up),
         "elapsed_sec": round(time.time() - started, 1),
         "output_dir": str(output_dir),
         "validation": validation,
