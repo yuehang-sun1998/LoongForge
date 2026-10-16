@@ -181,3 +181,35 @@ def test_watchdog_leaves_a_live_server_alone(monkeypatch: Any) -> None:
 
     assert watchdog.restarts == 0
     assert servers[0][0] is live
+
+
+def test_unit_timeout_derives_from_the_episode_budget() -> None:
+    """The per-unit budget is max episodes x per_episode_sec + connect + slack."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    shards = [("a", 0, 0, 4), ("a", 1, 0, 2)]
+    config = {"timeouts": {"per_episode_sec": 100}, "server": {"connect_timeout_sec": 10}}
+    assert coord._unit_timeout_sec(config, shards) == 4 * 100 + 10 + coord.UNIT_TIMEOUT_SLACK_SEC
+    assert coord._unit_timeout_sec({**config, "run": {"unit_timeout_sec": 42}}, shards) == 42
+
+
+def test_await_slot_returns_a_finished_unit() -> None:
+    """Run test_await_slot_returns_a_finished_unit."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    done = _FakeProc(0)
+    proc, timed_out = coord._await_slot({done: (0, 3)}, {3: time.time()}, timeout_sec=10)
+    assert proc is done
+    assert timed_out is False
+
+
+def test_await_slot_kills_a_unit_that_blows_its_budget() -> None:
+    """A unit hung past its budget is killed so the slot frees (it then gets retried)."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    stuck = _FakeProc(None)  # never finishes
+    pool = {stuck: (0, 7)}
+    started_at = {7: time.time() - 10}  # already 10s into its budget
+    proc, timed_out = coord._await_slot(pool, started_at, timeout_sec=0.5)
+    assert proc is stuck
+    assert timed_out is True
