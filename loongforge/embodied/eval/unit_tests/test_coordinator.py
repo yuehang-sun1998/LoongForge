@@ -94,6 +94,7 @@ class _FakeProc:
     def __init__(self, returncode: int) -> None:
         self.returncode = returncode
         self.pid = 12345
+        self.terminated = False
 
     def poll(self) -> int:
         """Run poll."""
@@ -101,6 +102,7 @@ class _FakeProc:
 
     def terminate(self) -> None:
         """Run terminate."""
+        self.terminated = True
 
     def wait(self, timeout: float | None = None) -> int:
         """Run wait."""
@@ -108,6 +110,7 @@ class _FakeProc:
 
     def kill(self) -> None:
         """Run kill."""
+        self.terminated = True
 
 
 def test_run_retries_a_failed_unit_once(monkeypatch: Any, tmp_path: Any) -> None:
@@ -247,3 +250,31 @@ def test_run_exits_zero_when_coverage_is_complete(monkeypatch: Any, tmp_path: An
     monkeypatch.setattr(run_mod, "load_config", lambda path: {"coordinator": {}})
     monkeypatch.setattr(coord, "run", lambda config, path: {"validation": {"ok": True}})
     run_mod.main()  # must not raise
+
+
+def test_watchdog_does_not_leak_a_restart_started_during_shutdown(monkeypatch: Any) -> None:
+    """A restart still in flight when the run shuts down must not leak a server process."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    created = []
+
+    def fake_start(args: Any, env: Any = None) -> _FakeProc:
+        proc = _FakeProc(None)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(coord, "start_server", fake_start)
+    args = SimpleNamespace(host="127.0.0.1", port=14560, health_port=14561, server_start_timeout_sec=5)
+    servers = [(_FakeProc(1), args)]
+    watchdog = coord._ServerWatchdog(servers, [0], interval_sec=0.05)
+    # shutdown lands while the restart is waiting for the server to get healthy
+    monkeypatch.setattr(coord, "wait_healthz", lambda *a, **k: watchdog.stop())
+
+    watchdog.start()
+    time.sleep(0.4)
+    watchdog.stop()
+    watchdog.join(timeout=2)
+
+    assert watchdog.restarts == 0  # never counted as a successful restart
+    assert servers[0][0].returncode == 1  # the original entry is untouched
+    assert created and created[0].terminated  # the process we started was cleaned up
