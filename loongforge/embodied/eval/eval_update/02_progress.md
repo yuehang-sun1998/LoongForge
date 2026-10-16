@@ -295,6 +295,22 @@
   2. **缩放**：抓真实 `FastWAM.infer_action` 调用（**内层已是 batch-general**，从张量读 `batch_size`），按 batch 展开重放 → `total_ms / per_sample_ms` vs batch 1/2/4/8。绕开 `predict_action` 的 `batch==1` 断言（`modeling_fastwam.py:349`，且它只取 `images[0]`）。
 - **待做**：GPU 空出来后跑探针 → 按 `gpu_share` 与 `per_sample_ms` 的缩放曲线决定 M3 做不做。
 
+### 2.20 全量 chaos 实测：故障零扰动（2026-10-15）
+
+用户要求"跑全量真实评测、中间捣乱"。8 卡 / 2000 集 / 单 coordinator，跑到中途连注 4 类故障：
+
+| 注入 | 时刻 | 反应 |
+|---|---|---|
+| 删掉一个 unit 的 2 集记录 | +6 min | 变 missing → **覆盖补跑** |
+| `SIGKILL` server_3 | +14 min | 看门狗 `died; restarting` → `back up` |
+| `SIGSTOP` server_5（hung） | +24 min | `is hung; terminating it before restart` → `back up` |
+| `SIGKILL` 一个在跑的 unit | +34 min | unit 重试/补跑 |
+
+- **最终**：`exit 0`、`elapsed=57.3 min`（干净 M2 53.2 min → **+4.1 min / +7.7%**）、`server_restarts=2`、`servers_given_up=[]`、`failed_units=[]`、**`validation.ok=true`**（missing/duplicates/unexpected/unkeyed 全 0）、`infra_failed=0`、`1929/2000=96.45%`。
+- 🔑 **逐集比对干净 M2 全量：2000 集 0 处不同** → **故障零扰动**（不是"看起来对"，是逐位一致）。
+- **代价有界**：2 次 server 重启各 ~100s 重载 + 补跑/重试 ≈ +4.1 min。
+- **顺带**：这轮之前我中断一次工具调用，暴露并修掉了 `watchdog.join()` 未 start 就调用 → **server 泄漏**的 bug（`ed7a7b6`）。
+
 ---
 
 ## 3. 待办（按依赖排序）

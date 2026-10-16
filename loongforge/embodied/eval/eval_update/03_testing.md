@@ -205,7 +205,19 @@
   - **A 删记录**：删 `worker_0/results.jsonl`（1 集）→ `repair_rounds=1`、`n_units_launched=9`、`validation.ok=true`、`missing=0`、`infra_failed=0`。**✅ 补跑生效。**
   - **B kill server**：`kill -9` 掉 `server_0` → ① **无重启**（external 模式 `ensure_running` 空转）；② 命中它的 unit 记 `episode_error`/`ConnectionClosedError`、`attempt: 2`（重试 3 次全败）；③ 走到 client 重建的 unit **卡满 300s**（`TimeoutError: Failed to connect to server within 300 seconds`）。**⚠️ 暴露 3 个缺口。**
   - **B 修复后复测**（`57dcef9` 连接重建 + `3cc3a2d` 看门狗）：同实验重跑 → `server_restarts=1`（日志 `server 0 died; restarting on port 18100` → `server 0 back up`）、**`validation.ok=true`、`infra_failed=0`、`failed_units=[]`**、8 集全在、`elapsed=218s`。**✅ 自愈生效**（代价：重启重载模型 ~100s）。
-- **结论**：✅ 通过。漏集由补跑闭环补齐；server 挂掉由看门狗同端口重启 + client 重建 + episode 重试恢复，`infra_failed` 归零、不再被 300s 拖尾。
+- **全量 chaos（2026-10-15，8 卡 / 2000 集 / 单 coordinator，跑到中途连注 4 类故障）**：
+
+  | 注入 | 时刻 | 反应 |
+  |---|---|---|
+  | 删掉一个 unit 的 2 集记录 | +6 min | 变 missing → **覆盖补跑**（最终 `records=2002`，按 `episode_id` 去重后 `missing=0`、`duplicates=0`） |
+  | `SIGKILL` server_3 | +14 min | 看门狗 `died; restarting on port 14620` → `back up` |
+  | `SIGSTOP` server_5（hung） | +24 min | `is hung; terminating it before restart` → `back up` |
+  | `SIGKILL` 一个在跑的 unit | +34 min | unit 重试/补跑（最终 `failed_units=[]`） |
+
+  - 最终：**exit 0**、`elapsed = 57.3 min`（干净 M2 全量 53.2 min → **代价 +4.1 min / +7.7%**）、`server_restarts=2`、`servers_given_up=[]`、`failed_units=[]`、**`validation.ok=true`（missing / duplicates / unexpected / unkeyed 全 0）**、`infra_failed=0`、`1929/2000 = 96.45%`。
+  - **逐集比对干净 M2 全量：2000 集 0 处不同 → 故障零扰动**。
+  - 代价拆解：2 次 server 重启各 ~100s 重载（~3.3 min）+ 补跑/重试（~1 min）≈ 观察到的 +4.1 min（**有界、可预期**）。
+- **结论**：✅ 通过。漏集由补跑闭环补齐；server 挂掉（死 / hung）由看门狗同端口重启 + client 重建 + episode 重试恢复，`infra_failed` 归零、不再被 300s 拖尾；**全量下 4 类故障零扰动**。
 
 ### T-11 · 健壮性兜底：unit 超时 / 收尾信号 / 竞态 / hung 探活
 
