@@ -44,7 +44,7 @@
 | 2 | **健壮性兜底**（unit 超时 / 收尾信号 / 竞态 / hung 探活） | ✅ 完成（`dc07c75`/`2e28ce0`/`e5f077c`/`cf9abb6`） | `coordinator.py` + `run.py` + `transport/client.py` | `03_testing.md` T-11 | §2.16 |
 | 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
 | 2 | **分片：per-benchmark planner 表** | ✅ 完成 | `planning.py` + `coordinator.py` + `validation.py` | `03_testing.md` T-12 | §2.18 |
-| 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
+| 3 | server 侧 batcher（M3） | 🔄 **判据修正 + 探针就绪，待测**（旧"GPU 空转所以不做"的推论已作废） | `orchestrator/batch_probe.py`（诊断） | `03_testing.md` T-13 | FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
 
@@ -284,6 +284,16 @@
 - **`run.py`**：`_benchmark_family` 改为从 planning 导入的别名（同一真相来源）。
 - **测试**：新增 `test_planning.py` 7 个 + 重写 `test_validation.py` 7 个；全量 **99 passed / 1 skipped**，ruff clean。
 - **仍未做**：runner 侧的细粒度支持 → 见待办 **T2-6**（`01` §5.8 有对照表）。
+
+### 2.19 M3 判据修正 + batch 探针（2026-10-15）
+
+- **起因**：用户质疑"batching 是不是可以做？至少 CPU-sim 显存没用满"。
+- **我原来的推论有错**：我说过"GPU 大量空转 → 做 batching 只会让 GPU 更空"。**不完整**——batching 降低的不只是 GPU 耗时，还包括**每请求的固定开销**（Python 调度 / 数据搬运 / VAE encode·decode / launch）；而这里**绑定资源就是串行 server**，**server 每请求成本降下来 = 上限直接抬高**，跟 GPU 忙不忙无关。显存也确实是空的（单 server 24.7/81.9 GB）。
+- **正确判据**：一次真实推理的 wall 里 **固定开销 vs 串行依赖链** 谁占主导。**没量过就不能下结论。**
+- **探针**：新增 `orchestrator/batch_probe.py`（诊断入口，不动评测路径）：
+  1. **拆分**：profile 真实 `predict_action` → `wall_ms / cuda_ms / host_ms / gpu_share` + top 5 kernels；
+  2. **缩放**：抓真实 `FastWAM.infer_action` 调用（**内层已是 batch-general**，从张量读 `batch_size`），按 batch 展开重放 → `total_ms / per_sample_ms` vs batch 1/2/4/8。绕开 `predict_action` 的 `batch==1` 断言（`modeling_fastwam.py:349`，且它只取 `images[0]`）。
+- **待做**：GPU 空出来后跑探针 → 按 `gpu_share` 与 `per_sample_ms` 的缩放曲线决定 M3 做不做。
 
 ---
 
