@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import time
+from types import SimpleNamespace
 from typing import Any
 
 from loongforge.embodied.eval.orchestrator.coordinator import (
@@ -89,6 +91,7 @@ class _FakeProc:
 
     def __init__(self, returncode: int) -> None:
         self.returncode = returncode
+        self.pid = 12345
 
     def poll(self) -> int:
         """Run poll."""
@@ -131,3 +134,50 @@ def test_run_retries_a_failed_unit_once(monkeypatch: Any, tmp_path: Any) -> None
     assert result["n_units"] == 2
     assert launches[0] == 2  # failed once, retried
     assert result["failed_units"] == []
+
+
+def test_watchdog_restarts_a_dead_server_in_place(monkeypatch: Any) -> None:
+    """A server whose process exited is restarted on the same port by the watchdog."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    started = []
+
+    def fake_start(args: Any, env: Any = None) -> _FakeProc:
+        proc = _FakeProc(None)  # alive
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(coord, "start_server", fake_start)
+    monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
+
+    args = SimpleNamespace(host="127.0.0.1", port=14560, health_port=14561, server_start_timeout_sec=5)
+    servers = [(_FakeProc(1), args)]  # the server process has exited
+    watchdog = coord._ServerWatchdog(servers, [0], interval_sec=0.05)
+    watchdog.start()
+    time.sleep(0.4)
+    watchdog.stop()
+    watchdog.join(timeout=2)
+
+    assert watchdog.restarts == 1
+    assert servers[0][0] is started[0]  # replaced in place, so the URL stays valid
+    assert servers[0][1] is args
+
+
+def test_watchdog_leaves_a_live_server_alone(monkeypatch: Any) -> None:
+    """Run test_watchdog_leaves_a_live_server_alone."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    monkeypatch.setattr(coord, "start_server", lambda *a, **k: _FakeProc(None))
+    monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
+
+    args = SimpleNamespace(host="127.0.0.1", port=14560, health_port=14561, server_start_timeout_sec=5)
+    live = _FakeProc(None)
+    servers = [(live, args)]
+    watchdog = coord._ServerWatchdog(servers, [0], interval_sec=0.05)
+    watchdog.start()
+    time.sleep(0.3)
+    watchdog.stop()
+    watchdog.join(timeout=2)
+
+    assert watchdog.restarts == 0
+    assert servers[0][0] is live

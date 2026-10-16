@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,6 +48,7 @@ PORT_STRIDE = 20
 UNITS_PER_SLOT = 4  # shards per worker slot: slack so fast slots can steal work
 DEFAULT_MAX_RETRIES = 2  # episode-level infra retries (episode_error / timeouts) per unit
 MAX_REPAIR_ROUNDS = 3  # auto re-dispatch rounds for episodes the plan asked for but that never ran
+WATCHDOG_INTERVAL_SEC = 15.0  # how often the coordinator checks its servers are alive
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
 
@@ -195,6 +197,49 @@ def _drain_pool(pool: Dict[subprocess.Popen, int], wait: bool) -> Optional[subpr
         time.sleep(1)
 
 
+class _ServerWatchdog(threading.Thread):
+    """Restart a policy server that has died, in place (same port).
+
+    Units connect through ``server.external_url``, so they cannot restart the
+    server they depend on -- only its owner (the coordinator) can. Restarting on
+    the *same* port keeps every unit's URL valid, so in-flight units just
+    reconnect on their next retry.
+    """
+
+    def __init__(self, servers: List[tuple], gpus: List[int], interval_sec: float = WATCHDOG_INTERVAL_SEC) -> None:
+        super().__init__(daemon=True, name="server-watchdog")
+        self._servers = servers  # list of (proc, args); replaced in place on restart
+        self._gpus = gpus
+        self._interval = interval_sec
+        self._stop_event = threading.Event()  # NB: not ``_stop`` -- Thread reserves that name
+        self.restarts = 0
+
+    def stop(self) -> None:
+        """Run stop."""
+        self._stop_event.set()
+
+    def run(self) -> None:
+        """Poll each server and restart the ones whose process has exited."""
+        while not self._stop_event.wait(self._interval):
+            for index, (proc, _) in enumerate(self._servers):
+                if proc.poll() is not None:
+                    self._restart(index)
+
+    def _restart(self, index: int) -> None:
+        """Run _restart."""
+        _, args = self._servers[index]
+        print(f"[watchdog] server {index} died; restarting on port {args.port}", flush=True)
+        try:
+            proc = start_server(args, {"CUDA_VISIBLE_DEVICES": str(self._gpus[index])})
+            wait_healthz(f"http://{args.host}:{args.health_port}/healthz", args.server_start_timeout_sec, proc)
+        except Exception as exc:  # a failed restart is retried on the next tick
+            print(f"[watchdog] restart of server {index} failed: {exc}", flush=True)
+            return
+        self._servers[index] = (proc, args)
+        self.restarts += 1
+        print(f"[watchdog] server {index} back up (pid={proc.pid})", flush=True)
+
+
 def _run_batch(
     config: Dict[str, Any],
     shards: List[tuple],
@@ -274,11 +319,13 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     all_shards: List[tuple] = list(plan)
     failed_units: List[int] = []
     repair_rounds = 0
+    watchdog = _ServerWatchdog(servers, gpus)  # started once the servers are healthy
     started = time.time()
     try:
         for proc, args in servers:
             wait_healthz(f"http://{args.host}:{args.health_port}/healthz", args.server_start_timeout_sec, proc)
         started = time.time()  # worker wall only (exclude model load)
+        watchdog.start()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -300,6 +347,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
                 failed_units.extend(extra_failed)
                 repair_rounds += 1
     finally:
+        watchdog.stop()
         for proc, _ in servers:
             proc.terminate()
             try:
@@ -321,6 +369,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         "n_units_launched": len(all_shards),
         "repair_rounds": repair_rounds,
         "failed_units": failed_units,
+        "server_restarts": watchdog.restarts,
         "elapsed_sec": round(time.time() - started, 1),
         "output_dir": str(output_dir),
         "validation": validation,
