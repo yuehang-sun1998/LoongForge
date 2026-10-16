@@ -368,7 +368,12 @@ class _ServerWatchdog(threading.Thread):
                 flush=True,
             )
             return
-        _, args = self._servers[index]
+        old_proc, args = self._servers[index]
+        if old_proc.poll() is None:
+            # Hung, not dead: it still holds the port, so it has to go before we can
+            # rebind -- otherwise every restart fails with "address already in use".
+            print(f"[watchdog] server {index} is hung; terminating it before restart", flush=True)
+            _terminate(old_proc)
         print(f"[watchdog] server {index} died; restarting on port {args.port}", flush=True)
         try:
             proc = start_server(args, {"CUDA_VISIBLE_DEVICES": str(self._gpus[index])})

@@ -414,3 +414,23 @@ def test_run_exits_nonzero_when_a_server_was_given_up(monkeypatch: Any, tmp_path
     with pytest.raises(SystemExit) as excinfo:
         run_mod.main()
     assert excinfo.value.code == 2
+
+
+def test_watchdog_terminates_a_hung_server_before_restarting(monkeypatch: Any) -> None:
+    """A hung server still holds its port, so it must be terminated before the rebind."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    monkeypatch.setattr(coord, "start_server", lambda args, env=None: _FakeProc(None))
+    monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
+    args = SimpleNamespace(host="127.0.0.1", port=14560, health_port=14561, server_start_timeout_sec=5)
+    hung = _FakeProc(None)  # process alive, but wedged
+    watchdog = coord._ServerWatchdog([(hung, args)], [0], interval_sec=0.05, probe_interval_sec=0.0)
+    monkeypatch.setattr(watchdog, "_alive", lambda a: False)
+
+    watchdog.start()
+    time.sleep(0.5)
+    watchdog.stop()
+    watchdog.join(timeout=2)
+
+    assert hung.terminated  # otherwise the new server cannot bind the port
+    assert watchdog.restarts >= 1
