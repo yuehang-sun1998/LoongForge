@@ -47,6 +47,8 @@
 | T-06 | 数值一致性（batch>1 vs batch=1） | 3（暂缓） | 任一 | ⏸ 暂缓 |
 | T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | ⏸ 暂缓（环境不支持 GPU-sim，待 CPU-sim 完成后统一做） |
 | T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3（暂缓） | 任一 | ⏸ 暂缓 |
+| T-09 | 运行后覆盖校验（漏/重/多出）+ 自动补跑 | 2 | 任一 | ✅ 通过（单测 5 passed；真实 M2 全量 `ok=true`） |
+| T-10 | 故障注入：漏集补跑 / kill server 自愈 | 2 | 任一 | 🔄 漏集补跑 ✅；server 自愈 ⬜（缺口见 01 §5.6） |
 
 ---
 
@@ -176,6 +178,30 @@
 > - **长尾被吃掉**：libero_10 的 500 集在基线里 2 卡拖 91 min，M2 里用满 8 卡、在 56 min 总盘子内跑完（后 6 卡不再空转）。
 > - **分数对齐**：逐集比对，2000 集中仅 **16 集**不同，全在 `libero_object/task=6/episode=16..31`，且基线里**全由同一 worker 连续产出**、`failure_reason=episode_error`/`ConnectionClosedError`（websocket keepalive 超时、`steps=0`、**根本没跑**）。**剔除这 16 个 spurious 失败后两边一致（96.42% vs 96.45%）→ 模型行为逐集相同**。
 > - ⚠️ **retry 缺口（已修）**：`episode_error` 本就在 episode 级重试集合里（`libero_runner.py:505`），但 `--max-retries` **默认 0** → 基线没设就把它记成失败。已在 `coordinator._shard_config` 默认注入 `run.max_retries=2`（显式值优先）。
+
+### T-09 · 运行后覆盖校验 + 自动补跑
+
+- **对应功能**：§5.5（`validation.py` + coordinator 补跑轮）。
+- **目的**：确认"计划要跑的集"与"实际跑出的集"一致——**不漏、不重、不多**；漏的自动补跑而不是中断。
+- **前置**：M2 coordinator 可用。
+- **步骤**：跑一次协调评测 → 看 `coordinator_result.json` 的 `validation` 块；或离线 `python -m ...validation --output-dir … --n-units N --plan plan.json`。
+- **通过标准**：`missing=duplicates=unexpected=unkeyed=0`（`ok=true`）；模型失败**不算**不完整；若确有缺失，应在 ≤3 轮内被补跑补齐。
+- **数据（2026-10-15）**：
+  - **单测**：`test_validation.py` 5 passed（期望集合 / `episode_id` 回退解析 / 连续区间合并 / 缺重多检测 / infra vs 模型失败分类）。
+  - **E2E 冒烟**（2 卡 / 4 并发 / 8 unit）：`validation.ok=true`、`repair_rounds=0`、`infra_failed=0`、失败 8 个全为 `not_successful_within_max_steps`。
+  - **真实 M2 全量离线校验**（2000 集 / 520 unit）：`ok=true`、`expected=actual=2000`、`missing=duplicates=unexpected=unkeyed=0`、`infra_failed=0`、`success_rate=0.9645`。
+- **结论**：✅ 通过。覆盖校验把"缺/重/多出"变成显式判据；缺失自动补跑（最多 3 轮），不中断评测。
+
+### T-10 · 故障注入：漏集补跑 + server 挂掉自愈
+
+- **对应功能**：§5.5 覆盖校验/补跑 + §5.6 server 自愈。
+- **目的**：验证"真出故障时"系统能不能自愈，而不是静默出错误分。
+- **步骤**：① 跑到中途删掉一个已完成 unit 的 `results.jsonl`（造漏集）→ 看补跑；② 跑到中途 `kill -9` 一个 policy server → 看是否重启 + 恢复。
+- **通过标准**：① 漏集在 ≤3 轮内补齐、`ok=true`；② server 被杀后**自动重启**、受影响 episode 最终**补齐**、wall-clock 不因 300s 连接等待被拖尾。
+- **数据（2026-10-15，各 2 卡 / 8 unit / 8 集，`max_steps=150`）**：
+  - **A 删记录**：删 `worker_0/results.jsonl`（1 集）→ `repair_rounds=1`、`n_units_launched=9`、`validation.ok=true`、`missing=0`、`infra_failed=0`。**✅ 补跑生效。**
+  - **B kill server**：`kill -9` 掉 `server_0` → ① **无重启**（external 模式 `ensure_running` 空转）；② 命中它的 unit 记 `episode_error`/`ConnectionClosedError`、`attempt: 2`（重试 3 次全败）；③ 走到 client 重建的 unit **卡满 300s**（`TimeoutError: Failed to connect to server within 300 seconds`）。**⚠️ 暴露 3 个缺口。**
+- **结论**：🔄 覆盖校验/补跑 ✅ 已验证；**server 自愈 ⬜ 待实现**（`01_architecture.md` §5.6、`02_progress.md` T2-3）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【阶段 3，暂缓】
 

@@ -39,6 +39,8 @@
 | 2 | shard/worker 契约 | ✅ 完成（由 `run.py` 统一分发吸收，**无需新 adapter 层**，见 §2.11） | `run.py` + 各 `*_runner` | `03_testing.md` T-04 | — |
 | 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ✅ 完成 + 全量对照（**全局队列 + 有界进程池 + 失败重试**；56.2 min / 3.09×，见 §2.11–§2.13） | `coordinator.py` | `03_testing.md` T-05 | 契约 |
 | 2 | episode-chunk 粒度抢占 | ✅ 完成（chunk 细到 1 集，快槽可抢下一个 unit） | `coordinator.py` | `03_testing.md` T-05 | 队列 |
+| 2 | **运行后覆盖校验 + 自动补跑** | ✅ 完成 | `validation.py` + `coordinator.py` | `03_testing.md` T-09 | — |
+| 2 | **server 自愈（看门狗 + 连接重建）** | ⬜ 待实现 | `coordinator.py` + `libero_runner.py` + `transport/client.py` | `03_testing.md` T-10 | §2.15 |
 | 3 | server 侧 batcher | ⬜ 未开始（**暂不做**） | `rpc_server.py` | — | 阶段 1/2 + FastWAM batch 契约 |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -215,6 +217,29 @@
 - **收获**：① 证实 M2 的全局队列确实抹平长尾（整机 1.68× / 对 vanilla 3.09×）；② 满负载下多 server 端口隔离、`suite_overrides`、unit 级重试均正常；③ 暴露"**episode 级重试默认关**"这个坑 → 已在 §2.11 修为默认 `run.max_retries=2`。
 - **待做**：GPU-sim 一路；vanilla 代码 rebase 后重跑对齐绝对分数。
 
+### 2.14 运行后覆盖校验 + 自动补跑（2026-10-15）
+
+- **背景**：`_aggregate` 只做去重计数——**漏集 / 重复 / 多出**都会被静默吞掉（分数照出）。用户要求补一个校验机制。
+- **代码**：新增 `orchestrator/validation.py`——`expected_keys(plan)`（计划应跑集合）、`key_of(record)`（取 `(suite,task,episode)`；缺字段回退解析 `episode_id`）、`read_records`、`validate`、`missing_keys`、`repair_shards`（缺失键**合并回连续区间**）、`format_report`；CLI `python -m ...validation --output-dir … --n-units N --plan plan.json`（默认**只报告**，`--strict` 才 exit 1）。coordinator 跑完把 `plan.json` 落盘，供离线复查。
+- **闭环（不中断评测）**：主队列跑完 → **校验 → 有缺失就生成补跑分片（连续区间合并）→ 复用同一个有界池再跑 → 再校验**，最多 `MAX_REPAIR_ROUNDS=3` 轮。**只有 3 轮后仍不完整**才 `ok=false`（此时才值得人工介入）；**过程不抛异常、不中断**。
+- **失败分类**：`infra_failed`（`episode_error`/超时/`server_unreachable`，**没真跑**）与**模型失败**分开；模型失败是正常结果，**不算不完整**。
+- **验证**：
+  - 单测 `test_validation.py` 5 passed（期望集合 / 键解析 / 区间合并 / 缺重多检测 / 失败分类）；全量 **74 passed / 1 skipped**。
+  - **E2E 冒烟**（2 卡 / 8 unit）：`coordinator_result.json` 出 `validation` 块，`ok=true`、`repair_rounds=0`、模型失败 8 个被正确排除。
+  - **对真实 M2 全量离线校验**（2000 集 / 520 unit）：**`ok=true`、missing=0、duplicates=0、unexpected=0、unkeyed=0、infra_failed=0**，`success_rate=0.9645`，失败全是 `not_successful_within_max_steps`（71）。
+
+### 2.15 故障注入实测 + 自愈缺口（2026-10-15）
+
+用户要求"真刀真枪试一下校验机制"。两个故障注入实验（各 2 卡 / 8 unit / 8 集，`max_steps=150`）：
+
+- **实验 A（删记录 → 验补跑）✅**：跑到中途删掉一个已完成 unit 的 `results.jsonl`（1 集变缺失）→ **`repair_rounds=1`、`n_units_launched=9`（8 计划 + 1 补跑）、`validation.ok=true`、`missing=0`、`infra_failed=0`**。补跑分片 = 那 1 集合并成的连续区间，新 index、复用同一有界池。**校验闭环确实能自愈漏集。**
+- **实验 B（kill server → 验鲁棒性）⚠️ 暴露 3 个缺口**：
+  1. **没有重启**：unit 全 external，`ensure_running` 直接 return → server 死了没人拉起。
+  2. **client 不重建 → 级联失败**：`ConnectionClosedError` 归为 `episode_error`，runner 只在 `server_unreachable` 时重建 client → 死连接继续失败（记录里 `attempt: 2`，重试 3 次全败）。**这正是基线那 16 连败的成因。**
+  3. **unit 卡死 300s**：`PolicyClient._wait_for_server(timeout=300)` 对着死 server 等满 300s（`TimeoutError: Failed to connect to server within 300 seconds`）→ 一次 server 挂掉可把评测拖成几十分钟。
+
+**结论**：覆盖校验解决"漏集"，但 **server 挂掉需要独立的"自愈"机制**（看门狗 + 连接重建 + 快速失败）——设计见 `01_architecture.md` §5.6，实现见待办 **T2-3**。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -284,6 +309,13 @@
 - **改动**：`coordinator.py` 用**全局队列 + 有界进程池**（`pending` + `free_slots`，跑完即补位）；chunk 细到 1 集；失败**重试一次**；每 server 落独立 config 定端口。
 - **粒度**：**episode-chunk 级**（不是 task 级）。
 - **验收**：✅ 多卡 E2E（2 server / 4 并发 / 8 unit）动态补位、无重叠无缺失、失败重试；✅ 全量对照已量化（静态基线 §2.12 + **M2 全量 §2.13：56.2 min / 96.45%，vs 基线 1.68×、vs 1卡1server 3.09×**）。
+
+### T2-3 server 自愈（看门狗 + 连接重建）【⬜ 待实现】
+
+- **目标**：server 挂掉后自动恢复，不让评测中断、也不被 300s 连接等待拖尾。
+- **改动**：① coordinator 加看门狗线程（查进程 + `/healthz`，死了**原地重启**）；② runner 把 websocket 连接类异常（`ConnectionClosed*`）归为 `server_unreachable`（触发 client 重建 + `ensure_running`）；③ client 的 `_wait_for_server` 300s 对 unit 级缩短 / 或让 unit 快速失败。
+- **验收**：kill 掉一个 server → 评测**自动恢复**、受影响 episode 最终补齐、`infra_failed` 归零、wall-clock 不被 300s 拖尾（`03_testing.md` T-10）。
+- **依据**：§2.15 的故障注入实测；设计见 `01_architecture.md` §5.6。
 
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 
