@@ -606,6 +606,83 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 
 ---
 
+### 7.6 优化链：chunk 客户端化 → batching → 提 N【M3 设计依据】
+
+三件事**必须按序做**，且**互相耦合**。
+
+#### (1) 现状（2026-10-15 核实）
+
+- **chunk 存在 server 端**：`loongforge_policy.py:42` 的 `_chunk_cache[episode_id] = (index, chunk[32])`；真推理算 32 步，只执行前 `chunk_execute_steps=10` 步。
+- **评测端每步都发请求**（`libero_runner.py:359`），且**每次带完整 payload**（2×224×224×3 ≈ 300KB 图像），**即使这次只是取 cache 里的下一个动作**。
+- 结果：**每 10 步 = 1 次真推理 + 9 次 cache hit**；命中路径 `_route_message` 只花 **7.7µs**，但端到端 **~0.9ms**（全是打包/传输/解包一帧用不上的图像）。
+- **`return_action_chunk` 开关已存在**（`loongforge_policy.py:95`，一次返回整段），但 **runner 的调用点从没传过**（恒 `False`），且**评测端没有"持 chunk 逐步消费"的代码**。
+
+#### (2) chunk 客户端化：开关 + 队列
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | 传 `return_action_chunk=True` | runner 调用点 |
+| 2 | **评测端新增 action 队列**：队列空才发请求，一次填满整段，逐步 `pop` | `_common.ChunkConsumer`（供各 runner 复用） |
+| 3 | 语义对齐：`episode_step` 只在实际发请求时推进（trace 区分"请求步/环境步"）；`payload_builder.update_from_response` 只在发请求时调；`client.reset` 时清队列 | 各 runner |
+| 4 | **遵守 `disable_action_cache`**（闭环 chunk 模型）：该开关为真时队列长度=1，行为等价于现状 | 各 runner |
+
+- **收益**：**请求量 10 → 1**、图像传输 10 → 1、server 忙占比从尖峰降到 ~10%；**结果应逐位一致**（同一份 chunk、同一顺序），可直接与现有全量结果比对。
+- **注意**：这一步**本身几乎不加速**（省的 RPC 相对 2s/10步 很小），它的价值是 **消掉 90% 的无效请求**，为 batcher 铺路。
+
+#### (3) batching：队列里只剩真推理
+
+**chunk 化之后，batcher 的队列天然只装真推理**（hit 请求根本不出 sim 进程），无需任何特判。
+
+**但 batch 大小不会因此变大**——真实推理的到达率没变（`N / (10 × t_step)`）。它由**供需平衡**决定：
+
+```
+需求率 λ = N / (10 × t_step)
+容量   C = K / t_infer          # batch K 的服务时间几乎不变（T-13：8× 工作量 +9%）
+稳态   λ ≈ C  →  K ≈ N × t_infer / (10 × t_step)
+```
+
+实测代入（`t_infer≈0.65s`、`t_step≈0.2s`、`N=16`）→ **K ≈ 5**（对照 T-13：batch 4 = 3.9×、batch 8 = 7.3× → **实收 ~4×**）。
+
+**正反馈**：batching 让推理变快 → sim 不再等 → 需求率上升 → 队列保持饱和 → batch 维持（不会自己饿死）。
+
+#### (4) 提 N：两者做完后的真正杠杆
+
+**server 能支撑的 sim 数**（chunk 化之后请求 100% 是真推理）：
+
+```
+N_max ≈ K × (10 × t_step) / t_infer
+```
+| batch K | N_max（每 server） | 8 卡总量 | 备注 |
+|---|---|---|---|
+| 1 | ≈ 5 | 40 | **现状 N=16 是靠 90% 的 µs 级 hit 在"过载"跑** |
+| 4 | ≈ 12 | 96 | |
+| 8 | ≈ 25 | 200 | |
+
+**新的瓶颈顺序（N 加大后）**：
+
+| 资源 | 现状（N=16×8） | N=64×8 | 结论 |
+|---|---|---|---|
+| CPU | 8.9%（128 核） | ~35% | 有余量 |
+| **内存** | 2.2GB/sim × 128 ≈ 281GB | ≈ 1.1TB（上限 1.5TB） | ⚠️ **最先撞墙** |
+| 仿真 | 被推理掩盖 | 成为瓶颈 | 见下 |
+
+```text
+wall = max(仿真总时间 / 总 sim 数, 推理总时间 / (K × 卡数))
+     = max(62000 CPU·s / 512, 14000 GPU·s / 64) ≈ max(121s, 219s) ≈ 3.6 min   ← 理想下界
+```
+对现状 56 min → 理论上限 ~15×；计入加载/长尾/争用，**现实估计 8–12 min**。
+
+#### (5) 顺序与耦合（不要跳步）
+
+1. **chunk 客户端化**（简单、结果逐位一致、为 batcher 铺路）
+2. **batcher**（队列只装真推理；按目标 K 反推 `max_wait_ms`）
+3. **重扫 N-吞吐曲线**（chunk 化之后才是真实曲线，`calibrate.py`）
+4. **提 N，先看内存**；再往上需要降 per-sim 占用（如 `MUJOCO_GL=egl` 省渲染 buffer）
+5. ⚠️ **`t_step` 与 `N_max` 耦合**：换渲染后端（osmesa→egl）会改 `t_step` → **N 必须重标定**
+6. GPU-sim 另算（SAPIEN 向量化与 batch 天然耦合，见 §7.5）
+
+**per-benchmark 适用性**：LIBERO / CALVIN / ManiSkill 可**直接套**（都是"每步请求、只取第一条"）；**SimplerEnv** 有 action ensemble（依赖跨步 `action_history`，要保证更新节奏不变）；**RoboTwin** 的交互在外部脚本里（要单独改）。
+
 ## 8. 完整流程（升级后）
 
 > 输入/输出视角的端到端流程。**阶段 A 标定**（一次性，可缓存）→ **阶段 B 正式评测**。相关：§6（标定）、§5.4（配置 schema）、§4.3（队列）。

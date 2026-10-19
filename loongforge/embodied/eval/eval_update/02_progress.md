@@ -44,6 +44,7 @@
 | 2 | **健壮性兜底**（unit 超时 / 收尾信号 / 竞态 / hung 探活） | ✅ 完成（`dc07c75`/`2e28ce0`/`e5f077c`/`cf9abb6`） | `coordinator.py` + `run.py` + `transport/client.py` | `03_testing.md` T-11 | §2.16 |
 | 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
 | 2 | **分片：per-benchmark planner 表** | ✅ 完成 | `planning.py` + `coordinator.py` + `validation.py` | `03_testing.md` T-12 | §2.18 |
+| 3 | **chunk 客户端化**（消 90% 请求） | ⬜ 待做（设计见 `01` §7.6） | 各 runner + `_common` | — | — |
 | 3 | server 侧 batcher（M3） | 🔄 **探针实测：`per_sample_ms` 583→79ms（batch 8，7.3×）→ 判定 GO，是量级最大的剩余杠杆**；待补 batch 契约 | `orchestrator/batch_probe.py`（诊断） | `03_testing.md` T-13 | FastWAM batch 契约 |
 | 3 | **单卡多 server vs batch**（T-08） | ✅ 已结案：**多副本只 1.25×、batch 7.3×** → 选 batch | —（A/B 用现有 coordinator 跑） | `03_testing.md` T-08 | — |
 
@@ -328,6 +329,18 @@
 - **结果**：A 30.3 ep/min（wall 13.20 min）vs B **32.5 ep/min**（wall 12.29 min）→ **worker wall 只快 1.25×**（10.16→8.15 min），总 wall 只快 1.07×。显存不是瓶颈（2×24.7=49.4 < 81.9GB，`server_restarts=0`）。
 - **结论**：**强次线性**——多进程共享 GPU 受**上下文切换/驱动串行化**限制（不是 SM 不够）。**"单卡多 server 就够了"不成立**（~1.25×），而 batching 有独立且大得多的空间（7.3×）→ **M3 值得做，且不能靠多开 server 替代**。同时**结案 T-08**（"大 batch vs 单卡多副本" → 选 batch）。
 - **caveat**：单 workload 的结论；换 workload / 试 3 server 一卡可能有出入，但 1.25× 这个量级已足以否掉"多 server 替代 batching"。
+
+### 2.22 优化链设计：chunk 客户端化 → batching → 提 N（2026-10-15，仅文档）
+
+- **起因**：讨论 cache hit 的优化空间时厘清——**chunk 现在存在 server 端**（`_chunk_cache`），**评测端每步都发请求**（还带 300KB 图像），命中路径 server 只花 7.7µs、但端到端 ~0.9ms 全是传输。
+- **结论（写进 `01` §7.6）**：
+  1. **chunk 客户端化**：传 `return_action_chunk=True`（开关已有）+ 评测端加 action 队列（队列空才发请求）→ **请求量 10→1**、图像传输 10→1、**结果逐位一致**；本身几乎不加速，价值是**消掉 90% 无效请求**。
+  2. **batching**：chunk 化后**队列天然只装真推理**（hit 不出 sim 进程）→ batcher 无需特判。但 **batch 不会因此变大**：`K ≈ N × t_infer / (10 × t_step)` → `N=16` 时 **K≈5**（实收 ~4×，对照 T-13）。
+  3. **提 N**：`N_max ≈ K × 10 × t_step / t_infer` → K=4 时 ~12、K=8 时 ~25（每 server）。**新瓶颈是内存**（N=64×8 ≈ 1.1TB / 1.5TB），CPU 还有余量。
+  4. **理想下界** ≈ `max(仿真 121s, 推理 219s) ≈ 3.6 min`（现状 56min）；现实 8–12 min。
+- **耦合提醒**：`t_step` 与 `N_max` 耦合 → 换渲染后端（egl）要重标定 N。
+- **适用性**：LIBERO/CALVIN/ManiSkill 直接套；SimplerEnv 有 action ensemble、RoboTwin 在外部脚本里，需单独处理。
+- **本步只更新文档**（用户正在用 GPU 跑其他任务）。
 
 ---
 
