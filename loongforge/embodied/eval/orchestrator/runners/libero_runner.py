@@ -275,6 +275,7 @@ def run_episode(
     e2e_latencies: List[Optional[float]] = []
     episode_start = time.time()
     env = None
+    chunk_consumer = _common.ChunkConsumer()
 
     try:
         with alarm_timeout(args.per_episode_timeout_sec, EpisodeTimeoutError):
@@ -286,6 +287,10 @@ def run_episode(
             client.reset(episode_id)
             payload_builder.reset(episode_id)
             action_decoder.reset()
+            chunk_consumer.reset()
+            chunk_steps = int(client.metadata.get("chunk_execute_steps") or 0)
+            request_step = 0
+            last_request_id = None
             env.reset()
             obs = env.set_init_state(initial_state)
             # set_init_state teleports the sim, but the robosuite OSC caches
@@ -336,50 +341,61 @@ def run_episode(
 
                 episode_step = raw_step - args.num_steps_wait
                 controller = env.env.robots[0].controller
-                canonical_obs = adapter.obs_to_canonical(
-                    obs,
-                    {
-                        "instruction": task_description,
+                disable_action_cache = bool(getattr(payload_builder, "disable_action_cache", False))
+                issued_request = chunk_consumer.needs_request(disable_action_cache)
+                data: Dict[str, Any] = {}
+                inference_latency_ms = None
+                e2e_latency_ms = 0.0
+                if issued_request:
+                    canonical_obs = adapter.obs_to_canonical(
+                        obs,
+                        {
+                            "instruction": task_description,
+                            "episode_id": episode_id,
+                            "episode_step": request_step,
+                            "ee_pos": np.asarray(controller.ee_pos, dtype=np.float32),
+                            "ee_ori_mat": np.asarray(controller.ee_ori_mat, dtype=np.float32),
+                        },
+                    )
+                    ctx = {
+                        "benchmark_name": "libero",
                         "episode_id": episode_id,
-                        "episode_step": episode_step,
+                        "episode_step": request_step,
+                        "instruction": task_description,
                         "ee_pos": np.asarray(controller.ee_pos, dtype=np.float32),
                         "ee_ori_mat": np.asarray(controller.ee_ori_mat, dtype=np.float32),
-                    },
-                )
-                ctx = {
-                    "benchmark_name": "libero",
-                    "episode_id": episode_id,
-                    "episode_step": episode_step,
-                    "instruction": task_description,
-                    "ee_pos": np.asarray(controller.ee_pos, dtype=np.float32),
-                    "ee_ori_mat": np.asarray(controller.ee_ori_mat, dtype=np.float32),
-                }
-                request_start = time.perf_counter()
-                with alarm_timeout(args.policy_call_timeout_ms / 1000.0, TimeoutError):
-                    response = client.predict_action(
-                        **_build_rpc_payload(
-                            payload_builder,
-                            canonical_obs,
-                            ctx,
-                            # Closed-loop-within-chunk models (PayloadBuilder capability)
-                            # must be called every env step; others keep the chunk cache.
-                            disable_action_cache=bool(
-                                getattr(payload_builder, "disable_action_cache", False)
-                            ),
+                    }
+                    request_start = time.perf_counter()
+                    with alarm_timeout(args.policy_call_timeout_ms / 1000.0, TimeoutError):
+                        response = client.predict_action(
+                            **_build_rpc_payload(
+                                payload_builder,
+                                canonical_obs,
+                                ctx,
+                                # Closed-loop-within-chunk models (PayloadBuilder
+                                # capability) must be called every env step; others
+                                # hand the whole chunk to the client.
+                                disable_action_cache=disable_action_cache,
+                                return_action_chunk=True,
+                            )
                         )
-                    )
-                e2e_latency_ms = (time.perf_counter() - request_start) * 1000.0
-                e2e_latencies.append(e2e_latency_ms)
-                if not response.get("ok", False):
-                    raise RuntimeError(f"Policy error: {response}")
+                    e2e_latency_ms = (time.perf_counter() - request_start) * 1000.0
+                    e2e_latencies.append(e2e_latency_ms)
+                    if not response.get("ok", False):
+                        raise RuntimeError(f"Policy error: {response}")
 
-                data = response["data"]
-                payload_builder.update_from_response(data)
-                inference_latency_ms = data.get("inference_latency_ms")
-                inference_latencies.append(inference_latency_ms)
-                raw_chunk = np.asarray(data["actions"], dtype=np.float32)
-                if raw_chunk.ndim == 1:
-                    raw_chunk = raw_chunk.reshape(1, -1)
+                    data = response["data"]
+                    payload_builder.update_from_response(data)
+                    inference_latency_ms = data.get("inference_latency_ms")
+                    inference_latencies.append(inference_latency_ms)
+                    chunk_consumer.load(
+                        data["actions"],
+                        limit=1 if disable_action_cache else chunk_steps,
+                    )
+                    last_request_id = data.get("request_id")
+                    request_step += 1
+
+                raw_chunk = chunk_consumer.next_action(disable_action_cache)
                 # Log raw grip values before decode for debugging
                 if action_decoder_key and raw_chunk.shape[-1] >= 10:
                     raw_grip = float(raw_chunk[0, 9])
@@ -396,12 +412,14 @@ def run_episode(
                     trace.append(
                         {
                             "step": episode_step,
-                            "request_id": data.get("request_id"),
+                            "env_step": episode_step,
+                            "request_step": request_step - 1 if issued_request else None,
+                            "request_id": last_request_id,
                             "raw_action": flat_action.tolist(),
                             "env_action": env_action,
                             "inference_latency_ms": inference_latency_ms,
                             "e2e_latency_ms": e2e_latency_ms,
-                            "chunk_cache_hit": inference_latency_ms is None,
+                            "chunk_cache_hit": not issued_request,
                             "done": bool(done),
                             "success": bool(info.get("success", False)),
                         }
@@ -466,6 +484,8 @@ def run_episode(
         "runtime": "sim",
         "success": int(success),
         "steps": steps,
+        "env_steps": steps,
+        "inference_requests": chunk_consumer.requests,
         "safety_cost": None,
         "episode_time_sec": time.time() - episode_start,
         "reset_time_sec": reset_time_sec,

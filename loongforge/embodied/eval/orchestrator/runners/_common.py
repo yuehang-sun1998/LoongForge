@@ -132,6 +132,68 @@ def resolve_min_episodes(args: argparse.Namespace) -> int:
     if configured > 0:
         return configured
     return int(getattr(args, "episodes_per_task", 0) or 0)
+# --------------------------------------------------------------------------- #
+# Client-side action chunks (T-14: 10 requests -> 1)
+# --------------------------------------------------------------------------- #
+class ChunkConsumer:
+    """Hold one action chunk client-side and serve its actions step by step.
+
+    The server returns a whole chunk when ``return_action_chunk=True``. Keeping
+    it in the runner removes the per-step RPC (and its full observation
+    payload); the model still sees exactly the same requests as before, so the
+    executed actions are unchanged.
+
+    ``disable_action_cache`` models are closed-loop within a chunk: the runner
+    asks for a fresh request every env step and consumes only the first action.
+    """
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.local_steps = 0
+        self._chunk: Optional[np.ndarray] = None
+        self._index = 0
+
+    def reset(self) -> None:
+        """Drop the current chunk (call at episode start / after client.reset)."""
+        self._chunk = None
+        self._index = 0
+        self.requests = 0
+        self.local_steps = 0
+
+    def needs_request(self, disable_action_cache: bool = False) -> bool:
+        """Return True when the runner must issue a new inference request."""
+        return (
+            disable_action_cache
+            or self._chunk is None
+            or self._index >= self._chunk.shape[0]
+        )
+
+    def load(self, chunk: Any, limit: Optional[int] = None) -> None:
+        """Install a freshly returned chunk and reset the cursor."""
+        actions = np.asarray(chunk, dtype=np.float32)
+        if actions.ndim == 1:
+            actions = actions.reshape(1, -1)
+        if limit is not None and int(limit) > 0:
+            actions = actions[: int(limit)]
+        self._chunk = actions
+        self._index = 0
+        self.requests += 1
+
+    def next_action(self, disable_action_cache: bool = False) -> np.ndarray:
+        """Return the next action as ``[1, action_dim]``.
+
+        ``disable_action_cache`` requests are single-step by construction: the
+        cursor is invalidated so the next call triggers a new request.
+        """
+        if self._chunk is None or self._index >= self._chunk.shape[0]:
+            raise RuntimeError("ChunkConsumer.next_action() called without a loaded chunk")
+        action = self._chunk[self._index : self._index + 1]
+        if disable_action_cache:
+            self._index = self._chunk.shape[0]
+        else:
+            self._index += 1
+            self.local_steps += 1
+        return action
 
 
 # --------------------------------------------------------------------------- #

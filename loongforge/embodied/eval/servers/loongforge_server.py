@@ -12,6 +12,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
+import yaml
+
 from loongforge.embodied.eval.factories.registry import build_model_spec
 from loongforge.embodied.eval.servers.eval_server_config import parse_eval_server_config
 from loongforge.embodied.eval.servers.loongforge_policy import GenericPredictActionPolicy
@@ -90,6 +92,9 @@ def main() -> None:
     cli = parser.parse_args()
 
     server_args, raw_model_dict = parse_eval_server_config(cli.config)
+    with open(cli.config, "r", encoding="utf-8") as file:
+        raw_config = yaml.safe_load(file) or {}
+    batching = (raw_config.get("server") or {}).get("batching") or {}
 
     if server_args.loongforge_root:
         os.chdir(server_args.loongforge_root)
@@ -107,7 +112,12 @@ def main() -> None:
         request_id_prefix=f"loongforge-{server_args.model_type}",
     )
     start_health_server(server_args.health_port, server_args.ckpt_path)
-    PolicyServer(policy=policy, port=server_args.port, metadata=policy.metadata).serve_forever()
+    PolicyServer(
+        policy=policy,
+        port=server_args.port,
+        metadata=policy.metadata,
+        batching=batching,
+    ).serve_forever()
 
 
 if __name__ == "__main__":

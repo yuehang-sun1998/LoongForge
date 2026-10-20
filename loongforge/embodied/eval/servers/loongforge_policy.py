@@ -74,6 +74,11 @@ class GenericPredictActionPolicy:
         """Return policy metadata for the eval server."""
         return dict(self._metadata)
 
+    @property
+    def supports_batching(self) -> bool:
+        """Whether the underlying model exposes a real batch contract (T-06)."""
+        return bool(self._metadata.get("supports_batching", False))
+
     def reset(self, episode_id: str) -> Dict[str, Any]:
         """Reset action cache for an episode."""
         self._chunk_cache.pop(episode_id, None)
@@ -99,7 +104,11 @@ class GenericPredictActionPolicy:
         """
         disable_action_cache = bool(kwargs.pop("disable_action_cache", False))
         return_action_chunk = bool(kwargs.pop("return_action_chunk", False))
-        cache_entry = None if disable_action_cache else self._chunk_cache.get(episode_id)
+        # When the client owns the chunk it will not come back until the chunk is
+        # exhausted. Caching server-side in that case would replay the *old*
+        # chunk on the next request instead of running inference.
+        use_cache = not (disable_action_cache or return_action_chunk)
+        cache_entry = self._chunk_cache.get(episode_id) if use_cache else None
         if cache_entry is not None:
             chunk_index, chunk = cache_entry
             chunk_index += 1
@@ -127,13 +136,36 @@ class GenericPredictActionPolicy:
             **kwargs,
         )
         inference_latency_ms = (time.perf_counter() - start_time) * 1000.0
-        if not disable_action_cache:
+        if use_cache:
             self._chunk_cache[episode_id] = (0, chunk)
         return {
             "actions": chunk if return_action_chunk else chunk[0:1],
             "inference_latency_ms": inference_latency_ms,
             "request_id": self._request_id(episode_id, episode_step),
         }
+
+    def has_cached_action(self, payload: Dict[str, Any]) -> bool:
+        """Return True when this payload can be served from the chunk cache.
+
+        Used by the server-side batcher to keep cache hits out of the inference
+        queue. Client-owned chunks (``return_action_chunk``) are never cached
+        server-side, so they always need inference.
+        """
+        if payload.get("disable_action_cache") or payload.get("return_action_chunk"):
+            return False
+        entry = self._chunk_cache.get(str(payload.get("episode_id", "default")))
+        return entry is not None and entry[0] + 1 < entry[1].shape[0]
+
+    def predict_action_batch(self, payloads: list) -> list:
+        """Process several payloads in one call.
+
+        The model-level batch contract (per-row seeds and batched input
+        encoding) is tracked by T-06. Until it lands this is a
+        correctness-preserving fallback: every payload still runs through the
+        normal single-request path, so enabling the batcher cannot change
+        results.
+        """
+        return [self.predict_action(**payload) for payload in payloads]
 
     def _request_id(self, episode_id: str, episode_step: int) -> str:
         """Build a stable request id for eval responses."""
