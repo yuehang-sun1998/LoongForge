@@ -174,15 +174,71 @@ def _scaling(model: Any, metadata: Dict[str, Any], batches: List[int]) -> List[D
     return rows
 
 
+def _equivalence(model: Any, metadata: Dict[str, Any], seeds: List[int]) -> Dict[str, Any]:
+    """Compare batch=K (per-row seeds) with K separate batch=1 calls.
+
+    Both arms use the same captured conditioning inputs. The batch arm gets
+    ``seed=[s0..s_{K-1}]``; the reference arm runs each seed separately. The
+    per-row max abs difference must be zero (or at most the batched-GEMM
+    reduction-order noise), and rows must differ across seeds.
+    """
+    from loongforge.embodied.model.fastwam.mot.fastwam import FastWAM
+
+    args, kwargs = _capture_infer_call(model, metadata)
+    core = model.core
+    references = []
+    for row_seed in seeds:
+        call = dict(kwargs)
+        call["seed"] = int(row_seed)
+        out = FastWAM.infer_action(core, *args, **call)
+        action = _as_tensor(out)
+        references.append(action[0] if action.ndim == 3 else action)
+
+    batch_kwargs = {
+        key: _expand(value, len(seeds))
+        for key, value in kwargs.items()
+        if key != "seed"
+    }
+    batch_kwargs["seed"] = [int(seed) for seed in seeds]
+    batch_args = tuple(_expand(value, len(seeds)) for value in args)
+    batched = _as_tensor(FastWAM.infer_action(core, *batch_args, **batch_kwargs))
+
+    per_row = [float((batched[index] - references[index]).abs().max()) for index in range(len(seeds))]
+    cross = [
+        float((batched[i] - references[j]).abs().max())
+        for i in range(len(seeds))
+        for j in range(len(seeds))
+        if i != j
+    ]
+    return {
+        "seeds": seeds,
+        "out_shape": tuple(batched.shape),
+        "per_row_max_abs_diff": per_row,
+        "max_abs_diff": max(per_row),
+        "min_cross_seed_diff": min(cross) if cross else None,
+        "rows_distinct": bool(cross and min(cross) > 0),
+    }
+
+
 def main() -> None:
     """Run main."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="a server eval config (server.ckpt_path etc.)")
     parser.add_argument("--calls", type=int, default=5)
     parser.add_argument("--batches", default="1,2,4,8")
+    parser.add_argument(
+        "--equivalence",
+        action="store_true",
+        help="compare batch=K with per-row seeds against K batch=1 calls",
+    )
+    parser.add_argument("--seeds", default="1,2,3,4")
     args = parser.parse_args()
 
     model, metadata = _build_model(args.config)
+    if args.equivalence:
+        seeds = [int(seed) for seed in args.seeds.split(",") if seed]
+        print(json.dumps(_equivalence(model, metadata, seeds), indent=2))
+        return
     split = _profile(model, metadata, args.calls)
     scaling = _scaling(model, metadata, [int(b) for b in args.batches.split(",") if b])
     print(json.dumps({"split": split, "scaling": scaling}, indent=2))

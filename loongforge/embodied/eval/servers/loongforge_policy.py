@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,8 @@ import numpy as np
 
 from loongforge.embodied.eval.protocol import PROTOCOL_VERSION
 from loongforge.embodied.eval.servers.predict_action_interface import PredictActionModel, call_predict_action
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -157,15 +160,91 @@ class GenericPredictActionPolicy:
         return entry is not None and entry[0] + 1 < entry[1].shape[0]
 
     def predict_action_batch(self, payloads: list) -> list:
-        """Process several payloads in one call.
+        """Process several payloads in one model call when supported.
 
-        The model-level batch contract (per-row seeds and batched input
-        encoding) is tracked by T-06. Until it lands this is a
-        correctness-preserving fallback: every payload still runs through the
-        normal single-request path, so enabling the batcher cannot change
-        results.
+        Batch rows use the same fixed noise seed as the batch=1 path, so a
+        request's result does not depend on whether it shared a batch. If the
+        model has no batch contract (or any payload is not batch-compatible),
+        fall back to the sequential path.
         """
-        return [self.predict_action(**payload) for payload in payloads]
+        if not self.supports_batching or len(payloads) <= 1:
+            return [self.predict_action(**payload) for payload in payloads]
+        try:
+            return self._predict_action_batch(payloads)
+        except Exception:
+            logger.warning(
+                "Batched inference failed; falling back to sequential requests.",
+                exc_info=True,
+            )
+            return [self.predict_action(**payload) for payload in payloads]
+
+    def _predict_action_batch(self, payloads: list) -> list:
+        modes = {
+            (bool(payload.get("disable_action_cache")), bool(payload.get("return_action_chunk")))
+            for payload in payloads
+        }
+        if len(modes) != 1:
+            raise ValueError("cannot batch payloads with different cache modes")
+        base_seed = self._metadata.get("noise_seed")
+        if base_seed is None:
+            raise ValueError("batched inference requires a fixed model.noise_seed")
+
+        images = []
+        instructions = []
+        states = []
+        for payload in payloads:
+            payload_images = payload.get("images")
+            payload_instructions = payload.get("instructions")
+            if not isinstance(payload_images, (list, tuple)) or not payload_images:
+                raise ValueError("batched inference expects a non-empty image list")
+            views = list(payload_images)
+            if isinstance(views[0], (list, tuple)):
+                # Already batch-wrapped ([[view, ...]]).
+                if len(views) != 1:
+                    raise ValueError("batched inference expects batch=1 image payloads")
+                views = list(views[0])
+            images.append(views)
+            if isinstance(payload_instructions, str):
+                instructions.append(payload_instructions)
+            elif isinstance(payload_instructions, (list, tuple)) and len(payload_instructions) == 1:
+                instructions.append(payload_instructions[0])
+            else:
+                raise ValueError("batched inference expects one instruction per payload")
+            states.append(np.asarray(payload.get("state"), dtype=np.float32).reshape(-1))
+        state_batch = np.stack(states, axis=0)
+
+        start = time.perf_counter()
+        result = self._model.predict_action(
+            images=images,
+            instructions=instructions,
+            state=state_batch,
+            dataset_stats=self._dataset_stats,
+            seeds=[int(base_seed)] * len(payloads),
+        )
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        actions = np.asarray(result, dtype=np.float32)
+        if actions.ndim == 2:
+            actions = actions[None, :, :]
+        if actions.shape[0] != len(payloads):
+            raise ValueError(
+                f"batched model returned {actions.shape[0]} rows for {len(payloads)} payloads"
+            )
+
+        responses = []
+        for payload, row in zip(payloads, actions):
+            episode_id = str(payload.get("episode_id", "default"))
+            if not payload.get("disable_action_cache") and not payload.get("return_action_chunk"):
+                self._chunk_cache[episode_id] = (0, row)
+            responses.append(
+                {
+                    "actions": row if payload.get("return_action_chunk") else row[0:1],
+                    "inference_latency_ms": latency_ms,
+                    "request_id": self._request_id(
+                        episode_id, int(payload.get("episode_step", 0))
+                    ),
+                }
+            )
+        return responses
 
     def _request_id(self, episode_id: str, episode_step: int) -> str:
         """Build a stable request id for eval responses."""
