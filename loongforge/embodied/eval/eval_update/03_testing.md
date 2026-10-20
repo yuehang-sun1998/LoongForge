@@ -52,7 +52,7 @@
 | T-11 | 健壮性兜底（unit 超时 / 收尾信号 / 竞态 / hung 探活） | 2 | 任一 | ✅ 通过（单测 8 个；E2E 冒烟通过） |
 | T-12 | 分片 planner 表（per-benchmark） | 2 | 全 family | ✅ 通过（单测 14 个；E2E 冒烟通过） |
 | T-13 | batch 缩放探针（M3 go/no-go） | 3 | 任一 | 🔄 探针就绪，待跑（需空闲 GPU） |
-| T-14 | chunk 客户端化（请求量 10→1、结果逐位一致） | 3 | CPU-sim | ⬜ 待执行（设计见 01 §7.6） |
+| T-14 | chunk 客户端化（请求量 10→1、结果逐位一致） | 3 | CPU-sim | ✅ 通过（80/80 逐集一致；请求量 9.83×） |
 
 ---
 
@@ -296,8 +296,11 @@
   1. **正确性**：同一分片跑两遍（改前/改后），**逐集 success 与 steps 完全一致**（同一份 chunk、同一顺序 → 应逐位一致）。
   2. **请求量**：server 侧统计的 `predict_action` 次数降到 **~1/10**（真推理次数不变）。
   3. **收益**：端到端 RPC 时间大幅下降（但**总 wall 预期基本不变**——省下的 RPC 相对仿真很小）。
-- **数据**：_待填_（需空闲 GPU）
-- **结论**：_待填_
+- **数据（2026-10-20，真实 FastWAM + LIBERO）**：
+  - 正确性：`libero_10/task0` 10 集，与 server-cache 旧 run 的 **success / steps 10/10 一致**；另随机抽 `goal/spatial/object` 共 7 个 task × 10 集，**70/70 一致**（合计 **80/80**）。
+  - 请求量：`task0` 10 集共 **302 次推理请求 / 2969 个 env step = 9.83×**；逐集符合 `ceil(steps/10)`（如 700→70、232→24）。
+  - server 侧 batcher E2E：4 个 sim 并发连同一个 server（`max_wait_ms=50`），51 个请求聚成 46 个 batch，**mean 1.11 / max 2**；4 个 client 全部正常结束（3 成功 + 1 个 150 步超时），无 server 错误。
+- **结论**：✅ **T-14 通过**。chunk 客户端化不改变结果，请求量降到 ~1/10。server 侧 batcher 的异步聚合与 cache-hit 过滤已跑通；真正的 GPU 加速仍待 **T-06** 的 batch 契约（当前 `predict_action_batch` 是顺序回退）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【📋 方案已定，M3 前置】
 

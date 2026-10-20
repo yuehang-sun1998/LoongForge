@@ -608,6 +608,8 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 
 ### 7.6 优化链：chunk 客户端化 → batching → 提 N【M3 设计依据】
 
+> **状态（2026-10-20）**：第 (2) 步已实现并验证——`return_action_chunk` + `ChunkConsumer`，80/80 集与旧 run 逐位一致，请求量 9.83×；第 (3) 步 `AsyncBatcher` 已实现（异步聚合 + cache-hit 过滤），4 个 sim 的 E2E 聚合到 max batch 2，但 `predict_action_batch` 仍是顺序回退，**真正的 GPU 加速待 T-06 的 batch 契约**；第 (4) 步重扫 N 在 T-06 之后做。
+
 三件事**必须按序做**，且**互相耦合**。
 
 #### (1) 现状（2026-10-15 核实）

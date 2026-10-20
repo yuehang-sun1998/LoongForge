@@ -44,8 +44,8 @@
 | 2 | **健壮性兜底**（unit 超时 / 收尾信号 / 竞态 / hung 探活） | ✅ 完成（`dc07c75`/`2e28ce0`/`e5f077c`/`cf9abb6`） | `coordinator.py` + `run.py` + `transport/client.py` | `03_testing.md` T-11 | §2.16 |
 | 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
 | 2 | **分片：per-benchmark planner 表** | ✅ 完成 | `planning.py` + `coordinator.py` + `validation.py` | `03_testing.md` T-12 | §2.18 |
-| 3 | **chunk 客户端化**（消 90% 请求） | ⬜ 待做（设计见 `01` §7.6） | 各 runner + `_common` | — | — |
-| 3 | server 侧 batcher（M3） | 🔄 **探针实测：`per_sample_ms` 583→79ms（batch 8，7.3×）→ 判定 GO，是量级最大的剩余杠杆**；待补 batch 契约 | `orchestrator/batch_probe.py`（诊断） | `03_testing.md` T-13 | FastWAM batch 契约 |
+| 3 | **chunk 客户端化**（消 90% 请求） | ✅ 完成（请求量 9.83×；80/80 逐集一致） | 各 runner + `_common` | `03_testing.md` T-14 | §2.23 |
+| 3 | server 侧 batcher（M3） | 🔄 **探针实测：`per_sample_ms` 583→79ms（batch 8，7.3×）→ 判定 GO**；**server 侧 `AsyncBatcher` 已实现（异步聚合 + cache-hit 过滤）**；待补 T-06 真 batch 契约 | `transport/batcher.py` + `batch_probe.py`（诊断） | `03_testing.md` T-13/T-14 | FastWAM batch 契约 |
 | 3 | **单卡多 server vs batch**（T-08） | ✅ 已结案：**多副本只 1.25×、batch 7.3×** → 选 batch | —（A/B 用现有 coordinator 跑） | `03_testing.md` T-08 | — |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -341,6 +341,15 @@
 - **耦合提醒**：`t_step` 与 `N_max` 耦合 → 换渲染后端（egl）要重标定 N。
 - **适用性**：LIBERO/CALVIN/ManiSkill 直接套；SimplerEnv 有 action ensemble、RoboTwin 在外部脚本里，需单独处理。
 - **本步只更新文档**（用户正在用 GPU 跑其他任务）。
+
+### 2.23 M3 前两步落地：chunk 客户端化 + server 侧 batcher（2026-10-20）
+
+- **代码**：`return_action_chunk=True` + `_common.ChunkConsumer`；server 在 client-owned chunk 模式下**绕过 `_chunk_cache`**（否则下次请求会回放旧 chunk）。新增 `transport/batcher.py::AsyncBatcher`（`max_wait_ms` 聚合、`max_batch_size`、cache-hit 过滤、每 batch 一个 `Future`），`server.batching` 默认关闭。
+- **T-14 实测**（真实 FastWAM + LIBERO）：
+  - `libero_10/task0` 10 集 + 随机 `goal/spatial/object` 7 task × 10 集：**80/80 集 success/steps 与旧 server-cache run 完全一致**。
+  - 请求量：`task0` 10 集 **302 requests / 2969 env steps = 9.83×**，逐集严格 `ceil(steps/10)`。
+- **batcher E2E**：4 个 sim 共用 1 个 server（`max_wait_ms=50`）→ 51 请求 / 46 batch，mean 1.11、max 2；无 server 错误。
+- **未做**：真 batch 数值等价（T-06）——`predict_action_batch` 目前是**顺序回退**，所以 batcher 只证明"聚合/过滤/异步路径"正确，**还没有 GPU 加速**。下一步是给 `infer_action` 加 per-row seeds + batch 等价比对，再回头重扫 N。
 
 ---
 
