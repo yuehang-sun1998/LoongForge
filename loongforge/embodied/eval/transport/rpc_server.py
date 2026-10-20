@@ -150,6 +150,15 @@ class PolicyServer:
         if message_type == "ping":
             return {"status": "ok", "ok": True, "type": "pong", "request_id": request_id}
 
+        if message_type == "stats":
+            return {
+                "status": "ok",
+                "ok": True,
+                "type": "stats",
+                "request_id": request_id,
+                "data": {"batching": self._batcher.stats if self._batcher is not None else None},
+            }
+
         if message_type == "reset":
             episode_id = payload.get("episode_id")
             if not episode_id:
