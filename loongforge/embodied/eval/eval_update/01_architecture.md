@@ -608,7 +608,7 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 
 ### 7.6 优化链：chunk 客户端化 → batching → 提 N【M3 设计依据】
 
-> **状态（2026-10-20）**：第 (2) 步已实现并验证——`return_action_chunk` + `ChunkConsumer`，80/80 集与旧 run 逐位一致，请求量 9.83×；第 (3) 步 `AsyncBatcher` + 真 batch 路径已接通（T-06：bf16 `max|d|≈0.0054`，行独立无错位）；第 (4) 步重扫 N 是下一步。
+> **状态（2026-10-20）**：第 (2) 步已实现并验证——`return_action_chunk` + `ChunkConsumer`，80/80 集与旧 run 逐位一致，请求量 9.83×；第 (3) 步 `AsyncBatcher` + 真 batch 路径已接通（T-06：同 seed 受控下 batch 行逐位相同、与 bs1 的 `max|d|≈4.9e-3` 为 bf16 归约差；per-row seeds 行独立）；第 (4) 步重扫 N 是下一步。
 
 三件事**必须按序做**，且**互相耦合**。
 

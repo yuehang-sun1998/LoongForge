@@ -318,10 +318,11 @@
   - **附加（防"假批"）**：`bat_i` 与 `ref_j (j≠i)` **必须不同** → 证明不是所有行都用了同一噪声/同一结果（batch_probe 的 `samples_differ` 是弱版，这里要逐行对号）。
 - **工具**：扩 `orchestrator/batch_probe.py` 加 `--equivalence`（或独立入口 `batch_equivalence`）：跑上面 2/3/4 并打印 `max_i d_i` + 是否逐行对号。
 - **数据（2026-10-20，真实 FastWAM，bf16）**：
-  - `batch_probe --equivalence --seeds 1,2,3,4`：`out_shape=[4,32,7]`；逐行 `max|bat_i - ref_i|` = **0.0039 / 0.0054 / 0.0039 / 0.0039**；跨 seed 最小差 **0.236** → 行确实是独立的，没有错位/串行。
-  - 差异来源：bf16 下批内 GEMM 的归约顺序与 batch=1 不同；**没有结构性差异**。fp32 下预期回到 ~1e-6 量级。
+  - **受控同 seed（主判据）**：`batch_probe --equivalence --same-seed --seeds 42 --batch-size 4`。4 次 bs1 参考之间 `reference_spread=0`；bs4 的 4 行之间 `batch_row_spread=0`；逐行 `max|bat_i - ref_i| = 0.0048828125`。这是纯 batched-GEMM 归约顺序差，**没有结构性差异**。
+  - **per-row seed / 假 batch 检查（补充）**：`--seeds 1,2,3,4`，`out_shape=[4,32,7]`；逐行 `max|bat_i - ref_i|` = **0.0039 / 0.0054 / 0.0039 / 0.0039**；跨 seed 最小差 **0.236** → 行独立，没有把某一行静默复制成整个 batch。
+  - 差异来源：bf16 下批内 GEMM 的归约顺序与 batch=1 不同；fp32 下预期回到 ~1e-6 量级。
   - 生产 batch 路径 E2E：4 个 sim 并发连同一 server，开启 `server.batching` → 51 请求 / 44 batch（mean 1.16、max 2），**无顺序回退**；与顺序回退基线相比 3/4 集 steps 完全一致，1 集 107→106（bf16 数值噪声）。
-- **结论**：✅ **T-06 通过（bf16 口径）**。per-row seeds 生效，batch=K 与 batch=1 在浮点噪声内一致；`FastWAMPolicy.predict_action` 的 batch 路径与 `GenericPredictActionPolicy.predict_action_batch` 已接通。若要逐位一致，需要用 fp32 跑（非当前 eval 默认）。
+- **结论**：✅ **T-06 通过（bf16 口径）**。同 seed 受控实验证明 batching 只引入 bf16 归约噪声（max|d|≈4.9e-3）；per-row seed 机制生效且行独立；`FastWAMPolicy.predict_action` 的 batch 路径与 `GenericPredictActionPolicy.predict_action_batch` 已接通。若要逐位一致，需要用 fp32 跑（非当前 eval 默认）。
 
 ### T-07 · GPU-sim：sim/server 同卡 vs 异卡
 

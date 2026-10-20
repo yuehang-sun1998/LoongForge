@@ -349,7 +349,10 @@
   - `libero_10/task0` 10 集 + 随机 `goal/spatial/object` 7 task × 10 集：**80/80 集 success/steps 与旧 server-cache run 完全一致**。
   - 请求量：`task0` 10 集 **302 requests / 2969 env steps = 9.83×**，逐集严格 `ceil(steps/10)`。
 - **batcher E2E**：4 个 sim 共用 1 个 server（`max_wait_ms=50`）→ 51 请求 / 46 batch，mean 1.11、max 2；无 server 错误。
-- **T-06 数值等价（2026-10-20）**：`infer_action` 支持 batch + per-row seeds；真实 bf16 模型 `batch_probe --equivalence`：`out_shape=[4,32,7]`，逐行 `max|d|≈0.0039–0.0054`，跨 seed 差 0.236（行独立，无结构错位）。生产 batch 路径已接通（`predict_action` batch + `predict_action_batch`），4 sim E2E 无回退，3/4 集 steps 与顺序基线一致、1 集差 1 步（bf16 噪声）。
+- **T-06 数值等价（2026-10-20）**：`infer_action` 支持 batch + per-row seeds；真实 bf16 模型：
+  - **同 seed 受控（主判据）**：4 次 bs1 与一次 bs4、seed 42 → 参考之间/批内行之间均逐位相同（spread=0），逐行 `max|d|=0.00488`（纯 bf16 归约差）。
+  - **per-row seeds（补充）**：`--seeds 1,2,3,4` → `out_shape=[4,32,7]`，逐行 `max|d|≈0.0039–0.0054`，跨 seed 差 0.236（行独立，无假 batch）。
+  - 生产 batch 路径已接通（`predict_action` batch + `predict_action_batch`），4 sim E2E 无回退。
 - **未做**：真 batch 的 GPU 加速实测（T-13 的 7.3× 需在 batch 路径上复测）；重扫 N。
 
 ---

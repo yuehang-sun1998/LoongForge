@@ -29,7 +29,7 @@ import argparse
 import json
 import statistics
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -110,11 +110,13 @@ def _capture_infer_call(model: Any, metadata: Dict[str, Any]) -> Tuple[Tuple[Any
 
 
 def _expand(value: Any, batch: int) -> Any:
-    """Tile a batch-1 tensor (or a prompt string) up to batch; leave the rest alone."""
+    """Tile a batch-1 tensor (or a prompt) up to batch; leave the rest alone."""
     if torch.is_tensor(value) and value.ndim >= 2 and value.shape[0] == 1:
         return value.repeat(batch, *([1] * (value.ndim - 1)))
     if isinstance(value, str):
         return [value] * batch  # the text encoder takes a Sequence[str]
+    if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], str):
+        return [value[0]] * batch
     return value
 
 
@@ -174,49 +176,94 @@ def _scaling(model: Any, metadata: Dict[str, Any], batches: List[int]) -> List[D
     return rows
 
 
-def _equivalence(model: Any, metadata: Dict[str, Any], seeds: List[int]) -> Dict[str, Any]:
-    """Compare batch=K (per-row seeds) with K separate batch=1 calls.
+def _equivalence(
+    model: Any,
+    metadata: Dict[str, Any],
+    seeds: List[int],
+    batch_size: Optional[int] = None,
+    same_seed: bool = False,
+) -> Dict[str, Any]:
+    """Compare batch=K with K separate batch=1 calls.
 
-    Both arms use the same captured conditioning inputs. The batch arm gets
-    ``seed=[s0..s_{K-1}]``; the reference arm runs each seed separately. The
-    per-row max abs difference must be zero (or at most the batched-GEMM
-    reduction-order noise), and rows must differ across seeds.
+    Two modes:
+
+    * ``same_seed=True`` (the controlled batching test): every reference and
+      every batch row uses the same seed. With the same captured input this
+      isolates the batched compute path: references are identical, batch rows
+      should also be identical, and the only possible difference is the batched
+      GEMM reduction order.
+    * ``same_seed=False`` (per-row seed / fake-batch guard): row ``i`` uses
+      ``seeds[i]`` in both arms. If the rows differed from their own reference
+      but matched another row's reference, the batch routing would be wrong.
     """
     from loongforge.embodied.model.fastwam.mot.fastwam import FastWAM
+
+    batch = int(batch_size or len(seeds))
+    if same_seed:
+        row_seeds = [int(seeds[0])] * batch
+    else:
+        row_seeds = [int(seed) for seed in seeds]
+        if len(row_seeds) != batch:
+            raise ValueError(
+                f"per-row seed count {len(row_seeds)} must match batch size {batch}"
+            )
 
     args, kwargs = _capture_infer_call(model, metadata)
     core = model.core
     references = []
-    for row_seed in seeds:
+    for row_seed in row_seeds:
         call = dict(kwargs)
-        call["seed"] = int(row_seed)
+        call["seed"] = row_seed
         out = FastWAM.infer_action(core, *args, **call)
         action = _as_tensor(out)
         references.append(action[0] if action.ndim == 3 else action)
 
     batch_kwargs = {
-        key: _expand(value, len(seeds))
+        key: _expand(value, batch)
         for key, value in kwargs.items()
         if key != "seed"
     }
-    batch_kwargs["seed"] = [int(seed) for seed in seeds]
-    batch_args = tuple(_expand(value, len(seeds)) for value in args)
+    batch_kwargs["seed"] = row_seeds
+    batch_args = tuple(_expand(value, batch) for value in args)
     batched = _as_tensor(FastWAM.infer_action(core, *batch_args, **batch_kwargs))
 
-    per_row = [float((batched[index] - references[index]).abs().max()) for index in range(len(seeds))]
+    per_row = [float((batched[index] - references[index]).abs().max()) for index in range(batch)]
     cross = [
         float((batched[i] - references[j]).abs().max())
-        for i in range(len(seeds))
-        for j in range(len(seeds))
+        for i in range(batch)
+        for j in range(batch)
         if i != j
     ]
+    reference_spread = max(
+        (
+            float((references[i] - references[j]).abs().max())
+            for i in range(batch)
+            for j in range(i + 1, batch)
+        ),
+        default=0.0,
+    )
+    batch_spread = max(
+        (
+            float((batched[i] - batched[j]).abs().max())
+            for i in range(batch)
+            for j in range(i + 1, batch)
+        ),
+        default=0.0,
+    )
     return {
-        "seeds": seeds,
+        "same_seed": same_seed,
+        "batch_size": batch,
+        "seeds": row_seeds,
         "out_shape": tuple(batched.shape),
         "per_row_max_abs_diff": per_row,
         "max_abs_diff": max(per_row),
+        "reference_spread": reference_spread,
+        "batch_row_spread": batch_spread,
+        "batch_rows_identical": batch_spread == 0.0,
         "min_cross_seed_diff": min(cross) if cross else None,
-        "rows_distinct": bool(cross and min(cross) > 0),
+        # Only meaningful in per-row-seed mode: identical rows are expected when
+        # the same seed is broadcast to the whole batch.
+        "rows_distinct": bool((not same_seed) and cross and min(cross) > 0),
     }
 
 
@@ -232,12 +279,34 @@ def main() -> None:
         help="compare batch=K with per-row seeds against K batch=1 calls",
     )
     parser.add_argument("--seeds", default="1,2,3,4")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="rows in the equivalence batch (default: number of seeds)",
+    )
+    parser.add_argument(
+        "--same-seed",
+        action="store_true",
+        help="use one seed for every reference and batch row (controlled batching test)",
+    )
     args = parser.parse_args()
 
     model, metadata = _build_model(args.config)
     if args.equivalence:
         seeds = [int(seed) for seed in args.seeds.split(",") if seed]
-        print(json.dumps(_equivalence(model, metadata, seeds), indent=2))
+        print(
+            json.dumps(
+                _equivalence(
+                    model,
+                    metadata,
+                    seeds,
+                    batch_size=args.batch_size or None,
+                    same_seed=args.same_seed,
+                ),
+                indent=2,
+            )
+        )
         return
     split = _profile(model, metadata, args.calls)
     scaling = _scaling(model, metadata, [int(b) for b in args.batches.split(",") if b])
