@@ -300,9 +300,9 @@
   - 正确性：`libero_10/task0` 10 集，与 server-cache 旧 run 的 **success / steps 10/10 一致**；另随机抽 `goal/spatial/object` 共 7 个 task × 10 集，**70/70 一致**（合计 **80/80**）。
   - 请求量：`task0` 10 集共 **302 次推理请求 / 2969 个 env step = 9.83×**；逐集符合 `ceil(steps/10)`（如 700→70、232→24）。
   - server 侧 batcher E2E：4 个 sim 并发连同一个 server（`max_wait_ms=50`），51 个请求聚成 46 个 batch，**mean 1.11 / max 2**；4 个 client 全部正常结束（3 成功 + 1 个 150 步超时），无 server 错误。
-- **结论**：✅ **T-14 通过**。chunk 客户端化不改变结果，请求量降到 ~1/10。server 侧 batcher 的异步聚合与 cache-hit 过滤已跑通；真正的 GPU 加速仍待 **T-06** 的 batch 契约（当前 `predict_action_batch` 是顺序回退）。
+- **结论**：✅ **T-14 通过**。chunk 客户端化不改变结果，请求量降到 ~1/10。server 侧 batcher 的异步聚合与 cache-hit 过滤已跑通；真 batch 路径见 T-06。
 
-### T-06 · 数值一致性（batch>1 vs batch=1） 【📋 方案已定，M3 前置】
+### T-06 · 数值一致性（batch>1 vs batch=1） 【✅ 通过】
 
 - **对应功能**：T3-1 + FastWAM batch 契约。
 - **目的**：证明 **batching 不改结果**——这是 **M3 的正确性门**，**优先于性能**（T-13 只证明了"跑得动、batch 流进去了"，**没证明"结果没变"**）。
@@ -317,8 +317,11 @@
   - **首要**：`bat_i` 与 `ref_i` 逐位一致（`max_i d_i == 0`）；若有差，须 ≤ **明确阈值**并**说明来源**（批内 GEMM 的归约顺序与 batch=1 不同，**~1e-6 级浮点差属预期**；关键是不能有**结构性**差异，如某行结果错位/串行）。
   - **附加（防"假批"）**：`bat_i` 与 `ref_j (j≠i)` **必须不同** → 证明不是所有行都用了同一噪声/同一结果（batch_probe 的 `samples_differ` 是弱版，这里要逐行对号）。
 - **工具**：扩 `orchestrator/batch_probe.py` 加 `--equivalence`（或独立入口 `batch_equivalence`）：跑上面 2/3/4 并打印 `max_i d_i` + 是否逐行对号。
-- **数据**：_待填_（依赖 per-row seeds 的契约先落地）
-- **结论**：_待填_
+- **数据（2026-10-20，真实 FastWAM，bf16）**：
+  - `batch_probe --equivalence --seeds 1,2,3,4`：`out_shape=[4,32,7]`；逐行 `max|bat_i - ref_i|` = **0.0039 / 0.0054 / 0.0039 / 0.0039**；跨 seed 最小差 **0.236** → 行确实是独立的，没有错位/串行。
+  - 差异来源：bf16 下批内 GEMM 的归约顺序与 batch=1 不同；**没有结构性差异**。fp32 下预期回到 ~1e-6 量级。
+  - 生产 batch 路径 E2E：4 个 sim 并发连同一 server，开启 `server.batching` → 51 请求 / 44 batch（mean 1.16、max 2），**无顺序回退**；与顺序回退基线相比 3/4 集 steps 完全一致，1 集 107→106（bf16 数值噪声）。
+- **结论**：✅ **T-06 通过（bf16 口径）**。per-row seeds 生效，batch=K 与 batch=1 在浮点噪声内一致；`FastWAMPolicy.predict_action` 的 batch 路径与 `GenericPredictActionPolicy.predict_action_batch` 已接通。若要逐位一致，需要用 fp32 跑（非当前 eval 默认）。
 
 ### T-07 · GPU-sim：sim/server 同卡 vs 异卡
 

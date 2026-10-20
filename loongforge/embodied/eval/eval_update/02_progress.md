@@ -45,7 +45,7 @@
 | 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
 | 2 | **分片：per-benchmark planner 表** | ✅ 完成 | `planning.py` + `coordinator.py` + `validation.py` | `03_testing.md` T-12 | §2.18 |
 | 3 | **chunk 客户端化**（消 90% 请求） | ✅ 完成（请求量 9.83×；80/80 逐集一致） | 各 runner + `_common` | `03_testing.md` T-14 | §2.23 |
-| 3 | server 侧 batcher（M3） | 🔄 **探针实测：`per_sample_ms` 583→79ms（batch 8，7.3×）→ 判定 GO**；**server 侧 `AsyncBatcher` 已实现（异步聚合 + cache-hit 过滤）**；待补 T-06 真 batch 契约 | `transport/batcher.py` + `batch_probe.py`（诊断） | `03_testing.md` T-13/T-14 | FastWAM batch 契约 |
+| 3 | server 侧 batcher（M3） | 🔄 **探针实测：`per_sample_ms` 583→79ms（batch 8，7.3×）→ 判定 GO**；**server 侧 `AsyncBatcher` 已实现（异步聚合 + cache-hit 过滤）**；**T-06 已过（bf16 max|d|=0.0054），真 batch 路径已接通** | `transport/batcher.py` + `batch_probe.py`（诊断） | `03_testing.md` T-06/T-13/T-14 | 下一步重扫 N |
 | 3 | **单卡多 server vs batch**（T-08） | ✅ 已结案：**多副本只 1.25×、batch 7.3×** → 选 batch | —（A/B 用现有 coordinator 跑） | `03_testing.md` T-08 | — |
 
 **图例**：✅ 完成 / 🔄 进行中 / ⬜ 未开始 / ⏸ 暂缓。
@@ -349,7 +349,8 @@
   - `libero_10/task0` 10 集 + 随机 `goal/spatial/object` 7 task × 10 集：**80/80 集 success/steps 与旧 server-cache run 完全一致**。
   - 请求量：`task0` 10 集 **302 requests / 2969 env steps = 9.83×**，逐集严格 `ceil(steps/10)`。
 - **batcher E2E**：4 个 sim 共用 1 个 server（`max_wait_ms=50`）→ 51 请求 / 46 batch，mean 1.11、max 2；无 server 错误。
-- **未做**：真 batch 数值等价（T-06）——`predict_action_batch` 目前是**顺序回退**，所以 batcher 只证明"聚合/过滤/异步路径"正确，**还没有 GPU 加速**。下一步是给 `infer_action` 加 per-row seeds + batch 等价比对，再回头重扫 N。
+- **T-06 数值等价（2026-10-20）**：`infer_action` 支持 batch + per-row seeds；真实 bf16 模型 `batch_probe --equivalence`：`out_shape=[4,32,7]`，逐行 `max|d|≈0.0039–0.0054`，跨 seed 差 0.236（行独立，无结构错位）。生产 batch 路径已接通（`predict_action` batch + `predict_action_batch`），4 sim E2E 无回退，3/4 集 steps 与顺序基线一致、1 集差 1 步（bf16 噪声）。
+- **未做**：真 batch 的 GPU 加速实测（T-13 的 7.3× 需在 batch 路径上复测）；重扫 N。
 
 ---
 
