@@ -54,6 +54,7 @@
 | T-13 | batch 缩放探针（M3 go/no-go） | 3 | 任一 | ✅ 通过（batch 8 per-sample 583→79ms，7.3×；GO） |
 | T-14 | chunk 客户端化（请求量 10→1、结果逐位一致） | 3 | CPU-sim | ✅ 通过（80/80 逐集一致；请求量 9.83×） |
 | T-15 | paper §7 的 F1/F2：infra 失败不计完成 + 完整性有独立期望 | 2 | 任一 | ✅ 通过（upstream #303 已合入 metrics/runner 修复；编排层另用 validation.py） |
+| T-16 | 多卡共享 CPU/内存对 N 标定的影响 | 3 | CPU-sim | ⬜ 待执行（需空闲 8 卡） |
 
 ---
 
@@ -310,6 +311,25 @@
 - **编排层补充**：coordinator 仍用 `validation.py` 做 **shard 级**覆盖校验与自动补跑（§5.5），与 metrics 层的 **episode 级**语义互补；`INFRA_FAILURE_REASONS` 已统一从 `metrics/results.py` 导入，避免漂移。
 - **判据**：见 PR #303 的 400 集真实 FastWAM+LIBERO 验证（故障注入 + resume + 完整性）。
 - **结论**：✅ 通过。单 runner / metrics 路径与编排路径现在都有覆盖。
+
+### T-16 · 多卡共享 CPU/内存对 N 标定的影响 【⬜ 待执行】
+
+- **背景**：`N` 是 per-server 的，但 **CPU 和内存是整机共享的**。并行在 8 张卡上跑不同 N 时，每个点的 `ΣN` 和背景负载不同；测出的 per-server 吞吐/膝点会被 cross-card contention 污染，不能直接当成"该 N 的容量"。
+- **目的**：量化共享资源对 per-server 吞吐和 `N*` 的影响，给 N 扫描定一个可解释的修正方法。
+- **固定 workload**：4 suite × 5 task × 10 eps = **200 集**，任务集/seed/max_steps 在所有组之间一致。
+- **实验组**：
+  - **A 单 server 独跑**：1 张卡，其余空闲；N=16 / 24。
+  - **B 8 server 同 N**：8 张卡全部 N=16（或 24），代表真实部署。
+  - **C 8 server 异 N**：8 张卡分别 N=12/16/20/24/28/32/40/48。
+  - **D 固定 per-server N、改变总负载**：1/2/4/8 张卡全部 N=16，看 per-server 吞吐随总 sim 数的下降曲线。
+- **指标**：per-server episodes/min、`t_step`（`episode_time_sec / steps`）、CPU%、RSS、实际 batch size、queue wait p95。
+- **判据**：
+  - **shared-load penalty** = `throughput_B / throughput_A`（同 N）。
+  - **heterogeneous bias** = C 中各点吞吐相对 B 中同 N 点的偏差。
+  - 若 penalty 显著（如 <0.9），N 标定必须以"8 卡同 N"为准，或用 penalty 修正单卡扫描结果。
+  - 同时确认内存：`ΣN × 2.2GB` 距离 1.5TB 还有多少余量。
+- **数据**：_待填_（需空闲 8 卡）
+- **结论**：_待填_
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【✅ 通过】
 

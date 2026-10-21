@@ -353,7 +353,7 @@
   - **同 seed 受控（主判据）**：4 次 bs1 与一次 bs4、seed 42 → 参考之间/批内行之间均逐位相同（spread=0），逐行 `max|d|=0.00488`（纯 bf16 归约差）。
   - **per-row seeds（补充）**：`--seeds 1,2,3,4` → `out_shape=[4,32,7]`，逐行 `max|d|≈0.0039–0.0054`，跨 seed 差 0.236（行独立，无假 batch）。
   - 生产 batch 路径已接通（`predict_action` batch + `predict_action_batch`），4 sim E2E 无回退。
-- **未做**：真 batch 的 GPU 加速实测（T-13 的 7.3× 需在 batch 路径上复测）；重扫 N。
+- **未做**：真 batch 的 GPU 加速实测（T-13 的 7.3× 需在 batch 路径上复测）；重扫 N；**多卡共享 CPU/内存对 N 标定的影响（T-16）**——N 是 per-server，CPU/内存整机共享，并行异 N 扫描会混淆，正式标定需 8 卡同 N 或加修正。
 
 ---
 
