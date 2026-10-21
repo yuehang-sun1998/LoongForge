@@ -57,6 +57,11 @@ def _benchmark(config: Dict[str, Any]) -> Dict[str, Any]:
     return config.get("benchmark") or {}
 
 
+def _seed_mode(config: Dict[str, Any]) -> str:
+    """Env seeding granularity (``per_episode`` default, ``per_task`` official FastWAM)."""
+    return str(_benchmark(config).get("env_seed_mode") or "per_episode")
+
+
 def _suites(config: Dict[str, Any]) -> List[str]:
     """Suites to evaluate: ``benchmark.suites`` (list) or the single ``benchmark.suite``."""
     benchmark = _benchmark(config)
@@ -91,8 +96,14 @@ def plan_libero(config: Dict[str, Any], total_workers: int) -> List[Shard]:
     overrides = benchmark.get("suite_overrides") or {}
     shards: List[Shard] = []
     for suite, tasks in per_suite:
+        # In per_task mode the env is seeded once per process and reused, so the
+        # scene an episode sees is (run.seed, reset count in this process).
+        # Splitting a task across processes would replay the first scenes, so
+        # one task must map to exactly one shard.
+        suite_mode = str((overrides.get(suite) or {}).get("env_seed_mode") or _seed_mode(config))
+        suite_chunk = max(1, episodes_per_task) if suite_mode == "per_task" else chunk
         for task in tasks:
-            for offset, count in _ranges(0, episodes_per_task, chunk):
+            for offset, count in _ranges(0, episodes_per_task, suite_chunk):
                 patch = {
                     "suite": suite,
                     "task_ids": [task],
@@ -173,6 +184,32 @@ PLANNERS: Dict[str, Planner] = {
 }
 
 
+def _assert_per_task_not_split(config: Dict[str, Any], shards: List[Shard]) -> None:
+    """Reject a plan that spreads one task over several processes in ``per_task`` mode.
+
+    The planner already keeps one task per shard here; this is the backstop for a
+    hand-built or future planner, where the split would silently change scenes.
+    """
+    seen = set()
+    for shard in shards:
+        patch = (shard.get("overrides") or {}).get("benchmark") or {}
+        mode = str(patch.get("env_seed_mode") or _seed_mode(config))
+        if mode != "per_task":
+            continue
+        key = (patch.get("suite"), tuple(patch.get("task_ids") or ()))
+        if int(patch.get("episode_offset") or 0) > 0 or key in seen:
+            raise ValueError(
+                "env_seed_mode='per_task' cannot split a task across processes: "
+                f"shard {shard.get('id')!r} would replay earlier scenes. "
+                "Use one shard per task (episode_offset=0) or per_episode seeding."
+            )
+        seen.add(key)
+
+
 def plan_shards(config: Dict[str, Any], total_workers: int) -> List[Shard]:
     """Shards for this config, via the planner for its benchmark family."""
-    return PLANNERS[benchmark_family(config)](config, total_workers)
+    family = benchmark_family(config)
+    shards = PLANNERS[family](config, total_workers)
+    if family == "libero":
+        _assert_per_task_not_split(config, shards)
+    return shards

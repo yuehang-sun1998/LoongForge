@@ -55,6 +55,7 @@
 | T-14 | chunk 客户端化（请求量 10→1、结果逐位一致） | 3 | CPU-sim | ✅ 通过（80/80 逐集一致；请求量 9.83×） |
 | T-15 | paper §7 的 F1/F2：infra 失败不计完成 + 完整性有独立期望 | 2 | 任一 | ✅ 通过（upstream #303 已合入 metrics/runner 修复；编排层另用 validation.py） |
 | T-16 | 多卡共享 CPU/内存对 N 标定的影响 | 3 | CPU-sim | ⬜ 待执行（需空闲 8 卡） |
+| T-17 | `per_task` 下 episode 级分片（RNG 快照逐集恢复） | 2/M3 | CPU-sim（LIBERO） | 📋 设计定稿（`01_architecture.md` §5.8.1）；待实现 + GPU 验证 |
 
 ---
 
@@ -70,6 +71,13 @@
 - **现状 wall-clock**：LIBERO 全量（8×A800，4 套件）**~2.7h**；`libero_10` 现以静态手段拆 10 分片（16 分片 / 8 卡 / 2 波 ≈ 3.4h）。
 
 > ⚠️ 上述 `N_min≈4.2` 用 31s 样本算出；libero_10（60s）对应 `N_min≈8.4`。**N_min 是 model+suite 相关**。
+
+> ⚠️ **协议口径（2026-10-21 修正，复跑必看）**：历史数据要分两套代码看，不能一概而论：
+> - **accel_c16 / c5 / nis\***（2026-10-03）：跑的是 `/workspace/LoongForge` @ `d1b8c9f`，该 clone **已接线 `env_seed_mode`** → 实际是 **`per_task`**（证据：50 集记录里 `seed` / `repro.episode_seed` 全为 42）。
+> - **静态 8 卡 94.2 min / M2 56.2 min / T-01**（2026-10-15）：跑的是**本分支 rebase 前**代码，`CONFIG_MAPPING` 缺这条 → 实际是 **`per_episode`**。
+> - **已验证的复现口径**（2026-10-21）：`per_task` + `prefer_controller_ee: true` + `controller_force_update: false` 重跑 accel_c16 `task 0` 前 10 集，与历史 **10/10 逐集一致**（steps/success/failure_reason），证明当前 rebase 后代码能复现该路径。
+> - **对比规则**：对 accel 历史 → 用上述 `per_task` 组合；对本分支 M2/静态基线 → 显式 pin `per_episode`。两套参照不可混用。
+> - `run_manifest.json` / episode record 会记录实际模式，跑完先核对再比数。
 
 ---
 
@@ -160,6 +168,7 @@
 - **对应功能**：T2-2。
 - **目的**：验证长尾被抹平、wall-clock 达目标。
 - **前置**：T2-2 已实现；N* 已标定。
+- **协议口径**：对**本分支**历史全量（静态 94.2 / M2 56.2 min）对比时，config 必须显式 `env_seed_mode: per_episode`；对 **accel_c16 系列**（旧 clone，`per_task`）对比时用 `per_task` + `prefer_controller_ee: true` + `controller_force_update: false`。后者分片会自动退化为 task 级，wall-clock 不可与本分支历史数据直接比。
 - **步骤**：按 `G × N*` 起 worker 池，跑全量；记录 wall-clock、各 worker 空转时长、失败重跑次数。
 - **通过标准**：wall-clock 落进目标区间（对齐 `01_architecture.md` §7.1 的 29~32min 理想值，实际按标定 N 修正）；无 worker 长时间空转；**无因等待超时导致的失败重跑**。
 - **数据（动态调度 E2E，2026-10-15，2×A800）**：
@@ -177,6 +186,7 @@
 > - **逐 suite 加速（每 50 集，log 实测）**：libero_10 **2.7×** / spatial **4.3×** / object **3.0×** / goal **3.5×**；**整机 94.2 vs 173.7 = 1.85×**。
 > - **缺口归因**：spatial/object/goal 在 ~45 min 跑完，后 **6 卡空转**到 libero_10 收尾（91 min）→ **M2 动态下发**（空卡抢 libero_10 的 chunk）预计把整机拉到 **~3.0×**。
 > - ⚠️ **分数未逐位一致**（object 95.80 vs vanilla 99.40 等）——vanilla 评测代码此后有更新，**待开发完 rebase 一版 vanilla 再重跑对齐**（用户 2026-10-15 决定先不追）。
+> - ⚠️ **口径混用**：该 vanilla 参照跑的是**官方 harness（`per_task`）**，而本分支历史数据实际是 `per_episode` → 分数差异除"评测代码更新"外，**种子/场景集不同也可能是来源之一**。后续任何 vanilla 对比都要先统一 `env_seed_mode` 再比。
 >
 > **M2 全量对照（2026-10-15，已完成）**：**单 coordinator + 跨套件全局队列**，同 8 卡、同 ckpt、同 2000 集（`servers:[{gpus:[0..7]}]` + `n_sims_per_server=16`）。
 > - **总 wall = 56.2 min**（worker 53.2 min）；**1929/2000 = 96.45%**；**520 unit 全 rc=0、`failed_units=[]`**、**0 个 `episode_error`**。
@@ -230,7 +240,7 @@
   1. **unit 超时**：unit 卡死超过预算 → 被 kill、走重试/补跑（单测：`_await_slot` 超预算返回 `timed_out=True`；`_unit_timeout_sec` 按 episode 预算推导）。
   2. **收尾信号**：`ok=false` → `run.py` **exit 2**；`infra_failed>0` → stderr 告警（单测：两个退出码用例）。
   3. **看门狗竞态**：shutdown 落在 restart 中途 → 期间启动的 server 被自己 terminate、不进 `servers`（单测：`created[0].terminated`）。
-  4. **hung 探活**：进程活但 ping 不通 → 连续 2 次失败后重启；活着的正常 server 不误杀；探活有界且恢复代理环境变量（单测 3 个）。
+  4. **hung 探活**：进程活但 ping 不通 → 连续 2 次失败后重启；活着的正常 server 不误杀；探活有界且恢复代理环境变量（单测 3 个）。**探测必须有界**：SIGSTOP 后 TCP 仍可连接，`PolicyClient` 读 server metadata 的那次 `recv` 也必须带 timeout，否则 watchdog 会永久阻塞（2026-10-21 回归发现，见下）。
   5. **`output_dir` 冲突**：已有 `coordinator_result.json` → 拒绝启动（`SystemExit`）；`run.resume: true` 放行（单测 2 个）。
   6. **`policy_call_ms` 下限**：`N × service_ms × 2` 之上不告警、之下告警、未给 `service_ms` 跳过（单测 1 个，三态）。
   7. **server 崩溃循环**：连续失败超过 `MAX_SERVER_RESTARTS` → 放弃并记入 `servers_given_up`；`run.py` **exit 2**（单测 2 个）。
@@ -243,6 +253,12 @@
   | 崩溃循环 | 反复 `SIGKILL` server_0 | 3 次 restart 全失败 → `giving up … needs a human`；`servers_given_up=[0]`、**exit 2**；且 `ok=True missing=0`（剩余 server + 补跑兜住） |
   | `output_dir` 冲突 | 同目录重跑 | **exit 1** + `already exists -- refusing to overwrite` |
   | `policy_call_ms` 下限 | `service_ms=500 / policy_call_ms=500 / N=16` | 启动即告警 `below the queue-wait floor 16000ms` |
+
+- **2026-10-21 回归补充（hung 探活的有界性）**：
+  - 旧用例只验证了“最终会重启”，没有验证**探测耗时**。本次复测发现：`SIGSTOP` 后 `PolicyClient._wait_for_server` 的 metadata `conn.recv()` **没有 timeout**，watchdog 卡在 connect 阶段 **约 9 分钟**，直到进程被 `SIGCONT` 才恢复。
+  - **修复**：`recv(timeout=remaining)` + `open_timeout=min(30, remaining)`；超时关闭连接并抛出。
+  - **新增单测**：`test_client_bounds_the_metadata_wait`（模拟“能连上但不回 metadata”的 server，断言 `recv` 带 timeout、超时后连接关闭）。
+  - **复测判据**：`SIGSTOP` → 重启完成 ≤ **2.5 min**（2×probe 间隔 + 3s 超时）。实测 `21:38:25 → 21:40:53 = 2m28s` ✅；10 集最终全部完成。
 
   - 单测 **13 个**；全量 **93 passed / 1 skipped**，ruff clean。
   - 🔴 **测试中发现的 bug（已修 `683b455`）**：看门狗重启 **hung** server 时**不先终止旧进程** → 旧进程仍占端口 → 重绑失败 → 永远恢复不了。
@@ -329,6 +345,26 @@
   - 若 penalty 显著（如 <0.9），N 标定必须以"8 卡同 N"为准，或用 penalty 修正单卡扫描结果。
   - 同时确认内存：`ΣN × 2.2GB` 距离 1.5TB 还有多少余量。
 - **数据**：_待填_（需空闲 8 卡）
+- **结论**：_待填_
+
+### T-17 · `per_task` 下 episode 级分片（RNG 快照）【⬜ 待实现 + 验证】
+
+- **对应方案**：`01_architecture.md` §5.8.1（预计算每集 reset 前的 `np.random` 状态，分片逐集恢复）。
+- **目的**：证明"打散到任意进程"与"单进程串行"逐集**场景一致**，从而在保留官方 `per_task` 语义的同时恢复 episode 级调度。
+- **前置**：LIBERO + 渲染 GPU（`OffScreenRenderEnv` 需要 EGL）；代码侧先做 CPU 单测（fake env）。
+- **步骤**：
+  1. **串行参考**：`per_task`、`seed=42`、task 0、E=10，单进程跑完；每集记录 reset 后第一帧的哈希（`hash(obs["agentview_image"])`），可另记关键物体 qpos。
+  2. **预计算快照**：同一 task 生成 `S0..S9`（每集 reset 之前的状态）。
+  3. **分片**：`chunk=2`（5 个进程）或 `chunk=1`（10 个进程），每集 `set_state(S_k)`；每集记录同样哈希。
+  4. **反证**：把 episode 9 的 shard 故意恢复成 `S8`，确认哈希变化 → 证明比对有区分度。
+  5. **重试路径**：对 episode 5 注入一次 infra 失败，确认重试后场景仍是第 5 集（而不是第 6 集）。
+  6. **resume 路径**：跑到一半杀进程，`--resume` 后从中间集继续，确认剩余集哈希与串行一致。
+- **通过标准**：
+  - 步骤 3 的 10 个哈希与步骤 1 **逐位相同**；
+  - 步骤 4 哈希**必须不同**；
+  - 步骤 5/6 的重试与 resume 集哈希与串行一致。
+- **附加（性能）**：E=50 时对比 task 级 vs 快照 + episode 级在同一 N 下的 wall-clock，确认并发从 40 提到 128 附近的收益。
+- **数据**：_待填_（需空闲 GPU）
 - **结论**：_待填_
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【✅ 通过】

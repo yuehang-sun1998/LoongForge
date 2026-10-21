@@ -7,6 +7,9 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
+from loongforge.embodied.eval.orchestrator import planning
 from loongforge.embodied.eval.orchestrator.planning import (
     benchmark_family,
     chunk_size,
@@ -87,6 +90,98 @@ def test_plan_calvin_is_one_shard_until_the_runner_takes_an_offset() -> None:
     shards = plan_calvin(config, 4)
     assert len(shards) == 1
     assert shards[0]["overrides"]["benchmark"]["num_sequences"] == 10
+
+
+def test_plan_libero_per_task_keeps_one_shard_per_task() -> None:
+    """per_task seeds once per process, so a task must not be split across processes."""
+    config: dict = {
+        "benchmark": {
+            "name": "libero",
+            "suites": ["a", "b"],
+            "task_ids": [0, 1],
+            "episodes_per_task": 4,
+            "env_seed_mode": "per_task",
+        }
+    }
+    shards = plan_libero(config, 32)  # many workers must not induce intra-task chunks
+    assert len(shards) == 4
+    assert all(shard["overrides"]["benchmark"]["episode_offset"] == 0 for shard in shards)
+    assert all(shard["overrides"]["benchmark"]["episodes_per_task"] == 4 for shard in shards)
+    assert sum(shard["expected"] for shard in shards) == 16
+
+
+def test_plan_libero_per_episode_still_splits() -> None:
+    """The default per_episode seeding keeps the steal-work slicing."""
+    config: dict = {"benchmark": {"name": "libero", "suites": ["a"], "task_ids": [0], "episodes_per_task": 16}}
+    shards = plan_libero(config, 1)
+    assert len(shards) > 1
+    assert any(shard["overrides"]["benchmark"]["episode_offset"] > 0 for shard in shards)
+
+
+def test_plan_libero_per_task_suite_override_is_honoured() -> None:
+    """A suite-level per_task override gets the same one-shard-per-task treatment."""
+    config: dict = {
+        "benchmark": {
+            "name": "libero",
+            "suites": ["libero_10", "libero_goal"],
+            "task_ids": [0],
+            "episodes_per_task": 4,
+            "suite_overrides": {"libero_10": {"env_seed_mode": "per_task"}},
+        }
+    }
+    shards = plan_libero(config, 32)
+    per_task = [s for s in shards if s["overrides"]["benchmark"]["suite"] == "libero_10"]
+    per_episode = [s for s in shards if s["overrides"]["benchmark"]["suite"] == "libero_goal"]
+    assert len(per_task) == 1
+    assert len(per_episode) > 1
+
+
+def test_plan_shards_rejects_intra_task_split_for_per_task(monkeypatch: Any) -> None:
+    """Backstop: a planner that splits a task under per_task must fail loudly."""
+
+    def split_planner(config: dict, total_workers: int) -> list:
+        return [
+            {
+                "id": f"a/task=0/eps={offset}-{offset}",
+                "overrides": {
+                    "benchmark": {
+                        "suite": "a",
+                        "task_ids": [0],
+                        "episode_offset": offset,
+                        "episodes_per_task": 1,
+                        "env_seed_mode": "per_task",
+                    }
+                },
+                "expected": 1,
+            }
+            for offset in (0, 1)
+        ]
+
+    monkeypatch.setitem(planning.PLANNERS, "libero", split_planner)
+    config: dict = {"benchmark": {"name": "libero", "env_seed_mode": "per_task"}}
+    with pytest.raises(ValueError, match="cannot split a task"):
+        plan_shards(config, 2)
+
+
+def test_plan_shards_rejects_duplicate_task_for_per_task(monkeypatch: Any) -> None:
+    """Two shards with the same task (offset 0) are still a split under per_task."""
+
+    def duplicate_planner(config: dict, total_workers: int) -> list:
+        return [
+            {
+                "id": f"a/task=0/copy{i}",
+                "overrides": {
+                    "benchmark": {"suite": "a", "task_ids": [0], "episode_offset": 0, "episodes_per_task": 4}
+                },
+                "expected": 4,
+            }
+            for i in range(2)
+        ]
+
+    monkeypatch.setitem(planning.PLANNERS, "libero", duplicate_planner)
+    config: dict = {"benchmark": {"name": "libero", "env_seed_mode": "per_task"}}
+    with pytest.raises(ValueError, match="cannot split a task"):
+        plan_shards(config, 2)
 
 
 def test_plan_shards_dispatches_on_the_family(monkeypatch: Any) -> None:

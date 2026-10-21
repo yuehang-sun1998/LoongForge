@@ -9,6 +9,7 @@ import multiprocessing as mp
 import socket
 
 import numpy as np
+import pytest
 
 from loongforge.embodied.eval.protocol import PROTOCOL_VERSION
 from loongforge.embodied.eval.servers.mock_policy import MockPolicy
@@ -70,3 +71,26 @@ def test_mock_server_conformance() -> None:
     finally:
         proc.terminate()
         proc.join(timeout=5)
+
+
+def test_client_bounds_the_metadata_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stopped-but-listening server must not block the watchdog in connect()."""
+    import websockets.sync.client as sync_client
+
+    seen = {}
+
+    class _HungConn:
+        def recv(self, timeout=None):
+            seen["timeout"] = timeout
+            raise TimeoutError("timed out")
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setattr(sync_client, "connect", lambda *args, **kwargs: _HungConn())
+    with pytest.raises(TimeoutError):
+        PolicyClient(host="127.0.0.1", port=1, timeout=2.5)
+
+    assert seen["timeout"] is not None
+    assert 0 < seen["timeout"] <= 2.5
+    assert seen["closed"] is True

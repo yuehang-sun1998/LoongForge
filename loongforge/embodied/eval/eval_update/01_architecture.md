@@ -388,7 +388,7 @@ Shard = {"id": str, "overrides": {<config 段>: {<键>: <值>}}, "expected": int
 
 | family | planner | 工作单元 | 分片轴 |
 |---|---|---|---|
-| libero | `plan_libero` | `(suite, task, episode)` | suite × task(int) × episode(+offset)，chunk 细到快槽能抢 |
+| libero | `plan_libero` | `(suite, task, episode)` | suite × task(int) × episode(+offset)，chunk 细到快槽能抢；`env_seed_mode=per_task` 时默认退化为 **task 粒度**，启用 RNG 快照后恢复 episode 粒度（见 §5.8.1） |
 | simplerenv / maniskill | `plan_episode_indexed` | **单集** | task(str) × episode |
 | robotwin | `plan_robotwin` | `(task, config, seed 区间)` | task(str) × config × `start_seed` + `test_num` |
 | calvin | `plan_calvin` | `(task_suite, sequence)` | suite × `num_sequences`（**runner 无 offset → 目前只能 1 片**） |
@@ -407,6 +407,62 @@ Shard = {"id": str, "overrides": {<config 段>: {<键>: <值>}}, "expected": int
 
 > **边界提醒**：本方案的约定是"改动落点在**编排层**，不动 runner"。以上三项**要动 runner** → 建议**单独一轮、按 family 分开提交**，别和编排层混。
 > **为什么现在不做**：环境里**只有 LIBERO 能跑**（CALVIN 依赖未装、RoboTwin 缺 EGL 驱动、SimplerEnv/ManiSkill 依赖未装）→ **写了也没法验证**。
+
+#### 5.8.1 `per_task` 下的 episode 级分片：RNG 快照方案（设计定稿，未实现）
+
+**问题**：LIBERO 的 `per_task`（官方 FastWAM 语义）把 env 的随机状态绑在"进程内第几次 reset"上，而 episode-chunk 分片会把同一 task 拆到多个进程 → 每个进程都从第一个场景重放，静默改变评测集。
+
+**代码事实（`/workspace/LIBERO` + robosuite 1.4.0）**：
+
+- `bddl_base_domain.seed(seed)` 只做 `np.random.seed(seed)`；
+- `_reset_internal()` 用 placement sampler（`np.random.uniform`，含拒绝采样）采样物体/fixture 摆放，并把 **fixture 的 `body_pos/body_quat` 写进 model**；
+- runner 每集调用 `env.reset()` + `set_init_state(initial_states[k])`，而 `set_init_state` 只恢复 **sim state（qpos/qvel）** → **fixture 摆放不受它约束，仍取决于 reset 时的 RNG**；
+- `step()` / `manipulation_env.py` 中**没有** `np.random` 调用 → 随机消耗集中在 reset。
+
+**方案**：把"第 k 集开始前的 RNG 状态"预先算出来并持久化，分片按集恢复，彻底解耦"进程内 reset 次数"。
+
+1. **预计算**（每 `(suite, task, seed)` 一次，只 reset、不跑 episode）：
+
+   ```python
+   env = OffScreenRenderEnv(...)
+   env.seed(seed)
+   for k in range(episodes_per_task):
+       snapshots[k] = np.random.get_state()   # 第 k 次 reset 之前
+       env.reset()                            # 真跑，复现拒绝采样次数
+   ```
+
+   产物 `scene_snapshots/<suite>__task<id>__seed<seed>.npz`：E 份状态（约 2.5KB/份，E=50 约 125KB/task）。
+
+2. **分片执行**：`per_task` 下每集开始前 `np.random.set_state(snapshots[k])`，再 `env.reset()` + `set_init_state(initial_states[k])`。
+
+**例子**（E=6、chunk=2、3 个进程）：
+
+| 进程 | episode | 恢复的快照 | 实际场景 |
+|---|---|---|---|
+| shard 0 | 0,1 | S0,S1 | A,B |
+| shard 1 | 2,3 | S2,S3 | C,D |
+| shard 2 | 4,5 | S4,S5 | E,F |
+
+不恢复快照时，每个进程 `seed` 后都从 S0 起步 → 三个分片实际都只看到 A、B。
+
+**实现要点**：
+
+- **每集都恢复**，不只片头跳一次。片头跳一次在"连续 + 不重试 + 不 resume + step 不消耗 RNG"时才成立；而 retry 会多 reset 一次、resume 会从中间开始，都会静默错位。`set_state` 是微秒级，相对单集几十秒不可见。
+- **预计算与 worker 的 env 创建顺序一致**：建 env → `seed` → 恢复快照 → reset。
+- **manifest 记录**快照路径 + sha256；缺失/指纹不符直接报错，不静默退回。
+- **回退**：未启用快照时保持 §5.5.4 的 task 级分片 + 拒绝兜底（正确但并发 ≤ task 数）。
+- **planner**：启用快照后 `per_task` 恢复 episode 级切片，`N` 不再受 task 数限制。
+
+**成本（E=50、40 task 全量）**：
+
+| 方案 | 并发上限 | 额外 reset | 备注 |
+|---|---|---|---|
+| task 级（现状） | 40 / 128 槽 | 0 | 长尾 = 最慢 task 的 50 集 |
+| reset 快进（每片重放前缀） | 128 | ~600 次/task（c=2，O(E²/2c)） | 每片墙钟最多等 ~(E-c)×t_reset |
+| **RNG 快照** | **128** | **50 次/task，一次性** | 任意 offset O(1) |
+
+**验证**（见 `03_testing.md` T-17）：串行 vs 分片的逐集首帧哈希比对，外加"故意恢复错集快照"的反证。
+
 
 ## 6. 标定方法论
 

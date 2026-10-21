@@ -36,16 +36,24 @@ class PolicyClient:
 
         start_time = time.time()
         while True:
-            if time.time() - start_time > timeout:
+            remaining = timeout - (time.time() - start_time)
+            if remaining <= 0:
                 raise TimeoutError(f"Failed to connect to server within {timeout} seconds")
             try:
                 conn = websockets.sync.client.connect(
                     self._uri,
                     compression=None,
                     max_size=None,
-                    open_timeout=30,
+                    open_timeout=min(30.0, remaining),
                 )
-                metadata = msgpack_numpy.unpackb(conn.recv())
+                try:
+                    # A stopped-but-listening server still accepts the TCP connect, so
+                    # this read must be bounded too -- otherwise a hung server blocks the
+                    # watchdog forever waiting for metadata that will never arrive.
+                    metadata = msgpack_numpy.unpackb(conn.recv(timeout=remaining))
+                except TimeoutError:
+                    conn.close()
+                    raise
                 if metadata.get("protocol_version") != PROTOCOL_VERSION:
                     raise RuntimeError(
                         f"protocol_version mismatch: {metadata.get('protocol_version')} != {PROTOCOL_VERSION}"

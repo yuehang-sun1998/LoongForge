@@ -355,6 +355,27 @@
   - 生产 batch 路径已接通（`predict_action` batch + `predict_action_batch`），4 sim E2E 无回退。
 - **未做**：真 batch 的 GPU 加速实测（T-13 的 7.3× 需在 batch 路径上复测）；重扫 N；**多卡共享 CPU/内存对 N 标定的影响（T-16）**——N 是 per-server，CPU/内存整机共享，并行异 N 扫描会混淆，正式标定需 8 卡同 N 或加修正。
 
+### 2.24 rebase 后回归验证（2026-10-21，进行中）
+
+> rebase 到 `upstream/master @ 7847a83` 后，对分支自有功能重新实测；upstream 已合入的 F1–F12 不重测。
+
+- **CPU**：`loongforge/embodied/eval/unit_tests` **129 passed / 1 skipped**，ruff clean。
+- **集成冒烟**（1 server + N=2，4 集）：4/4 成功，`validation.ok=true`、missing/duplicates/unexpected=0、`infra_failed=0`，elapsed 161.9s；manifest 正确记录实际 `env_seed_mode`。
+- **chunk 生效**：254 steps / 16 requests、346/22，约 `steps/16`。
+- **batch 数值等价**（真实 FastWAM + 本 ckpt）：
+  - fp32 同 seed bs4 vs 4×bs1：`max|d|=7.0e-4`，参考/批内 spread 均为 0 → **结构性正确**。
+  - bf16：相对误差 ~1.7%（per-row 逐行 0.008–0.031，跨 seed 差 1.84）→ 绝对值随动作幅度放大，仍非行错位。
+- **batch 缩放**：591.8 → 88.8 ms/sample（batch 8，**6.7×**；与 rebase 前 7.3× 同量级）。
+- **batching ON vs OFF**（N=8/卡，2 卡，80 集）：**逐集 0 差异**（success/steps/failure_reason），请求数与步数完全相同；elapsed 415.2 vs 418.2s（`max_wait_ms=5` 下几乎不形成 batch，端到端无可测收益，符合预期）。
+- **故障注入**：
+  - **kill server**：watchdog 发现进程退出 → 重启，10/10 集完成、`rc=0`；`server_restarts=1`。
+  - **删记录 + resume**：删掉 1 条记录（该 worker 只有 1 集）→ 二次运行带 `run.resume: true` → 最终 10/10、`missing=0`、`duplicates=0`、`infra_failed=0`。
+  - **SIGSTOP 挂起 server**：发现**真实缺口**——`PolicyClient._wait_for_server` 里 metadata 的 `conn.recv()` 没有 timeout，server 被 SIGSTOP 后 TCP 仍可连接，watchdog 线程永久阻塞在 connect 阶段，9 分钟未重启（只有 SIGCONT 后才恢复）。
+  - **修复**：metadata `recv` 加 `timeout=remaining`（超时关闭连接），`open_timeout=min(30, remaining)`；新增单测 `test_client_bounds_the_metadata_wait`（`test_mock_server_conformance.py`，2 passed / ruff clean）。
+  - **复测**：SIGSTOP `21:38:25` → 重启完成 `21:40:53`，共 **2m28s**（≈ 2×probe 间隔 + 3s 超时），符合设计。
+- **历史复现（关键）**：`libero_10/task0` 前 10 集按 **`per_task` + `prefer_controller_ee=true` + `controller_force_update=false`** 重跑，与 2026-10-03 accel_c16 历史记录 **10/10 逐集一致**（success/steps/failure_reason）。此前两轮不一致的原因分别是 `per_episode`（场景不同）和 `controller_force_update=true`（首帧观测不同）。
+- **待做**：8 卡 N 扫描、2000 集全量；`per_episode` 的逐集参照（M2 原始记录未找到，必要时用旧分支小网格自建）。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -452,6 +473,14 @@
 - **为什么先不做**：环境里**只有 LIBERO 能跑**（CALVIN 依赖未装 / RoboTwin 缺 EGL 驱动 / SimplerEnv·ManiSkill 依赖未装）→ **改了没法验证**。
 - **边界**：这三项**要动 runner**，超出"编排层"约定 → 建议**单独一轮、按 family 分开提交**。
 
+### T2-7 `per_task` 的 episode 级分片（RNG 快照）【📋 设计定稿，待实现 + 验证】
+
+- **问题**：`env_seed_mode=per_task` 的场景绑定"进程内第几次 reset"，现行 planner 为保证正确性退化为 task 粒度 → 并发上限 = task 数（单 suite 10 / 全量 40），E=50 时空转与长尾明显。
+- **方案**（`01_architecture.md` §5.8.1）：预计算每集 reset 前的 `np.random` 状态（每 task E 次 reset），分片逐集 `set_state` 恢复 → 任意 offset 都 O(1)，可恢复 episode 级切片。
+- **实现**：`libero_runner` 加快照生成/恢复入口；planner 在 `per_task` + 快照可用时恢复 episode 级；manifest 记录快照 sha256；缺失时回退 task 级。
+- **验证**：`03_testing.md` T-17（串行 vs 分片逐集首帧哈希、错集反证、retry/resume）。
+- **为什么现在不能验**：需要 LIBERO 渲染 GPU，当前 8 卡被占满；代码 + CPU 单测可先做。
+
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 
 - **前置**：阶段 1/2 完成 + FastWAM 补 batch 契约（`modeling_fastwam.py:349`、`mot/fastwam.py::infer_action` 4 处）+ 批内噪声语义定义。
@@ -514,12 +543,24 @@
 | F5 / F6 / F7 / F9 / F11 / F13 | **论文措辞或 docs** | 与本分支的编排改造无关 |
 | F8、C1–C4 | **不处理** | paper_review 已判定原句成立或属协议 |
 
-### 5.5.4 rebase 后仍需处理的语义冲突（paper_review §4.3）
+### 5.5.4 rebase 后仍需处理的语义冲突（paper_review §4.3）【✅ 已解决】
 
-> `plan_libero` 仍按 `episode_offset` **在 task 内部切分**；rebase 后 runner 已支持 `env_seed_mode`（`per_episode` 默认 / `per_task` 可选）。
-> - `per_episode`：分片**不改场景** ✅（当前全量配置用的就是它）。
-> - `per_task`：场景 = `(run.seed, 该 task 进程内第几次 reset)`；**task 内切分会静默改变场景**。
-> - **必须二选一（尚未做）**：① planner 在 `per_task` 下按 task 粒度分片（或 `episode_offset > 0` 直接拒绝）；② 分片时强制降级为 `per_episode`。并在 manifest 里记录实际模式。
+> `per_episode`（默认）：分片**不改场景** ✅。
+> `per_task`（官方 FastWAM）：场景 = `(run.seed, 该 task 进程内第几次 reset)`，**task 内切分会静默改变场景**。
+>
+> **处置（方案①：按 task 粒度分片 + 拒绝兜底）**：
+> - `plan_libero`：`env_seed_mode=per_task` 时忽略 worker 数，强制 `chunk = episodes_per_task` → **一个 task 恰好一个 shard**（`episode_offset=0`）；`suite_overrides` 里的 `env_seed_mode` 同样生效（逐 suite 判断）。
+> - `plan_shards`：LIBERO family 分片后做兜底校验 `_assert_per_task_not_split`——若 `per_task` 下出现 `episode_offset > 0`，或同一 `(suite, task)` 落进多个 shard，直接 `ValueError`（防手写/未来 planner 回归）。
+> - **实际模式可追溯**：`env_seed_mode` 同时写进 runner 的 `effective_config.json` 与 episode record metadata（`libero_runner._config_metadata`）。
+> - **单测**：`test_planning.py` 新增 5 例（per_task 一 task 一 shard、per_episode 仍切分、per-suite override、offset 切分拒绝、重复 task 拒绝）；全量 `129 passed / 1 skipped`，ruff clean。
+>
+> **代价与后续**：该方案下 `per_task` 的并发上限 = task 数（单 suite 10、全量 4 suite 40），而 8 卡 × N≈16 有 128 个槽；E=50 时 task 级的长尾和空转会很明显。**episode 级分片 + 官方语义**的方案（预计算 RNG 快照，逐集恢复）已在 `01_architecture.md` **§5.8.1** 定稿，当前**未实现**，验证用例见 `03_testing.md` **T-17**；未启用前保持 task 级分片作为安全回退。
+>
+> **协议口径提醒（2026-10-21 修正）**：仓库里的 `examples/embodied/fastwam/eval/configs/libero/*.yaml` 和 `/mnt/cfs/sunyuehang/runs/eval_configs_accel_*` 都写着 `env_seed_mode: per_task`，但历史数据的实际语义分两套：
+> - **accel_c16 / c5 / nis\***（2026-10-03）跑的是 `/workspace/LoongForge` @ `d1b8c9f`，该 clone **已接线** → 实际 `per_task`（50 集记录 `episode_seed` 全 42）；已验证复现口径 = `per_task` + `prefer_controller_ee: true` + `controller_force_update: false`，`task 0` 前 10 集与历史 **10/10 逐集一致**。
+> - **静态 94.2 / M2 56.2 min**（2026-10-15）跑的是**本分支 rebase 前**代码，映射缺失 → 实际 `per_episode`。
+> - **对比规则**：对 accel 历史用 `per_task` 组合；对本分支 M2/静态基线显式 pin `per_episode`。两套参照不可混用。
+> - 跑完以 `effective_config.json` / `run_manifest.json` 记录的实际模式为准，不要只看源 config。
 
 ## 6. 立即下一步（Next Action）
 
