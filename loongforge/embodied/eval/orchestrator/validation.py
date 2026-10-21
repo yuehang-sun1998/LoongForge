@@ -25,11 +25,11 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
+from loongforge.embodied.eval.metrics.results import INFRA_FAILURE_REASONS
+
 # Failure reasons that mean "the episode did not actually run" (see
-# libero_runner._classify_exception + the retry set).
-INFRA_FAILURE_REASONS = frozenset(
-    {"policy_timeout", "env_timeout", "episode_timeout", "server_unreachable", "episode_error"}
-)
+# libero_runner._classify_exception + the retry set). Shared with the metrics
+# layer so the coordinator and the per-run statistics cannot drift apart.
 
 
 def read_records_by_unit(output_dir: Path, n_units: int) -> List[List[Dict[str, Any]]]:

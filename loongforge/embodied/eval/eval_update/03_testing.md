@@ -2,7 +2,7 @@
 
 > **本文用途**：规定"每实现一个功能 → 对应一次性能测试 → 留数据与结论"的流程，并作为测试数据的**唯一归档处**。
 > **配套**：`01_architecture.md`（方案）、`02_progress.md`（进度）。
-> **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `511aa24`），仓库 `/workspace/LoongForge-Github`。
+> **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `7847a83`，已 rebase），仓库 `/workspace/LoongForge-Github`。
 > **最后更新**：2026-10-15。
 > **当前状态**：**M0/M1/M2 已实现并有实测数据**（T-01/T-02/T-03/T-04/T-05 见 §5）；全量对照见 T-05。T-06/T-07/T-08 暂缓。
 
@@ -46,13 +46,14 @@
 | T-05 | 动态队列 + 全量 wall-clock | 2 | 全 benchmark | ✅ 静态基线 94.2 min；**M2 全量 56.2 min / 96.45%**（vs 基线 1.68×、vs 1卡1server 3.09×） |
 | T-06 | 数值一致性（batch>1 vs batch=1） | 3（M3 前置） | 任一 | 📋 **方案已定**（per-row seeds 比对，见下）；待契约落地 |
 | T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | ⏸ 暂缓（环境不支持 GPU-sim，待 CPU-sim 完成后统一做） |
-| T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3（暂缓） | 任一 | ⏸ 暂缓 |
+| T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3 | 任一 | ✅ 已结案（batch 7.3× vs 多副本 1.25×） |
 | T-09 | 运行后覆盖校验（漏/重/多出）+ 自动补跑 | 2 | 任一 | ✅ 通过（单测 5 passed；真实 M2 全量 `ok=true`） |
 | T-10 | 故障注入：漏集补跑 / kill server 自愈 | 2 | 任一 | ✅ 通过（漏集补跑 ✅；kill server → 看门狗重启、`infra_failed=0`） |
 | T-11 | 健壮性兜底（unit 超时 / 收尾信号 / 竞态 / hung 探活） | 2 | 任一 | ✅ 通过（单测 8 个；E2E 冒烟通过） |
 | T-12 | 分片 planner 表（per-benchmark） | 2 | 全 family | ✅ 通过（单测 14 个；E2E 冒烟通过） |
-| T-13 | batch 缩放探针（M3 go/no-go） | 3 | 任一 | 🔄 探针就绪，待跑（需空闲 GPU） |
+| T-13 | batch 缩放探针（M3 go/no-go） | 3 | 任一 | ✅ 通过（batch 8 per-sample 583→79ms，7.3×；GO） |
 | T-14 | chunk 客户端化（请求量 10→1、结果逐位一致） | 3 | CPU-sim | ✅ 通过（80/80 逐集一致；请求量 9.83×） |
+| T-15 | paper §7 的 F1/F2：infra 失败不计完成 + 完整性有独立期望 | 2 | 任一 | ✅ 通过（upstream #303 已合入 metrics/runner 修复；编排层另用 validation.py） |
 
 ---
 
@@ -301,6 +302,14 @@
   - 请求量：`task0` 10 集共 **302 次推理请求 / 2969 个 env step = 9.83×**；逐集符合 `ceil(steps/10)`（如 700→70、232→24）。
   - server 侧 batcher E2E：4 个 sim 并发连同一个 server（`max_wait_ms=50`），51 个请求聚成 46 个 batch，**mean 1.11 / max 2**；4 个 client 全部正常结束（3 成功 + 1 个 150 步超时），无 server 错误。
 - **结论**：✅ **T-14 通过**。chunk 客户端化不改变结果，请求量降到 ~1/10。server 侧 batcher 的异步聚合与 cache-hit 过滤已跑通；真 batch 路径见 T-06。
+
+### T-15 · paper §7 的 F1 / F2 落地验证 【✅ 通过（upstream #303）】
+
+- **对应功能**：`paper_review.md` 的 F1（infra 失败被当"已完成"）与 F2（完整性检查有盲区）。
+- **当前状态**：upstream `7847a83`（PR #303）已合入 F1/F2/F3/F4/F10/F12 的 metrics + runner + `run.py` 修复；本分支 rebase 后直接复用。
+- **编排层补充**：coordinator 仍用 `validation.py` 做 **shard 级**覆盖校验与自动补跑（§5.5），与 metrics 层的 **episode 级**语义互补；`INFRA_FAILURE_REASONS` 已统一从 `metrics/results.py` 导入，避免漂移。
+- **判据**：见 PR #303 的 400 集真实 FastWAM+LIBERO 验证（故障注入 + resume + 完整性）。
+- **结论**：✅ 通过。单 runner / metrics 路径与编排路径现在都有覆盖。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【✅ 通过】
 

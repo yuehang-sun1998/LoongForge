@@ -1,7 +1,7 @@
 # LoongForge 具身评测编排改造 —— 架构方案
 
 > **范围**：LoongForge 具身评测框架（`loongforge/embodied/eval`）的**评测编排加速**。本方案与模型、benchmark 均无关，对所有被测模型与所有基准（LIBERO / CALVIN / RoboTwin / SimplerEnv / ManiSkill）生效；文中出现的 FastWAM / LIBERO 只是**实测样本**。
-> **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `511aa24`），仓库 `/workspace/LoongForge-Github`。
+> **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `7847a83`，已 rebase），仓库 `/workspace/LoongForge-Github`。
 > **状态**：设计已收敛，**代码尚未开始**。日期：2026-10-12。
 
 ---

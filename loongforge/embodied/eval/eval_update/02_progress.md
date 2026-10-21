@@ -2,7 +2,7 @@
 
 > **本文用途**：交接。任何人 / agent 读完本文即可接手，无需回读对话历史。
 > **配套文档**：`01_architecture.md`（做什么、怎么做）、`03_testing.md`（怎么验）。
-> **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `511aa24`），仓库 `/workspace/LoongForge-Github`。
+> **分支**：`feat/eval-orchestration-parallel`（base `upstream/master` @ `7847a83`，已 rebase），仓库 `/workspace/LoongForge-Github`。
 > **最后更新**：2026-10-15。
 > **一句话状态**：**M0+M1+M2 已实现并验证。** 静态 8 卡基线全量 94.2 min / 95.65%；**M2（单 coordinator 全局队列）全量 56.2 min / 96.45% → vs 基线 1.68×、vs 1卡1server vanilla 3.09×**。M3（batching）暂缓（GPU 未成瓶颈）。
 
@@ -12,7 +12,7 @@
 
 1. **改动落点在编排层**：`loongforge/embodied/eval/orchestrator/`。**不要**动 runner、server、model、benchmark。
 2. **代码仓库 / 分支**：改上游代码 / 提 PR 用 `/workspace/LoongForge-Github`（真正的 git 仓库，`origin`=个人 fork `yuehang-sun1998/LoongForge`，`upstream`=`baidu-baige/LoongForge`）；`/workspace/LoongForge` 等是旧克隆，仅供读代码。
-   - **本改造的所有开发都在分支 `feat/eval-orchestration-parallel` 上进行**，基点 `upstream/master` @ `511aa24`。
+   - **本改造的所有开发都在分支 `feat/eval-orchestration-parallel` 上进行**，基点 `upstream/master` @ `7847a83`（已 rebase）。
    - 该分支**当前未设置 tracking**；首次推送用 `git push -u origin feat/eval-orchestration-parallel`（否则裸 `git push` 会报 "no upstream branch"）。注意别把它 track 到 `upstream/master`——那是公网上游组织，不是你的 fork。
    - 本目录（`loongforge/embodied/eval/eval_update/`）即该分支的文档目录，后续文档都在此更新。
 3. **该环境访问 GitHub 需内网代理**（否则 `git fetch` 卡 ~130s 后超时）。代理地址与 `no_proxy` 白名单属**内网信息，不写入仓库**——具体值见团队内部说明。要点：走内网 egress；`no_proxy` 需含 `localhost,127.0.0.1` 与公司内网域名。
@@ -483,6 +483,43 @@
 - 现有全量评测脚本：`runs/release_and_eval.sh`（静态分片 + 波次补跑）。
 
 ---
+
+---
+
+## 5.5 与 `paper_review.md`（§7 核对）的对应关系
+
+> 依据：`/workspace/markdowns/loongforge/paper_review.md`（2026-10-19，对 `upstream/master` @ `8cbdcea` 的 §7 逐句核对）。
+> **2026-10-20 更新**：本分支已 rebase 到 `upstream/master` @ `7847a83`；F1/F2/F3/F4/F10/F12 已由 **PR #303** 合入 upstream。下面区分"upstream 已实现"与"本分支编排层额外提供"。
+
+### 5.5.1 已实现
+
+| ID | paper_review 的要求 | 实现 | 覆盖度 |
+|---|---|---|---|
+| **F1** | infra 失败不算"已完成"/不进成功率分母 | upstream `metrics/results.py`（`INFRA_FAILURE_REASONS`、`completed_episode_keys` 过滤、`infra_failed`）+ runner retry/resume；本分支 `validation.py` 复用同一常量 | ✅ 单 runner + 编排层 |
+| **F2** | 完整性有独立期望集合、非零退出 | upstream：`expected_counts` + `min_episodes_per_task` + exit 2；本分支：`validation.py` 的 **shard 级** `short_shards`/`validate` + 自动补跑（≤3 轮） | ✅ 两层互补：episode 级 + shard 级 |
+| **F3** | 真实 metadata | upstream：`repro_metadata.py` + `run_manifest.json` + `resolved_config.yaml` + `effective_config.json`；本分支 coordinator 额外落 `plan.json`/`coordinator_result.json` | ✅ |
+| **F4** | resume 默认 / 目录 / ckpt 校验 / 复用保护 | upstream：`run.resume` 默认 False、目录须存在、ckpt path+sha256、输出目录 guard、manifest 缺失补写；本分支 coordinator 额外有顶层 `resume` 防覆盖 | ✅ |
+| **F10** | 统一入口出报告 | upstream：`run.generate_report` 映射 + `report/` | ✅ |
+| **F12** | CALVIN repro compare | upstream：benchmark-aware key（`sequence_idx`） | ✅（CALVIN live 环境未验证） |
+| **本分支额外** | — | 动态多卡下发、覆盖校验 + 自动补跑、server watchdog、chunk 客户端化、batcher | ✅ |
+
+### 5.5.2 原"计划实现"的处置
+
+原 1–9 项（F1/F2/F3/F4/F10/F12）**已全部由 upstream PR #303 完成**，本分支 rebase 后直接复用，不再重复实现。唯一需要本分支持续维护的是 `validation.py` 与 `metrics/results.py` 的 `INFRA_FAILURE_REASONS` 一致性——现已改为**从 `metrics/results.py` 导入**。
+
+### 5.5.3 不归本分支 / 已关闭
+
+| ID | 处置 | 说明 |
+|---|---|---|
+| F5 / F6 / F7 / F9 / F11 / F13 | **论文措辞或 docs** | 与本分支的编排改造无关 |
+| F8、C1–C4 | **不处理** | paper_review 已判定原句成立或属协议 |
+
+### 5.5.4 rebase 后仍需处理的语义冲突（paper_review §4.3）
+
+> `plan_libero` 仍按 `episode_offset` **在 task 内部切分**；rebase 后 runner 已支持 `env_seed_mode`（`per_episode` 默认 / `per_task` 可选）。
+> - `per_episode`：分片**不改场景** ✅（当前全量配置用的就是它）。
+> - `per_task`：场景 = `(run.seed, 该 task 进程内第几次 reset)`；**task 内切分会静默改变场景**。
+> - **必须二选一（尚未做）**：① planner 在 `per_task` 下按 task 粒度分片（或 `episode_offset > 0` 直接拒绝）；② 分片时强制降级为 `per_episode`。并在 manifest 里记录实际模式。
 
 ## 6. 立即下一步（Next Action）
 
