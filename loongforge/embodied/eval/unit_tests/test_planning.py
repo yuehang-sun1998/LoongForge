@@ -69,6 +69,53 @@ def test_plan_libero_per_task_ignores_explicit_chunk() -> None:
     assert shards[0]["expected"] == 10
 
 
+def test_plan_libero_per_task_with_snapshots_allows_chunking() -> None:
+    """RNG snapshots make episode-level sharding safe under per_task."""
+    config: dict = {
+        "benchmark": {
+            "name": "libero",
+            "suites": ["a"],
+            "task_ids": [0],
+            "episodes_per_task": 10,
+            "episodes_per_chunk": 4,
+            "env_seed_mode": "per_task",
+            "scene_snapshot_dir": "/tmp/scene_snapshots",
+        }
+    }
+    shards = plan_libero(config, 64)
+    assert [(s["overrides"]["benchmark"]["episode_offset"], s["expected"]) for s in shards] == [
+        (0, 4),
+        (4, 4),
+        (8, 2),
+    ]
+
+
+def test_plan_shards_allows_split_with_snapshots(monkeypatch: Any) -> None:
+    """The backstop must not reject a split when snapshots are configured."""
+
+    def split_planner(config: dict, total_workers: int) -> list:
+        return [
+            {
+                "id": f"a/task=0/eps={offset}-{offset}",
+                "overrides": {
+                    "benchmark": {"suite": "a", "task_ids": [0], "episode_offset": offset, "episodes_per_task": 1}
+                },
+                "expected": 1,
+            }
+            for offset in (0, 1)
+        ]
+
+    monkeypatch.setitem(planning.PLANNERS, "libero", split_planner)
+    config: dict = {
+        "benchmark": {
+            "name": "libero",
+            "env_seed_mode": "per_task",
+            "scene_snapshot_dir": "/tmp/scene_snapshots",
+        }
+    }
+    assert len(plan_shards(config, 2)) == 2
+
+
 def test_benchmark_family_normalises_libero_variants() -> None:
     """Run test_benchmark_family_normalises_libero_variants."""
     assert benchmark_family({"benchmark": {"name": "libero"}}) == "libero"

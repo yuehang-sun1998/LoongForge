@@ -62,6 +62,11 @@ def _seed_mode(config: Dict[str, Any]) -> str:
     return str(_benchmark(config).get("env_seed_mode") or "per_episode")
 
 
+def _scene_snapshot_dir(config: Dict[str, Any]) -> str:
+    """Directory of pre-reset RNG snapshots (empty = not configured)."""
+    return str(_benchmark(config).get("scene_snapshot_dir") or "")
+
+
 def _suites(config: Dict[str, Any]) -> List[str]:
     """Suites to evaluate: ``benchmark.suites`` (list) or the single ``benchmark.suite``."""
     benchmark = _benchmark(config)
@@ -106,7 +111,12 @@ def plan_libero(config: Dict[str, Any], total_workers: int) -> List[Shard]:
         # Splitting a task across processes would replay the first scenes, so
         # one task must map to exactly one shard.
         suite_mode = str((overrides.get(suite) or {}).get("env_seed_mode") or _seed_mode(config))
-        suite_chunk = max(1, episodes_per_task) if suite_mode == "per_task" else chunk
+        # With RNG snapshots every episode restores its own pre-reset state, so the
+        # normal episode-level chunking is safe even under per_task.
+        if suite_mode == "per_task" and not _scene_snapshot_dir(config):
+            suite_chunk = max(1, episodes_per_task)
+        else:
+            suite_chunk = chunk
         for task in tasks:
             for offset, count in _ranges(0, episodes_per_task, suite_chunk):
                 patch = {
@@ -194,7 +204,10 @@ def _assert_per_task_not_split(config: Dict[str, Any], shards: List[Shard]) -> N
 
     The planner already keeps one task per shard here; this is the backstop for a
     hand-built or future planner, where the split would silently change scenes.
+    A configured snapshot directory makes the split safe, so it is allowed.
     """
+    if _scene_snapshot_dir(config):
+        return
     seen = set()
     for shard in shards:
         patch = (shard.get("overrides") or {}).get("benchmark") or {}

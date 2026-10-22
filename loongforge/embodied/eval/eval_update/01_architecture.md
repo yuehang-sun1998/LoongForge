@@ -409,7 +409,7 @@ Shard = {"id": str, "overrides": {<config 段>: {<键>: <值>}}, "expected": int
 > **边界提醒**：本方案的约定是"改动落点在**编排层**，不动 runner"。以上三项**要动 runner** → 建议**单独一轮、按 family 分开提交**，别和编排层混。
 > **为什么现在不做**：环境里**只有 LIBERO 能跑**（CALVIN 依赖未装、RoboTwin 缺 EGL 驱动、SimplerEnv/ManiSkill 依赖未装）→ **写了也没法验证**。
 
-#### 5.8.1 `per_task` 下的 episode 级分片：RNG 快照方案（设计定稿，未实现）
+#### 5.8.1 `per_task` 下的 episode 级分片：RNG 快照方案（已实现，6 集 GPU 逐位验证通过）
 
 **问题**：LIBERO 的 `per_task`（官方 FastWAM 语义）把 env 的随机状态绑在"进程内第几次 reset"上，而 episode-chunk 分片会把同一 task 拆到多个进程 → 每个进程都从第一个场景重放，静默改变评测集。
 
@@ -463,6 +463,25 @@ Shard = {"id": str, "overrides": {<config 段>: {<键>: <值>}}, "expected": int
 | **RNG 快照** | **128** | **50 次/task，一次性** | 任意 offset O(1) |
 
 **验证**（见 `03_testing.md` T-17）：串行 vs 分片的逐集首帧哈希比对，外加"故意恢复错集快照"的反证。
+
+**实现（2026-10-22）**：
+
+- 新模块 `orchestrator/scene_snapshots.py`：dump/load/apply + CLI；
+- 生成（每 task 一次，先于评测）：
+
+  ```bash
+  python -m loongforge.embodied.eval.orchestrator.scene_snapshots \
+    --suite libero_10 --task -1 --seed 42 --episodes 50 --out <snapshot_dir>
+  ```
+
+  产物 `<snapshot_dir>/<suite>__task<id>__seed<seed>.pkl`，含每集 reset 前的 `np.random` 与 `random` 状态，并返回 sha256。
+- 配置：`benchmark.env_seed_mode: per_task` + `benchmark.scene_snapshot_dir: <snapshot_dir>`；
+- planner：配置了快照目录时，`per_task` 恢复 **episode 级切片**，并跳过“禁止 task 内切分”的兜底；
+- runner：每集 `env.reset()` 前恢复 `snapshots[episode_idx]`，episode record 记录 `scene_snapshot` 路径；
+- 单测：`test_scene_snapshots.py`（状态往返复现场景序列、越界检测、版本校验）+ planner 2 例；
+- **GPU 验证（2026-10-22）**：libero_10/task0/seed42 6 集，串行 vs 快照恢复的 sim state 与首帧哈希 6/6 全等；分片 steps 与串行一致。
+- **全量对齐（2026-10-22）**：2000/2000、0 重启、97.15% vs 参照 97.00%；逐集 steps 一致 91.3%。残余差异已证明为模型代码数值漂移（task3/spatial task4 前 10 集场景哈希新旧代码 10/10 相同，steps 却已分叉）。
+- **未做**：coordinator 尚未自动生成快照（当前需要先跑上面的 CLI）。
 
 
 ## 6. 标定方法论

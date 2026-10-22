@@ -55,7 +55,7 @@
 | T-14 | chunk 客户端化（请求量 10→1、结果逐位一致） | 3 | CPU-sim | ✅ 通过（80/80 逐集一致；请求量 9.83×） |
 | T-15 | paper §7 的 F1/F2：infra 失败不计完成 + 完整性有独立期望 | 2 | 任一 | ✅ 通过（upstream #303 已合入 metrics/runner 修复；编排层另用 validation.py） |
 | T-16 | 多卡共享 CPU/内存对 N 标定的影响 | 3 | CPU-sim | ⬜ 待执行（需空闲 8 卡） |
-| T-17 | `per_task` 下 episode 级分片（RNG 快照逐集恢复） | 2/M3 | CPU-sim（LIBERO） | 📋 设计定稿（`01_architecture.md` §5.8.1）；待实现 + GPU 验证 |
+| T-17 | `per_task` 下 episode 级分片（RNG 快照逐集恢复） | 2/M3 | CPU-sim（LIBERO） | ✅ 6 集逐位验证（sim+首帧哈希 6/6）；全量 2000 对齐进行中 |
 
 ---
 
@@ -352,11 +352,27 @@
 - **数据**：_待填_（需空闲 8 卡）
 - **结论**：_待填_
 
-### T-17 · `per_task` 下 episode 级分片（RNG 快照）【⬜ 待实现 + 验证】
+### T-17 · `per_task` 下 episode 级分片（RNG 快照）【✅ 6 集 GPU 逐位验证通过；全量 2000 对齐进行中】
 
 - **对应方案**：`01_architecture.md` §5.8.1（预计算每集 reset 前的 `np.random` 状态，分片逐集恢复）。
 - **目的**：证明"打散到任意进程"与"单进程串行"逐集**场景一致**，从而在保留官方 `per_task` 语义的同时恢复 episode 级调度。
 - **前置**：LIBERO + 渲染 GPU（`OffScreenRenderEnv` 需要 EGL）；代码侧先做 CPU 单测（fake env）。
+- **实现与用法（2026-10-22）**：
+  - 生成快照：
+
+    ```bash
+    python -m loongforge.embodied.eval.orchestrator.scene_snapshots \
+      --suite libero_10 --task -1 --seed 42 --episodes 50 --out <snapshot_dir>
+    ```
+
+  - 配置：`benchmark.env_seed_mode: per_task` + `benchmark.scene_snapshot_dir: <snapshot_dir>`；
+  - runner 每集 `env.reset()` 前恢复 `snapshots[episode_idx]`，record 记 `scene_snapshot`；
+  - planner 在配置快照后允许 `per_task` 的 episode 级切片；
+  - CPU 单测：`test_scene_snapshots.py` 3 例 + planner 2 例（全量 138 passed / 1 skipped）。
+- **全量对齐（2026-10-22）**：2000/2000、validation ok、0 重启；成功率 97.15% vs 参照 97.00%；逐集 steps 一致 91.3%，差异集中在 4 个敏感 task（前几集一致后分叉）。已用场景哈希证明是模型代码数值漂移：task3/spatial task4 前 10 集新旧代码的 sim state + 首帧哈希 10/10 相同，而 steps 已在 ep2/ep9 分叉。
+- **GPU 逐位验证（2026-10-22，libero_10/task0/seed42，6 集）**：
+  - 串行 vs 快照恢复：`sim.get_state()` 哈希 **6/6 相同**、`agentview_image` 首帧哈希 **6/6 相同**、steps/success **6/6 相同**；
+  - 分片（chunk=2，3 个进程）steps 也与串行完全一致（260/242/248/262/259/249）。
 - **步骤**：
   1. **串行参考**：`per_task`、`seed=42`、task 0、E=10，单进程跑完；每集记录 reset 后第一帧的哈希（`hash(obs["agentview_image"])`），可另记关键物体 qpos。
   2. **预计算快照**：同一 task 生成 `S0..S9`（每集 reset 之前的状态）。

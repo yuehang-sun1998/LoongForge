@@ -88,8 +88,16 @@ class PolicyServer:
         while True:
             try:
                 msg = msgpack_numpy.unpackb(await websocket.recv())
-                if self._batcher is not None and msg.get("type", "infer") in ("infer", "predict_action"):
+                is_infer = msg.get("type", "infer") in ("infer", "predict_action")
+                if self._batcher is not None and is_infer:
                     response = await self._route_batched(msg)
+                elif is_infer:
+                    # Without batching, inference used to run inline on the event
+                    # loop: a busy server then starved pings/handshakes and the
+                    # watchdog killed it as "hung". The executor keeps the loop free.
+                    response = await asyncio.get_running_loop().run_in_executor(
+                        None, self._route_message, msg
+                    )
                 else:
                     response = self._route_message(msg)
                 await websocket.send(packer.pack(response))

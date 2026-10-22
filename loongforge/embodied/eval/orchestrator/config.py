@@ -174,6 +174,8 @@ CONFIG_MAPPING = {
     # for every episode; per_task reuses ONE env seeded with run.seed across all trials,
     # which is what the official FastWAM eval does (see docs §4.8).
     "benchmark.env_seed_mode": "env_seed_mode",
+    # per_task + episode-level sharding: restore each episode's pre-reset RNG state.
+    "benchmark.scene_snapshot_dir": "scene_snapshot_dir",
     "benchmark.max_steps": "max_steps",
     "benchmark.continuous_gripper": "continuous_gripper",
     # False -> proprio reads obs['robot0_eef_pos']/quat (official FastWAM

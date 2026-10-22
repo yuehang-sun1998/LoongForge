@@ -38,6 +38,7 @@ from loongforge.embodied.eval.action_decoders import ActionDecoder
 from loongforge.embodied.eval.orchestrator.config import (
     build_rpc_payload,
 )
+from loongforge.embodied.eval.orchestrator import scene_snapshots
 from loongforge.embodied.eval.orchestrator.runners import _common
 from loongforge.embodied.eval.orchestrator.runners._common import StepTimeoutError, alarm_timeout, avg as _avg
 from loongforge.embodied.eval.payload_builders import PayloadBuilder
@@ -94,6 +95,20 @@ def _extract_primary_frame(obs: Dict[str, Any]) -> np.ndarray:
 # LoongForge re-creates and re-seeds the env every episode and therefore renders a
 # different observation for the same recorded initial state.
 _ENV_CACHE: Dict[str, Any] = {"key": None, "env": None}
+
+# per_task + episode-level sharding: RNG states captured before each reset.
+_SCENE_SNAPSHOT_CACHE: Dict[tuple, Any] = {}
+
+
+def _scene_snapshot_states(directory: str, suite: str, task_id: int, seed: int):
+    """Load (and cache) the snapshot list for one task."""
+    key = (str(directory), str(suite), int(task_id), int(seed))
+    states = _SCENE_SNAPSHOT_CACHE.get(key)
+    if states is None:
+        path = scene_snapshots.snapshot_path(directory, suite, task_id, seed)
+        states = scene_snapshots.load_snapshots(path)
+        _SCENE_SNAPSHOT_CACHE[key] = states
+    return states
 
 
 def _get_cached_env(task, resolution: int, seed: int):
@@ -283,6 +298,24 @@ def run_episode(
                 env = _get_cached_env(task, _render_resolution(args), episode_seed)
             else:
                 env, task_description = _get_libero_env(task, _render_resolution(args), episode_seed)
+            # With a snapshot directory, each episode restores the RNG state the
+            # single-process serial run would have had before its own reset. This is
+            # what makes episode-level sharding safe under per_task seeding.
+            snapshot_dir = str(getattr(args, "scene_snapshot_dir", "") or "")
+            scene_snapshot_used = None
+            if env_seed_mode == "per_task" and snapshot_dir:
+                np_states, py_states = _scene_snapshot_states(
+                    snapshot_dir, task_suite_name, task_id, episode_seed
+                )
+                if episode_idx >= len(np_states):
+                    raise RuntimeError(
+                        f"scene snapshot for {task_suite_name}/task={task_id} has "
+                        f"{len(np_states)} states but episode_idx={episode_idx} was requested"
+                    )
+                scene_snapshots.apply_snapshot(np_states[episode_idx], py_states[episode_idx])
+                scene_snapshot_used = str(
+                    scene_snapshots.snapshot_path(snapshot_dir, task_suite_name, task_id, episode_seed)
+                )
             reset_start = time.time()
             client.reset(episode_id)
             payload_builder.reset(episode_id)
@@ -499,6 +532,7 @@ def run_episode(
         "failure_reason": failure_reason,
         "replay_path": replay_path,
         "trace_path": trace_path,
+        "scene_snapshot": scene_snapshot_used,
         "server_metadata": client.metadata,
         "repro": {
             **repro_metadata.repro_fields(("libero",)),
@@ -724,6 +758,15 @@ def build_argparser() -> argparse.ArgumentParser:
             "(`seed + task_id*1000 + episode_idx`). "
             "per_task: one env per task seeded with --seed and reused across trials "
             "(official FastWAM eval semantics; see docs §4.8)."
+        ),
+    )
+    parser.add_argument(
+        "--scene-snapshot-dir",
+        default="",
+        help=(
+            "With --env-seed-mode per_task, restore each episode's pre-reset RNG state "
+            "from <dir>/<suite>__task<id>__seed<seed>.pkl, making episode-level sharding "
+            "scene-identical to a single-process serial run (T-17)."
         ),
     )
     parser.add_argument(
