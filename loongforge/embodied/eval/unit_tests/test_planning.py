@@ -21,6 +21,54 @@ from loongforge.embodied.eval.orchestrator.planning import (
 )
 
 
+def test_plan_libero_explicit_episode_chunk() -> None:
+    """A worker can run several episodes per process to amortise startup."""
+    config: dict = {
+        "benchmark": {
+            "name": "libero",
+            "suites": ["a"],
+            "task_ids": [0],
+            "episodes_per_task": 10,
+            "episodes_per_chunk": 4,
+        }
+    }
+    shards = plan_libero(config, 64)
+    assert [(s["overrides"]["benchmark"]["episode_offset"], s["expected"]) for s in shards] == [
+        (0, 4),
+        (4, 4),
+        (8, 2),
+    ]
+    assert sum(s["expected"] for s in shards) == 10
+
+
+def test_plan_libero_explicit_chunk_cannot_exceed_the_task() -> None:
+    """A chunk larger than the task still yields one shard covering it."""
+    config: dict = {
+        "benchmark": {"name": "libero", "suites": ["a"], "task_ids": [0], "episodes_per_task": 10, "episodes_per_chunk": 32}
+    }
+    shards = plan_libero(config, 64)
+    assert len(shards) == 1
+    assert shards[0]["overrides"]["benchmark"]["episode_offset"] == 0
+    assert shards[0]["expected"] == 10
+
+
+def test_plan_libero_per_task_ignores_explicit_chunk() -> None:
+    """per_task correctness beats the startup optimisation: one task, one shard."""
+    config: dict = {
+        "benchmark": {
+            "name": "libero",
+            "suites": ["a"],
+            "task_ids": [0],
+            "episodes_per_task": 10,
+            "episodes_per_chunk": 4,
+            "env_seed_mode": "per_task",
+        }
+    }
+    shards = plan_libero(config, 64)
+    assert len(shards) == 1
+    assert shards[0]["expected"] == 10
+
+
 def test_benchmark_family_normalises_libero_variants() -> None:
     """Run test_benchmark_family_normalises_libero_variants."""
     assert benchmark_family({"benchmark": {"name": "libero"}}) == "libero"

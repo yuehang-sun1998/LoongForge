@@ -376,6 +376,126 @@
 - **历史复现（关键）**：`libero_10/task0` 前 10 集按 **`per_task` + `prefer_controller_ee=true` + `controller_force_update=false`** 重跑，与 2026-10-03 accel_c16 历史记录 **10/10 逐集一致**（success/steps/failure_reason）。此前两轮不一致的原因分别是 `per_episode`（场景不同）和 `controller_force_update=true`（首帧观测不同）。
 - **待做**：8 卡 N 扫描、2000 集全量；`per_episode` 的逐集参照（M2 原始记录未找到，必要时用旧分支小网格自建）。
 
+### 2.25 N 扫描与 chunk 频率口径（2026-10-22，第一轮作废、第二轮进行中）
+
+**先钉口径**：所有历史基线——vanilla 官方 harness、静态 8 卡 94.2 min、M2 56.2 min——**都是 `chunk_execute_steps=10`**（config 写 `0` → 默认 10）。`accel_c16/c5`（2026-10-03）只是早期调参，不作为基线，后续全部按 10。
+
+#### (1) 第一轮扫描（coordinator，chunk=16）——结论作废
+
+条件：8 卡同 N、4 suite × 5 task × 10 集 = **固定 200 集/点**、`chunk=16`、`max_wait_ms=5`。
+
+- **cadence 错**：与基线（10）不一致，请求率少 1.6×。
+- **并发被 unit 数封顶**：200 集 × chunk=1 → 只有 200 个 unit；N≥25 时 `concurrency = 8N` 已超过 200，实际只有 **200 个 worker** 在跑。
+  - 吞吐公式 `N / mean(episode_wall)` 假设每 server 有 N 个 sim；N>25 后这个假设不成立 → **高估吞吐**。
+  - 佐证：N=32/40/48/64 的 `elapsed` 都在 **564–583s**，基本不变；所谓 88→175 eps/min 主要是公式口径错误。
+- 该轮数据仅作历史记录，**不能用来选 N\***。
+
+#### (2) 内存实测（N=64，coordinator，200 workers）
+
+| 指标 | 实测 |
+|---|---|
+| 峰值已用内存 | **467GB**（`MemTotal - min(MemAvailable)`） |
+| 最低 `MemAvailable` | 1040GB |
+| PSS 峰值 | 429GB |
+| 单 sim PSS | **~2.0GB** |
+| OOM | 无 |
+
+按单 sim 2.0GB 重算上限：`N_mem = 0.8 × 1507 / (8 × 2.0) ≈ 75` → **N=64 安全，75 以上需要监控**。
+
+#### (3) 第二轮：external 模式（N=64 完成，N=32 进行中）
+
+- 8 个 server 常驻（每卡一个），全程只加载一次；
+- `chunk_execute_steps=0` → **10**；`max_wait_ms=50`、`max_batch_size=8`；
+- **每个 client 跑 1 集**，N per server → 总 episode = 8N，**真实并发 = 8N**；
+- 采集：吞吐、单集 wall、server stats 增量（requests/batches/mean_batch）、timing、`MemAvailable`/PSS、CPU。
+
+**跑通前修掉的三个问题**：
+
+1. **batching 一直没开**：`rpc_server.py` 只认 `batching.enabled`，而配置只写了 `max_batch_size/max_wait_ms` → **batcher 从未启动**。这解释了此前 ON/OFF 结果与耗时完全一致、stats 恒为 0。已改为“非空 `batching` 块默认启用，只有显式 `enabled: false` 才关闭”。
+2. **高并发握手失败**：512 个 client 同时连接，`websocket handshake` 超时（307/512），client 直接退出、无 results。已在 `PolicyClient._wait_for_server` 里对握手超时做预算内重试，并让驱动按 10ms 错峰启动。
+3. **端口冲突根因**：本机 `ip_local_port_range = 10000–61000`，之前用的 14560/16000/22600/24600 都可能被 client 的源端口/TIME_WAIT 占用；改用 **6000–6140**，并用真实 `bind` 而不是 `connect` 探测。
+
+**N=32 / N=64 结果（均 0 失败 client）**：
+
+| N | 完成 | 成功率 | 单集 wall | 容量 | mean batch | CPU | PSS 峰值 |
+|---|---|---|---|---|---|---|---|
+| 16* | 128/128 | 95.31% | 170.0s | 45.2 eps/min | — | 35% | 286GB |
+| 32 | 256/256 | 94.92% | 196.1s | **78.3 eps/min** | 2.85 | 70% | 526GB |
+| 64 | 512/512 | 97.27% | 339.0s | **90.6 eps/min** | 3.29 | **80%** | 982GB |
+
+\* N=16 是在 batching 修复前跑的（batcher 未启动），只作参考。
+
+- N=32 → N=64：容量 +15.7%，CPU 70%→80%，内存 PSS 526→982GB；**收益递减但仍为正**。
+- 膝点预计在 **64–80** 之间；N=64 已接近 CPU/内存边界，推荐 **N*=64**。
+- ~~全量 2000 集外推：`2000/90.6 ≈ 22 min` + 启动 ≈ 28–31 min → 5.5–6.5×~~ **（已由实测推翻，见下）**。
+
+**2000 集全量实测（pr240 fp32master，chunk=10，N=64，batching on）**：
+
+| 指标 | 数值 |
+|---|---|
+| 完成 | **2000/2000**，`validation.ok=true`，infra/重试/重启全 0 |
+| 成功率 | **96.85%**（1937/2000） |
+| worker wall（coordinator 口径） | **43.6 min** |
+| 总 wall（含模型加载） | **约 51 min** |
+| 实际吞吐 | **45.9 eps/min** |
+| 平均单集 | 426.9s（libero_10 774s、spatial 322s、object 336s、goal 275s） |
+
+| 参照 | wall | 提升 |
+|---|---|---|
+| vanilla 官方（8 卡折合） | 173.7 min | **3.4×** |
+| 静态 8 卡基线 | 94.2 min | 1.85× |
+| M2（N=16） | 56.2 min | **1.10×** |
+
+- 与 external 试跑的 90 eps/min 差距主要来自：全量换了 pr240 ckpt、请求错峰导致 batch 变小、以及 libero_10 长尾在收尾阶段空转；进程 import 开销按上限估算只占 ~4%。
+- **同 ckpt external 对照（2026-10-22，pr240，N=64，512 集）**：512/512、0 失败、成功率 96.09%、单集 334.5s、**稳态容量 91.8 eps/min**、mean batch 3.41、CPU 83.5%、PSS 897GB。
+  - 同 ckpt 下 external 容量 91.8 vs coordinator 71.9（由 mean ep 426.9s 反推）→ **coordinator 每集慢约 28%**；
+  - 2000 集端到端：coordinator 43.6 min（worker）vs external 按 91.8 eps/min 外推 21.8 min → **调度/进程模型带来约 2× 的墙钟差距**；
+  - 归因方向：每集一个 worker 进程（2000 次 import）、持续补位导致请求错峰/batch 变小、以及尾部空槽。**不是 ckpt 或模型问题**。
+- **优化项（已验证）**：`benchmark.episodes_per_chunk=4`（一个 worker 连续跑 4 集，保留动态补位；`per_task` 仍强制一 task 一 shard）。2000 集实测：
+  - **520 unit、2000/2000、成功率 96.80%、validation ok、0 失败/重试/重启**；
+  - worker wall **36.1 min**（chunk=1 为 43.6 min，**-17%**）；
+  - 吞吐 **55.4 eps/min**（chunk=1 为 45.9，**+21%**）；
+  - 单集 wall 332.0s（chunk=1 为 426.9s）。
+  - 仍低于 external 的 91.8 eps/min：剩余差距来自尾部空槽（520 unit 略多于 512 槽）与进程 import，而不是模型。
+
+**当前性能结论（2000 集，pr240，chunk=10）**：
+
+| 配置 | 总 wall | worker wall | 吞吐 | vs vanilla | vs M2 |
+|---|---|---|---|---|---|
+| chunk=1（每集一进程） | ~51 min | 43.6 min | 45.9 eps/min | 3.4× | 1.10× |
+| **chunk=4（每 worker 4 集）** | **~45 min** | **36.1 min** | **55.4 eps/min** | **3.9×** | **1.25×** |
+
+- 对照：vanilla 173.7（8 卡折合）、静态 94.2、M2 56.2 → 当前分别为 **3.9× / 2.1× / 1.25×**。
+- external 稳态容量 91.8 eps/min 仍高于 coordinator，剩余差距来自尾部空槽与进程 import；继续优化的边际收益有限。
+- 成功率口径不参与性能对比（per_episode vs vanilla per_task，场景集不同）。
+- **结论修正**：当前最佳全量实测 **vs vanilla 3.9×**（chunk=4，总 wall ~45 min）；chunk=1 为 3.4×。不是 5.5–6.5×。
+- **同 ckpt external 对照已完成**（见上），确认差距来自调度/进程模型而非 ckpt。
+- 单请求推理耗时 0.9–1.9s（含 batch 与排队）；`max_wait_ms=50` 下 mean batch 2.85–3.29，batching 确实生效。
+- 内存：N=64 时 `MemAvailable` 最低 577GB、PSS 982GB，无 OOM。
+- **复现验证（第二次 N=64）**：512/512、0 失败、成功率 96.48%、单集 341.6s、**89.9 eps/min**、mean batch 3.45 —— 与首轮 90.6 eps/min 偏差 <1%，容量可复现。
+
+**batching ON / OFF 平行 A/B**（4+4 卡同时跑、N=32、128 集/臂、整机负载相同）：
+
+| 臂 | 完成 | 成功率 | 单集 wall | 容量 | mean batch | CPU |
+|---|---|---|---|---|---|---|
+| **ON** | 128/128 | 95.31% | **154.2s** | **49.8 eps/min** | 3.22 | 69% |
+| OFF | 115/128 | 94.78% | 250.2s | 30.7 eps/min | — | 47% |
+
+- **batching 带来约 1.6× 吞吐**，单集 wall 也降到 1/1.6；CPU 利用率从 47% 提到 69%（sim 不再空等）。
+- OFF 臂有 13 个 client 握手超时（60s 重试预算耗尽），说明关闭 batching 时 server 更容易饱和；这使对比略微偏向 ON，但单集 wall 差异足够大，结论稳健。
+- 4 server × N=32 的 ON 容量 49.8 eps/min → 按 8 server 外推 ≈ 99.6 eps/min，与 8 卡 N=64 实测 90.6 一致。
+
+**确定性验证（batching 是唯一非确定源）**：
+
+- **batching OFF**：
+  - 同配置重复两轮（8 server × N=16，128 集）：`success/steps/failure_reason` **0 差异**；
+  - 跨并发对比（4 server × N=32 vs 8 server × N=16，115 个共同 episode）：**0 差异**。
+  - 结论：batch=1 时评测逐集确定，且与并发/server 数无关。
+- **batching ON**：两次 N=64（512 集）→ **325 集步数不同（多为 ±1–3 步）**、**4 集成功翻转**（498/512 vs 494/512，差 0.8%，在二项噪声内）。来源是 batch 组成随到达时序变化 + bf16 batched-GEMM 归约顺序。
+- **取舍**：要逐位可复现 → 关闭 batching（吞吐约降 1.6×）；要最高吞吐 → 开 batching，报告多轮均值/置信区间。
+
+**定性结论仍然成立**：N 是并发数不是单集加速；单集 wall 随并发上升（N=16 170s → N=64 339s），容量看整机吞吐。
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -500,6 +620,10 @@
 8. **server 默认不安全**：`PolicyServer` 默认 `host="0.0.0.0"` + `max_size=None` + 无认证（`rpc_server.py:26/46`）。共享长驻后须收紧（绑 localhost/内网 + 帧上限）。
 9. **队列前提是单机单 FS**：`os.rename` 原子性只在同一文件系统成立，跨节点 / NFS 失效（Ray Serve 已评估、因依赖重不选）。
 10. **公开仓文档规范**（若本文档要进开源仓）：注释用英文、内部路径用 `/path/to` 占位符、真实值放 gitignored 的 `*.internal.*`、提交前跑 `sensitive_scan`。本目录现已随分支入库（`loongforge/embodied/eval/eval_update/`），提交前需按此规范处理。
+11. **高并发 client 握手会丢集**：512 个 client 同时连接时，server 在 30s `open_timeout` 内可能完不成 websocket upgrade；旧客户端不重试 → 进程退出、无 `results.jsonl`（N=64 时丢了 307/512）。已让 `PolicyClient` 在 connect 预算内重试，并在驱动里按 10ms 错峰启动；单 server 同时握手建议 ≤32。
+12. **端口不要落在临时端口范围**：本机 `ip_local_port_range = 10000–61000`，选 14560/16000/22600/24600 等会被 client 源端口或 TIME_WAIT 占用 → server bind 失败。评估用 **6000–6140**，并**用真实 `bind` 而不是 `connect` 探测空闲**。
+13. **`batching.enabled` 必须显式或非空块**：旧实现只认 `enabled: true`，只写 `max_batch_size/max_wait_ms` 时 batcher **不会启动**（历史“ON/OFF 没区别”即由此而来）。现改为非空块默认启用，显式 `enabled: false` 才关闭；跑完用 server `stats` 的 `mean_batch_size` 确认真的生效。
+14. **batching 会引入 run-to-run 非确定性**：batch 组成随请求到达时序变化，bf16 batched-GEMM 归约顺序随之改变 → 同一配置两次 N=64 有 325/512 集步数抖动（±1–3 步）、4 集成功翻转（约 0.8%）。关闭 batching 时逐集完全确定（同配置重复、跨并发均为 0 差异）。需要严格复现的实验必须关闭 batching 或改用 fp32。
 
 ---
 
@@ -562,8 +686,15 @@
 > - **对比规则**：对 accel 历史用 `per_task` 组合；对本分支 M2/静态基线显式 pin `per_episode`。两套参照不可混用。
 > - 跑完以 `effective_config.json` / `run_manifest.json` 记录的实际模式为准，不要只看源 config。
 
-## 6. 立即下一步（Next Action）
+## 6. 当前计划（Next Action）
 
-**从 T0-1 开始**：给 `transport/rpc_server.py::_route_message` 加 `t_infer` + 队列深度插桩，然后用它跑 T-01（vanilla 1:1 标定），拿到 `t_sim`/`t_infer` 后按 §6 算 `N_min`，再进 T-02 小扫。
+**已完成（2026-10-22）**：CPU 单测 130 passed；`per_task` 分片保护；client 握手/超时修复；batching 开关修复；N 扫描（N=64）；batching A/B（1.62×）；确定性验证（OFF 0 差异）；2000 集全量 chunk=1（~51 min / 3.4×）与 chunk=4（~45 min / **3.9×**）；同 ckpt external 对照（91.8 eps/min）。
 
-> 不先做这一步的原因没有——阶段 1 的所有参数（N、是否同卡）都依赖它，跳过就是盲搜。
+**待做，按优先级**：
+
+1. **提交代码与文档**：`rpc_server.py`（batching 默认开启）、`client.py`（握手重试）、`planning.py`（`episodes_per_chunk` + per_task 保护）、对应单测、三份 docs。
+2. **分数对齐（可选）**：若要与 vanilla 逐集比分数，跑 `per_task + batching off` 的 2000 集（2–3 h，并发 ≤40）；或实现 T-17 RNG 快照，兼顾场景对齐与并行。
+3. **T-16 共享 CPU/内存实验**（约 1 h）：A 单 server 独跑 / B 8 卡同 N / C 异 N / D 固定 N 改总负载。
+4. **N=48/80 补点**（可选）：确认膝点；N=80 需盯 CPU/内存。
+5. **`per_episode` 逐集参照**：用旧分支小网格自建，回答 rebase 是否改变 per_episode 行为（M2 原始记录未找到）。
+6. **GPU-sim / CALVIN**：环境具备后再补标定与评测。

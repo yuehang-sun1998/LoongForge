@@ -46,21 +46,26 @@ class PolicyClient:
                     max_size=None,
                     open_timeout=min(30.0, remaining),
                 )
-                try:
-                    # A stopped-but-listening server still accepts the TCP connect, so
-                    # this read must be bounded too -- otherwise a hung server blocks the
-                    # watchdog forever waiting for metadata that will never arrive.
-                    metadata = msgpack_numpy.unpackb(conn.recv(timeout=remaining))
-                except TimeoutError:
-                    conn.close()
-                    raise
-                if metadata.get("protocol_version") != PROTOCOL_VERSION:
-                    raise RuntimeError(
-                        f"protocol_version mismatch: {metadata.get('protocol_version')} != {PROTOCOL_VERSION}"
-                    )
-                return conn, metadata
-            except ConnectionRefusedError:
-                time.sleep(1)
+            except (ConnectionRefusedError, TimeoutError, OSError):
+                # A server that is still loading (or briefly saturated by other
+                # clients) refuses or stalls the upgrade; retry within the budget.
+                time.sleep(min(1.0, max(0.0, remaining)))
+                continue
+            try:
+                # A stopped-but-listening server still accepts the TCP connect, so
+                # this read must be bounded too -- otherwise a hung server blocks the
+                # watchdog forever waiting for metadata that will never arrive.
+                metadata = msgpack_numpy.unpackb(conn.recv(timeout=remaining))
+            except TimeoutError:
+                conn.close()
+                time.sleep(min(1.0, max(0.0, remaining)))
+                continue
+            if metadata.get("protocol_version") != PROTOCOL_VERSION:
+                conn.close()
+                raise RuntimeError(
+                    f"protocol_version mismatch: {metadata.get('protocol_version')} != {PROTOCOL_VERSION}"
+                )
+            return conn, metadata
 
     def close(self) -> None:
         """Run close."""

@@ -320,7 +320,8 @@ vectorization: { num_envs: 1 }                                          # §7.5
 1. **按 `(ckpt) × (resource_class)` 两条轴组织**，别用扁平字段——否则多 ckpt / 两类混跑会立刻不够用。
 2. **`batching` / `vectorization` 现在就预留块**（`enabled: false` / `num_envs: 1`），保证 schema 前向兼容。
 
-> **已实现子集（M1/M2，当前代码，`coordinator.py`）**：`run.output_dir` / `run.timestamped_output` / `run.max_retries`（coordinator 默认注入 `2`：episode 级 infra 失败——`episode_error`/超时——重试，模型失败不重试）、`servers[].gpus`（=**G**，一张卡一个 server）、`pools.cpu_sim.n_sims_per_server`（=**N**）、`benchmark.{suite|suites, task_ids, episodes_per_task, episode_offset, max_steps, suite_overrides}`、`server.external_url`、`timeouts.policy_call_ms`；编排开关 = config 里有 `coordinator` / `servers` / `pools` 任一 key（`run.py` 按 key 存在性分发）。
+> **已实现子集（M1/M2，当前代码，`coordinator.py`）**：`run.output_dir` / `run.timestamped_output` / `run.max_retries`（coordinator 默认注入 `2`：episode 级 infra 失败——`episode_error`/超时——重试，模型失败不重试）、`servers[].gpus`（=**G**，一张卡一个 server）、`pools.cpu_sim.n_sims_per_server`（=**N**）、`benchmark.{suite|suites, task_ids, episodes_per_task, episode_offset, episodes_per_chunk, max_steps, suite_overrides}`、`server.external_url`、`timeouts.policy_call_ms`；编排开关 = config 里有 `coordinator` / `servers` / `pools` 任一 key（`run.py` 按 key 存在性分发）。
+> 其中 **`benchmark.episodes_per_chunk`**（默认 0 = 自动）显式指定“一个 worker 进程连续跑几集”，用于摊薄每集一次 torch/robosuite import；`per_task` 下仍强制一 task 一 shard（忽略该值）。
 > 其中 **`benchmark.suite_overrides: {<suite>: {<key>: <val>}}`** 用于**套件差异化**（如 LIBERO 官方 `max_steps`：`libero_10` 700 / 其余 400），使**一条全局队列跨套件**成立。
 > `resources` / `queue` / `calibrated` / `batching` / `vectorization` 仍是**目标 schema**，尚未接线（M2 的队列用进程内内存实现，非 `work/` 文件队列，见 `02_progress.md` §2.11）。
 
@@ -715,6 +716,13 @@ N_max ≈ K × (10 × t_step) / t_infer
 | 1 | ≈ 5 | 40 | **现状 N=16 是靠 90% 的 µs 级 hit 在"过载"跑** |
 | 4 | ≈ 12 | 96 | |
 | 8 | ≈ 25 | 200 | |
+
+> **2026-10-22 实测校正（chunk 已下沉 + batching 接通）**：
+> - **口径**：历史基线（vanilla / 静态 94.2 / M2 56.2）都是 **`chunk_execute_steps=10`**；N 必须在这个 cadence 下标定。
+> - **第一轮扫描（chunk=16、固定 200 集/点）作废**：固定 workload 只有 200 个 unit，N≥25 时实际并发被 unit 数封顶，`N / mean(episode_wall)` 会高估吞吐（各 N 的 elapsed 实际都是 564–583s）。详见 `02_progress.md` §2.25。
+> - **内存实测**（N=64、200 workers）：峰值 467GB、`MemAvailable` 最低 1040GB、单 sim PSS **~2.0GB**、无 OOM → `N_mem≈75`，N=64 安全。
+> - **第二轮改用 external 模式**：8 server 常驻、每 client 1 集、总并发 = 8N；`chunk=10`、`max_wait_ms=50`，同时采集实际 mean batch size、timing、内存与 CPU。
+> - 上表的 `N_max ≈ K × 10 × t_step / t_infer` 只算 **server 容量**；实际约束是 **CPU/内存 + 吞吐平台**。`N*` 不能跨 cadence 搬运（10 的请求率是 16 的 1.6×）。
 
 > ⚠️ **`N` 是 per-server，CPU/内存是整机共享**：并行在 8 张卡上跑不同 N 时，每个点的 `ΣN` 和背景负载不同，per-server 吞吐/膝点会被污染。正式标定用“8 卡同 N”，或用 `03_testing.md` T-16 测出的 shared-load penalty 修正单卡扫描结果。显存/内存是**硬上限**，不是“效率最高”的判据。
 

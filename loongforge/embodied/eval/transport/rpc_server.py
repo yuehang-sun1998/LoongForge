@@ -59,7 +59,11 @@ class PolicyServer:
             max_size=None,
         ) as server:
             logger.info("PolicyServer listening on ws://%s:%s", self._host, self._port)
-            if self._batching.get("enabled"):
+            # A non-empty ``batching`` block enables batching unless it says
+            # ``enabled: false`` explicitly. Requiring the key silently disabled
+            # batching for configs that only set max_batch_size/max_wait_ms.
+            batching_on = bool(self._batching) and self._batching.get("enabled", True)
+            if batching_on:
                 self._batcher = AsyncBatcher(
                     self._policy,
                     max_batch_size=int(self._batching.get("max_batch_size", 8)),

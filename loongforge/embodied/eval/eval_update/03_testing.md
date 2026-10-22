@@ -132,6 +132,11 @@
   - **agent 决策**：`n_sims_per_server = 16`（87% 上限；再往上 <10% 吞吐换 ~50% sim CPU，不值）；`placement` N/A（CPU-sim）；`policy_call_ms = 60000`。**校验 PASS**（`calibration_config.py`：`60000ms ≥ 16×50.9×2 = 1628ms`）。
   - ⚠️ 用**手动探针**（T1-1 未实现），非正式流程；**GPU-sim 一路未测**。
   - 产物：`report.json` / `report.md` / `env.json` + `parallel_config.yaml` + `validation.json`（在探针目录 `calibration_report/`）。
+- **2026-10-22 复核（client-side chunk 落地后）**：旧的 `N*=16` 是**每步请求 server** 的口径。chunk 下沉后请求量降到 ~1/10（官方 cadence），N 的合理区间显著上移。注意两点：
+  - **cadence 必须与基线一致**：vanilla / 静态 94.2 / M2 56.2 都是 `chunk_execute_steps=10`；`accel_c16/c5` 只是早期调参，不参与对比。
+  - **固定 workload 会封顶并发**：第一轮（chunk=16、固定 200 集/点）在 N≥25 时实际只有 200 个 worker，`N/mean(wall)` 高估吞吐，该轮数据作废。
+  - **第二轮（进行中）**：8 server 常驻 external 模式、每 client 1 集、总并发 = 8N、chunk=10、`max_wait_ms=50`；同时采集 mean batch size / timing / 内存 / CPU。明细见 `02_progress.md` §2.25。
+  - **内存实测**（N=64、200 workers）：峰值 467GB、单 sim PSS ~2.0GB、无 OOM → `N_mem≈75`。
 
 ### T-03 · 一行命令起 1+N（external server + 最小 coordinator）
 
@@ -388,6 +393,9 @@
   - 差异来源：bf16 下批内 GEMM 的归约顺序与 batch=1 不同；fp32 下预期回到 ~1e-6 量级。
   - 生产 batch 路径 E2E：4 个 sim 并发连同一 server，开启 `server.batching` → 51 请求 / 44 batch（mean 1.16、max 2），**无顺序回退**；与顺序回退基线相比 3/4 集 steps 完全一致，1 集 107→106（bf16 数值噪声）。
 - **结论**：✅ **T-06 通过（bf16 口径）**。同 seed 受控实验证明 batching 只引入 bf16 归约噪声（max|d|≈4.9e-3）；per-row seed 机制生效且行独立；`FastWAMPolicy.predict_action` 的 batch 路径与 `GenericPredictActionPolicy.predict_action_batch` 已接通。若要逐位一致，需要用 fp32 跑（非当前 eval 默认）。
+- **2026-10-22 修正（生产 batching 曾静默关闭）**：`rpc_server.py` 只认 `batching.enabled`，而配置只写了 `max_batch_size/max_wait_ms` → **生产评测里的 batcher 从未启动**（此前 ON/OFF 结果一致、stats 恒 0 即为此）。已改为“非空 `batching` 块默认启用，显式 `enabled: false` 才关闭”。
+  - **首次真实数据**（external、chunk=10、`max_wait_ms=50`、N=64、512 集）：**512/512 完成、成功率 97.27%、mean batch=3.29（8415 req / 2561 batch）**、CPU 80%、PSS 峰值 982GB。
+  - 模型层等价性结论不受影响（`batch_probe` 直接调 `infer_action`，不经过 batcher）。
 
 ### T-07 · GPU-sim：sim/server 同卡 vs 异卡
 

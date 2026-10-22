@@ -93,6 +93,11 @@ def plan_libero(config: Dict[str, Any], total_workers: int) -> List[Shard]:
     per_suite = [(suite, _libero_task_ids(config, suite)) for suite in _suites(config)]
     total = max(1, sum(len(tasks) for _, tasks in per_suite) * max(1, episodes_per_task))
     chunk = chunk_size(total, total_workers)
+    # Explicit chunk size: one worker runs several episodes in the same process,
+    # amortising the torch/robosuite import that otherwise dominates short units.
+    explicit_chunk = int(benchmark.get("episodes_per_chunk") or 0)
+    if explicit_chunk > 0:
+        chunk = max(1, explicit_chunk)
     overrides = benchmark.get("suite_overrides") or {}
     shards: List[Shard] = []
     for suite, tasks in per_suite:
