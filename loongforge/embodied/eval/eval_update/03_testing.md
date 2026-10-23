@@ -55,7 +55,7 @@
 | T-14 | chunk 客户端化（请求量 10→1、结果逐位一致） | 3 | CPU-sim | ✅ 通过（80/80 逐集一致；请求量 9.83×） |
 | T-15 | paper §7 的 F1/F2：infra 失败不计完成 + 完整性有独立期望 | 2 | 任一 | ✅ 通过（upstream #303 已合入 metrics/runner 修复；编排层另用 validation.py） |
 | T-16 | 多卡共享 CPU/内存对 N 标定的影响 | 3 | CPU-sim | ✅ 通过（shared-load penalty 0.50；异 N 偏差 -34%） |
-| T-17 | `per_task` 下 episode 级分片（RNG 快照逐集恢复） | 2/M3 | CPU-sim（LIBERO） | ✅ 6 集逐位验证（sim+首帧哈希 6/6）；全量 2000 对齐进行中 |
+| T-17 | `per_task` 下 episode 级分片（RNG 快照逐集恢复） | 2/M3 | CPU-sim（LIBERO） | ✅ 6 集逐位验证 + 全量 2000 对齐（followups 97.15% vs 97.00%；pr240 96.35% vs 96.65%） |
 
 ---
 
@@ -135,7 +135,7 @@
 - **2026-10-22 复核（client-side chunk 落地后）**：旧的 `N*=16` 是**每步请求 server** 的口径。chunk 下沉后请求量降到 ~1/10（官方 cadence），N 的合理区间显著上移。注意两点：
   - **cadence 必须与基线一致**：vanilla / 静态 94.2 / M2 56.2 都是 `chunk_execute_steps=10`；`accel_c16/c5` 只是早期调参，不参与对比。
   - **固定 workload 会封顶并发**：第一轮（chunk=16、固定 200 集/点）在 N≥25 时实际只有 200 个 worker，`N/mean(wall)` 高估吞吐，该轮数据作废。
-  - **第二轮（进行中）**：8 server 常驻 external 模式、每 client 1 集、总并发 = 8N、chunk=10、`max_wait_ms=50`；同时采集 mean batch size / timing / 内存 / CPU。明细见 `02_progress.md` §2.25。
+  - **第二轮（已完成）**：8 server 常驻 external 模式、每 client 1 集、总并发 = 8N、chunk=10、`max_wait_ms=50`；N=16/24/48/80 容量 70.7/77.8/81.8/81.9 eps/min，平台在 N≈48。明细见 `02_progress.md` §2.25。
   - **内存实测**（N=64、200 workers）：峰值 467GB、单 sim PSS ~2.0GB、无 OOM → `N_mem≈75`。
 
 ### T-03 · 一行命令起 1+N（external server + 最小 coordinator）
@@ -369,7 +369,7 @@
   - 单集 wall 随总负载上升（54.6 → 108.6 → 167.8s），PSS 随并发线性增长（37 → 462GB）。
   - 结论与 `01_architecture.md` §7.6 一致：正式标定必须 8 卡同 N，或按 0.50 的 penalty 修正单卡结果。
 
-### T-17 · `per_task` 下 episode 级分片（RNG 快照）【✅ 6 集 GPU 逐位验证通过；全量 2000 对齐进行中】
+### T-17 · `per_task` 下 episode 级分片（RNG 快照）【✅ 6 集逐位验证 + 全量 2000 对齐通过】
 
 - **对应方案**：`01_architecture.md` §5.8.1（预计算每集 reset 前的 `np.random` 状态，分片逐集恢复）。
 - **目的**：证明"打散到任意进程"与"单进程串行"逐集**场景一致**，从而在保留官方 `per_task` 语义的同时恢复 episode 级调度。
@@ -406,8 +406,13 @@
   - 步骤 4 哈希**必须不同**；
   - 步骤 5/6 的重试与 resume 集哈希与串行一致。
 - **附加（性能）**：E=50 时对比 task 级 vs 快照 + episode 级在同一 N 下的 wall-clock，确认并发从 40 提到 128 附近的收益。
-- **数据**：_待填_（需空闲 GPU）
-- **结论**：_待填_
+- **数据（2026-10-22/23）**：
+  - 6 集（libero_10/task0/seed42）：串行 vs 快照恢复的 `sim state` 与 `agentview_image` 首帧哈希 **6/6 全等**；分片（chunk=2）steps 与串行一致（260/242/248/262/259/249）；
+  - retry（kill server）：重试后 6 集 steps 仍全部一致；
+  - resume（kill 后续跑）：6/6 补齐、`validation.ok=true`、steps 全部一致；
+  - 全量 followups：2000/2000、0 重启、97.15% vs 97.00%；
+  - 全量 pr240（官方语义）：2000/2000、0 重启、96.35% vs vanilla 96.65%（-0.30%，噪声内），worker wall 35.5 min。
+- **结论**：✅ 通过。快照可逐位恢复 per_task 场景，支持 episode 级分片；retry/resume 不改变场景；全量分数与参照一致（差异归因于模型代码数值漂移，已用场景哈希证明）。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【✅ 通过】
 
@@ -444,8 +449,8 @@
   2. **异卡**：server 独占卡，sim 在其余卡（"1 server : N 张 sim 卡"）。
 - **指标**：wall-clock、`t_infer`（mean/p50/p95，**看抖动**）、显存峰值、`utilization.memory`、单 sim 的显存。
 - **通过标准**：给出两种放置的对比结论 + 推荐配置；重点确认**同卡是否把 `t_infer` 显著拉长**（若显著 → 改异卡，并回填 `01_architecture.md` §4.4 与风险栏）。
-- **数据**：_待填_（两种放置各一行）
-- **结论**：_待填_
+- **数据**：_未执行_（本机缺少 GPU-sim 环境：RoboTwin 缺 EGL 驱动，SimplerEnv/ManiSkill 依赖未装）
+- **结论**：⏸ 暂缓，待 GPU-sim 环境具备后补测。
 
 ### T-08 · 同 ckpt：大 batch vs 单卡多副本 【✅ 已结案】
 

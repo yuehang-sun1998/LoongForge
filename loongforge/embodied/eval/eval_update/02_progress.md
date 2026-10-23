@@ -355,7 +355,7 @@
   - 生产 batch 路径已接通（`predict_action` batch + `predict_action_batch`），4 sim E2E 无回退。
 - **未做**：真 batch 的 GPU 加速实测（T-13 的 7.3× 需在 batch 路径上复测）；重扫 N；**多卡共享 CPU/内存对 N 标定的影响（T-16）**——N 是 per-server，CPU/内存整机共享，并行异 N 扫描会混淆，正式标定需 8 卡同 N 或加修正。
 
-### 2.24 rebase 后回归验证（2026-10-21，进行中）
+### 2.24 rebase 后回归验证（2026-10-21/23，已完成）
 
 > rebase 到 `upstream/master @ 7847a83` 后，对分支自有功能重新实测；upstream 已合入的 F1–F12 不重测。
 
@@ -376,7 +376,7 @@
 - **历史复现（关键）**：`libero_10/task0` 前 10 集按 **`per_task` + `prefer_controller_ee=true` + `controller_force_update=false`** 重跑，与 2026-10-03 accel_c16 历史记录 **10/10 逐集一致**（success/steps/failure_reason）。此前两轮不一致的原因分别是 `per_episode`（场景不同）和 `controller_force_update=true`（首帧观测不同）。
 - **待做**：8 卡 N 扫描、2000 集全量；`per_episode` 的逐集参照（M2 原始记录未找到，必要时用旧分支小网格自建）。
 
-### 2.25 N 扫描与 chunk 频率口径（2026-10-22，第一轮作废、第二轮进行中）
+### 2.25 N 扫描与 chunk 频率口径（2026-10-22/23，第一轮作废、第二轮完成）
 
 **先钉口径**：所有历史基线——vanilla 官方 harness、静态 8 卡 94.2 min、M2 56.2 min——**都是 `chunk_execute_steps=10`**（config 写 `0` → 默认 10）。`accel_c16/c5`（2026-10-03）只是早期调参，不作为基线，后续全部按 10。
 
@@ -402,7 +402,7 @@
 
 按单 sim 2.0GB 重算上限：`N_mem = 0.8 × 1507 / (8 × 2.0) ≈ 75` → **N=64 安全，75 以上需要监控**。
 
-#### (3) 第二轮：external 模式（N=64 完成，N=32 进行中）
+#### (3) 第二轮：external 模式（N=16/32/48/64/80 完成）
 
 - 8 个 server 常驻（每卡一个），全程只加载一次；
 - `chunk_execute_steps=0` → **10**；`max_wait_ms=50`、`max_batch_size=8`；
@@ -529,7 +529,7 @@ N=48→80 吞吐持平，内存却从 772GB 涨到 1266GB → **平台在 N≈48
 
 ---
 
-### 2.27 补充验证（2026-10-23，进行中）
+### 2.27 补充验证（2026-10-23，已完成）
 
 - **N=48/80 补点**：48 → 81.8 eps/min、80 → 81.9 eps/min（平台），内存 772→1266GB → **N*=48**。
 - **T-14 旧 server-cache 路径**：新增 `benchmark.return_action_chunk`（默认 true；false = 旧 server cache，每步请求），已实现并通过单测。A/B（80 集、batching off、pr240）：**success 翻转 0，79/80 集 steps 一致**（1 集 239 vs 240，约 9.8× 请求差）。同卡串行复测该集：client 与 cache **均为 240 步** → **两条路径等价**，A/B 的 1 步差异来自跨进程/GPU 的数值抖动（pr240 在 batching off 下也不是逐位确定）。
