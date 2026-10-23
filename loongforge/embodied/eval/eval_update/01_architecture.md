@@ -742,6 +742,7 @@ N_max ≈ K × (10 × t_step) / t_infer
 > - **内存实测**（N=64、200 workers）：峰值 467GB、`MemAvailable` 最低 1040GB、单 sim PSS **~2.0GB**、无 OOM → `N_mem≈75`，N=64 安全。
 > - **第二轮改用 external 模式**：8 server 常驻、每 client 1 集、总并发 = 8N；`chunk=10`、`max_wait_ms=50`，同时采集实际 mean batch size、timing、内存与 CPU。
 > - 上表的 `N_max ≈ K × 10 × t_step / t_infer` 只算 **server 容量**；实际约束是 **CPU/内存 + 吞吐平台**。`N*` 不能跨 cadence 搬运（10 的请求率是 16 的 1.6×）。
+> - **T-16 实测（2026-10-23）**：8 卡同 N=16 的 per-server 吞吐 8.84 eps/min，单卡独跑 17.6 → **shared-load penalty ≈ 0.50**；8 卡并行不同 N 时，同 N=16 的 server 只有 5.8（-34%）。**正式标定必须 8 卡同 N**，或用 0.50 修正单卡结果；明细见 `03_testing.md` T-16。
 
 > ⚠️ **`N` 是 per-server，CPU/内存是整机共享**：并行在 8 张卡上跑不同 N 时，每个点的 `ΣN` 和背景负载不同，per-server 吞吐/膝点会被污染。正式标定用“8 卡同 N”，或用 `03_testing.md` T-16 测出的 shared-load penalty 修正单卡扫描结果。显存/内存是**硬上限**，不是“效率最高”的判据。
 

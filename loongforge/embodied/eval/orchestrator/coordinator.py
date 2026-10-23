@@ -155,6 +155,9 @@ def _launch_unit(
     shard_cfg = _shard_config(config, shard, external_url, str(output_dir / f"worker_{index}"))
     cfg_path = tmp / f"unit_{index}.json"
     cfg_path.write_text(json.dumps(shard_cfg), encoding="utf-8")
+    # Resume runs refuse a missing output_dir (typo protection). A resumed plan can
+    # assign a new worker index, so create the directory before the unit starts.
+    (output_dir / f"worker_{index}").mkdir(parents=True, exist_ok=True)
     log = open(output_dir / f"worker_{index}.log", "a", buffering=1)
     return subprocess.Popen(
         [sys.executable, "-m", "loongforge.embodied.eval.orchestrator.run", "--config", str(cfg_path)],

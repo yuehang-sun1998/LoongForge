@@ -498,6 +498,29 @@
 
 ---
 
+### 2.26 T-16 共享 CPU/内存实验（2026-10-23，已完成）
+
+- **方法**：external 模式，7 组串行（避免互相污染），chunk=10、wait=50、max batch=8；每组 1 集/client。
+- **结果**：
+
+  | 组 | G | N | 总吞吐 | per-server | mean ep | CPU | PSS |
+  |---|---|---|---|---|---|---|---|
+  | 单卡 | 1 | 16 | 17.6 | **17.6** | 54.6s | 9% | 37GB |
+  | 单卡 | 1 | 24 | 27.4 | 27.4 | 52.5s | 12% | 52GB |
+  | 2 卡 | 2 | 16 | 36.2 | 18.1 | 53.0s | 16% | 73GB |
+  | 4 卡 | 4 | 16 | 58.4 | 14.6 | 65.8s | 31% | 144GB |
+  | 8 卡同 N | 8 | 16 | 70.7 | **8.84** | 108.6s | 51% | 286GB |
+  | 8 卡同 N | 8 | 24 | 77.8 | 9.72 | 148.1s | 59% | 409GB |
+  | 8 卡异 N | 8 | 12–48 | 78.7 | 4.3–16.1 | 167.8s | 61% | 462GB |
+
+- **结论**：
+  - **shared-load penalty ≈ 0.50**（8 卡同 N 的 per-server 吞吐只有单卡一半）→ 单卡标定不能外推，必须 8 卡同 N；
+  - 异 N 并行会让同 N 的点偏低（N=16 的 server 5.8 vs 均匀 8.84，**-34%**），验证了“正式标定必须同 N”；
+  - N 从 16→24 在 8 卡下只 +10%（单卡 +56%），共享资源吃掉大部分收益；
+  - 内存/CPU 随总负载近似线性（PSS 37→462GB，CPU 9%→61%）。
+
+---
+
 ## 3. 待办（按依赖排序）
 
 > 每条格式：目标 / 改动 / 验收 / 产出。
@@ -604,6 +627,7 @@
   - 单测：`test_scene_snapshots.py` 3 例 + planner 2 例；全量 **138 passed / 1 skipped**。
 - **GPU 验证（2026-10-22）**：libero_10/task0/seed42 6 集，串行 vs 快照恢复的 `sim state` 与 `agentview_image` 首帧哈希 **6/6 全等**，steps/success 也 6/6 一致；分片（chunk=2）结果与串行一致。
 - **全量 2000 对齐（2026-10-22，followups ckpt、per_task + 快照、batching off、N=16）**：2000/2000、`validation.ok=true`、**server_restarts=0**、repair=0、infra_failed=3；成功率 **97.15%**，参照 followups 静态 **97.00%**（libero_10 94.2 vs 94.2、goal 97.2 vs 97.2、spatial 97.8 vs 97.0、object 99.4 vs 99.6）。逐集 steps 一致率 **91.3%**，差异集中在 libero_10 task3/8/9 与 spatial task4，且均为“前几集一致、之后分叉”。**已证明是模型代码数值漂移**：对 task3、spatial task4 的前 10 集，旧 clone `d1b8c9f` 与当前代码的 `sim state` + 首帧哈希 **10/10 完全相同**，而 steps 已在 ep2 / ep9 分叉 → 场景一致、策略数值不同，与快照无关。worker wall **63.1 min**（batching off）。
+- **retry / resume（2026-10-23）**：kill server 重试、kill 后 resume 均通过，6 集 steps 与串行基线完全一致；期间修了 coordinator 在 resume 时未创建新 worker 目录的问题（`_run_unit` 现在先 mkdir）。
 - **未做**：coordinator 尚未自动生成快照（需先跑 CLI）。
 - **验证**：`03_testing.md` T-17（串行 vs 分片逐集首帧哈希、错集反证、retry/resume）。
 
