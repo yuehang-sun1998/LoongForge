@@ -319,6 +319,7 @@
   1. **正确性**：同一分片跑两遍（改前/改后），**逐集 success 与 steps 完全一致**（同一份 chunk、同一顺序 → 应逐位一致）。
   2. **请求量**：server 侧统计的 `predict_action` 次数降到 **~1/10**（真推理次数不变）。
   3. **收益**：端到端 RPC 时间大幅下降（但**总 wall 预期基本不变**——省下的 RPC 相对仿真很小）。
+- **2026-10-23 补充**：新增 `benchmark.return_action_chunk`（true=客户端 chunk，false=旧 server cache）。80 集、batching off、pr240 的 A/B：**success 0 翻转、79/80 集 steps 一致**（1 集差 1 步），请求量 **9.76 vs 1.00 步/请求（~9.8×）**。同一集在同卡串行复测中两条路径**均为 240 步** → 路径等价；A/B 的 1 步差异是跨进程/GPU 的数值抖动。
 - **数据（2026-10-20，真实 FastWAM + LIBERO）**：
   - 正确性：`libero_10/task0` 10 集，与 server-cache 旧 run 的 **success / steps 10/10 一致**；另随机抽 `goal/spatial/object` 共 7 个 task × 10 集，**70/70 一致**（合计 **80/80**）。
   - 请求量：`task0` 10 集共 **302 次推理请求 / 2969 个 env step = 9.83×**；逐集符合 `ceil(steps/10)`（如 700→70、232→24）。
@@ -386,6 +387,7 @@
   - planner 在配置快照后允许 `per_task` 的 episode 级切片；
   - CPU 单测：`test_scene_snapshots.py` 3 例 + planner 2 例（全量 138 passed / 1 skipped）。
 - **全量对齐（2026-10-22）**：2000/2000、validation ok、0 重启；成功率 97.15% vs 参照 97.00%；逐集 steps 一致 91.3%，差异集中在 4 个敏感 task（前几集一致后分叉）。已用场景哈希证明是模型代码数值漂移：task3/spatial task4 前 10 集新旧代码的 sim state + 首帧哈希 10/10 相同，而 steps 已在 ep2/ep9 分叉。
+- **pr240 官方语义全量（2026-10-23）**：per_task + 快照、2000 集、N=64、batching on → 96.35% vs vanilla 96.65%（-0.30%，噪声内），0 重启/0 修复，worker wall 35.5 min（vanilla 173.7 min）。
 - **retry / resume（2026-10-23，task0、6 集、chunk=2、per_task + 快照）**：
   - retry：kill server 后受影响 unit 重试，6 集 steps 仍为 `260,242,248,262,259,249`；
   - resume：跑到 2 集后 kill，`run.resume=true` 续跑，最终 6/6、`validation.ok=true`、steps 全部匹配。

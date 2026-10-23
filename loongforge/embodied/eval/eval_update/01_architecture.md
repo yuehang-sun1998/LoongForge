@@ -320,8 +320,9 @@ vectorization: { num_envs: 1 }                                          # §7.5
 1. **按 `(ckpt) × (resource_class)` 两条轴组织**，别用扁平字段——否则多 ckpt / 两类混跑会立刻不够用。
 2. **`batching` / `vectorization` 现在就预留块**（`enabled: false` / `num_envs: 1`），保证 schema 前向兼容。
 
-> **已实现子集（M1/M2，当前代码，`coordinator.py`）**：`run.output_dir` / `run.timestamped_output` / `run.max_retries`（coordinator 默认注入 `2`：episode 级 infra 失败——`episode_error`/超时——重试，模型失败不重试）、`servers[].gpus`（=**G**，一张卡一个 server）、`pools.cpu_sim.n_sims_per_server`（=**N**）、`benchmark.{suite|suites, task_ids, episodes_per_task, episode_offset, episodes_per_chunk, max_steps, suite_overrides}`、`server.external_url`、`timeouts.policy_call_ms`；编排开关 = config 里有 `coordinator` / `servers` / `pools` 任一 key（`run.py` 按 key 存在性分发）。
-> 其中 **`benchmark.episodes_per_chunk`**（默认 0 = 自动）显式指定“一个 worker 进程连续跑几集”，用于摊薄每集一次 torch/robosuite import；`per_task` 下仍强制一 task 一 shard（忽略该值）。
+> **已实现子集（M1/M2，当前代码，`coordinator.py`）**：`run.output_dir` / `run.timestamped_output` / `run.max_retries`（coordinator 默认注入 `2`：episode 级 infra 失败——`episode_error`/超时——重试，模型失败不重试）、`servers[].gpus`（=**G**，一张卡一个 server）、`pools.cpu_sim.n_sims_per_server`（=**N**）、`benchmark.{suite|suites, task_ids, episodes_per_task, episode_offset, episodes_per_chunk, max_steps, suite_overrides, return_action_chunk}`、`server.external_url`、`timeouts.policy_call_ms`；编排开关 = config 里有 `coordinator` / `servers` / `pools` 任一 key（`run.py` 按 key 存在性分发）。
+> 其中 **`benchmark.return_action_chunk`**（默认 true）false 时走旧 server-side chunk cache（每步请求），用于 T-14 的旧路径 A/B。
+> **`benchmark.episodes_per_chunk`**（默认 0 = 自动）显式指定“一个 worker 进程连续跑几集”，用于摊薄每集一次 torch/robosuite import；`per_task` 下仍强制一 task 一 shard（忽略该值）。
 > 其中 **`benchmark.suite_overrides: {<suite>: {<key>: <val>}}`** 用于**套件差异化**（如 LIBERO 官方 `max_steps`：`libero_10` 700 / 其余 400），使**一条全局队列跨套件**成立。
 > `resources` / `queue` / `calibrated` / `batching` / `vectorization` 仍是**目标 schema**，尚未接线（M2 的队列用进程内内存实现，非 `work/` 文件队列，见 `02_progress.md` §2.11）。
 

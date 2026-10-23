@@ -176,6 +176,8 @@ CONFIG_MAPPING = {
     "benchmark.env_seed_mode": "env_seed_mode",
     # per_task + episode-level sharding: restore each episode's pre-reset RNG state.
     "benchmark.scene_snapshot_dir": "scene_snapshot_dir",
+    # False -> legacy server-side chunk cache (one request per env step).
+    "benchmark.return_action_chunk": "return_action_chunk",
     "benchmark.max_steps": "max_steps",
     "benchmark.continuous_gripper": "continuous_gripper",
     # False -> proprio reads obs['robot0_eef_pos']/quat (official FastWAM

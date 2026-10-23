@@ -409,7 +409,7 @@ def run_episode(
                                 # capability) must be called every env step; others
                                 # hand the whole chunk to the client.
                                 disable_action_cache=disable_action_cache,
-                                return_action_chunk=True,
+                                return_action_chunk=bool(getattr(args, "return_action_chunk", True)),
                             )
                         )
                     e2e_latency_ms = (time.perf_counter() - request_start) * 1000.0
@@ -758,6 +758,15 @@ def build_argparser() -> argparse.ArgumentParser:
             "(`seed + task_id*1000 + episode_idx`). "
             "per_task: one env per task seeded with --seed and reused across trials "
             "(official FastWAM eval semantics; see docs §4.8)."
+        ),
+    )
+    parser.add_argument(
+        "--return-action-chunk",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "True (default): the client owns the action chunk (T-14). "
+            "False: legacy server-side chunk cache -- one request per env step."
         ),
     )
     parser.add_argument(

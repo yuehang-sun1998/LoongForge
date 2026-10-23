@@ -425,8 +425,16 @@
 
 \* N=16 是在 batching 修复前跑的（batcher 未启动），只作参考。
 
-- N=32 → N=64：容量 +15.7%，CPU 70%→80%，内存 PSS 526→982GB；**收益递减但仍为正**。
-- 膝点预计在 **64–80** 之间；N=64 已接近 CPU/内存边界，推荐 **N*=64**。
+- N=32 → N=64：容量 +15.7%，CPU 70%→80%，内存 PSS 526→982GB；**收益递减**（后续 N=48/80 补充扫描确认平台在 48）。
+- **补充扫描（N=48/80，pr240、chunk=10、batching on）**：
+
+| N | 整机容量 | CPU | PSS | MemAvailable 最低 |
+|---|---|---|---|---|
+| 24 | 77.8 | 59% | 409GB | 1060GB |
+| 48 | **81.8** | 74% | 772GB | 690GB |
+| 80 | **81.9** | 85% | 1266GB | **197GB** |
+
+N=48→80 吞吐持平，内存却从 772GB 涨到 1266GB → **平台在 N≈48，推荐 N*=48**（与 N=64 吞吐相同但更省资源）。
 - ~~全量 2000 集外推：`2000/90.6 ≈ 22 min` + 启动 ≈ 28–31 min → 5.5–6.5×~~ **（已由实测推翻，见下）**。
 
 **2000 集全量实测（pr240 fp32master，chunk=10，N=64，batching on）**：
@@ -518,6 +526,14 @@
   - 异 N 并行会让同 N 的点偏低（N=16 的 server 5.8 vs 均匀 8.84，**-34%**），验证了“正式标定必须同 N”；
   - N 从 16→24 在 8 卡下只 +10%（单卡 +56%），共享资源吃掉大部分收益；
   - 内存/CPU 随总负载近似线性（PSS 37→462GB，CPU 9%→61%）。
+
+---
+
+### 2.27 补充验证（2026-10-23，进行中）
+
+- **N=48/80 补点**：48 → 81.8 eps/min、80 → 81.9 eps/min（平台），内存 772→1266GB → **N*=48**。
+- **T-14 旧 server-cache 路径**：新增 `benchmark.return_action_chunk`（默认 true；false = 旧 server cache，每步请求），已实现并通过单测。A/B（80 集、batching off、pr240）：**success 翻转 0，79/80 集 steps 一致**（1 集 239 vs 240，约 9.8× 请求差）。同卡串行复测该集：client 与 cache **均为 240 步** → **两条路径等价**，A/B 的 1 步差异来自跨进程/GPU 的数值抖动（pr240 在 batching off 下也不是逐位确定）。
+- **per_episode 新旧代码对照**：旧 clone `d1b8c9f` vs 当前代码，task0 10 集、per_episode、同 ckpt/协议 → **10/10 steps 完全一致**（含 1 个 700 步失败集），说明 rebase 未改变 per_episode 行为。旧 clone 首次运行在 ep1 出现 `ConnectionClosedError`（server 边界断开且无重试），加 `max_retries=2` 后完成，当前代码健壮性更好。
 
 ---
 
@@ -627,6 +643,7 @@
   - 单测：`test_scene_snapshots.py` 3 例 + planner 2 例；全量 **138 passed / 1 skipped**。
 - **GPU 验证（2026-10-22）**：libero_10/task0/seed42 6 集，串行 vs 快照恢复的 `sim state` 与 `agentview_image` 首帧哈希 **6/6 全等**，steps/success 也 6/6 一致；分片（chunk=2）结果与串行一致。
 - **全量 2000 对齐（2026-10-22，followups ckpt、per_task + 快照、batching off、N=16）**：2000/2000、`validation.ok=true`、**server_restarts=0**、repair=0、infra_failed=3；成功率 **97.15%**，参照 followups 静态 **97.00%**（libero_10 94.2 vs 94.2、goal 97.2 vs 97.2、spatial 97.8 vs 97.0、object 99.4 vs 99.6）。逐集 steps 一致率 **91.3%**，差异集中在 libero_10 task3/8/9 与 spatial task4，且均为“前几集一致、之后分叉”。**已证明是模型代码数值漂移**：对 task3、spatial task4 的前 10 集，旧 clone `d1b8c9f` 与当前代码的 `sim state` + 首帧哈希 **10/10 完全相同**，而 steps 已在 ep2 / ep9 分叉 → 场景一致、策略数值不同，与快照无关。worker wall **63.1 min**（batching off）。
+- **pr240 官方语义全量（2026-10-23，per_task + 快照、chunk=10、N=64、batching on）**：2000/2000、0 重启、0 修复、infra=0；成功率 **96.35%**，vanilla 参照 **96.65%**（差 -0.30%，在 batching ±0.8% 抖动内）；逐 suite：10 92.80 vs 93.20、spatial 97.00 vs 97.60、object 98.40 vs 99.40、goal 97.20 vs 96.40。worker wall **35.5 min**（vs vanilla 173.7 min，约 **4.9×**）。
 - **retry / resume（2026-10-23）**：kill server 重试、kill 后 resume 均通过，6 集 steps 与串行基线完全一致；期间修了 coordinator 在 resume 时未创建新 worker 目录的问题（`_run_unit` 现在先 mkdir）。
 - **未做**：coordinator 尚未自动生成快照（需先跑 CLI）。
 - **验证**：`03_testing.md` T-17（串行 vs 分片逐集首帧哈希、错集反证、retry/resume）。
@@ -653,7 +670,7 @@
 11. **高并发 client 握手会丢集**：512 个 client 同时连接时，server 在 30s `open_timeout` 内可能完不成 websocket upgrade；旧客户端不重试 → 进程退出、无 `results.jsonl`（N=64 时丢了 307/512）。已让 `PolicyClient` 在 connect 预算内重试，并在驱动里按 10ms 错峰启动；单 server 同时握手建议 ≤32。
 12. **端口不要落在临时端口范围**：本机 `ip_local_port_range = 10000–61000`，选 14560/16000/22600/24600 等会被 client 源端口或 TIME_WAIT 占用 → server bind 失败。评估用 **6000–6140**，并**用真实 `bind` 而不是 `connect` 探测空闲**。
 13. **`batching.enabled` 必须显式或非空块**：旧实现只认 `enabled: true`，只写 `max_batch_size/max_wait_ms` 时 batcher **不会启动**（历史“ON/OFF 没区别”即由此而来）。现改为非空块默认启用，显式 `enabled: false` 才关闭；跑完用 server `stats` 的 `mean_batch_size` 确认真的生效。
-14. **batching 会引入 run-to-run 非确定性**：batch 组成随请求到达时序变化，bf16 batched-GEMM 归约顺序随之改变 → 同一配置两次 N=64 有 325/512 集步数抖动（±1–3 步）、4 集成功翻转（约 0.8%）。关闭 batching 时逐集完全确定（同配置重复、跨并发均为 0 差异）。需要严格复现的实验必须关闭 batching 或改用 fp32。
+14. **batching 会引入 run-to-run 非确定性**：batch 组成随请求到达时序变化，bf16 batched-GEMM 归约顺序随之改变 → 同一配置两次 N=64 有 325/512 集步数抖动（±1–3 步）、4 集成功翻转（约 0.8%）。关闭 batching 在 **accel ckpt** 上逐集完全确定（同配置重复、跨并发均 0 差异）；但 **pr240** 在 batching off 下仍观察到 1 集 1 步的跨进程差异（GPU kernel 非确定归约）。要严格逐位复现，优先关闭 batching，必要时再固定 GPU/改用 fp32。
 15. **无 batching 时推理会阻塞 event loop → watchdog 误杀**：`_route_message` 同步调用 `predict_action`，N=16 时 ping 排在十几次推理后超过 15s，watchdog 判 hung 并重启（实测单次 2000 集触发 24 次重启、27 集缺失）。已把无 batching 的推理也放进 `run_in_executor`，让 loop 能及时回 ping；单测 `test_ping_is_responsive_while_inference_runs` 覆盖。
 
 ---
