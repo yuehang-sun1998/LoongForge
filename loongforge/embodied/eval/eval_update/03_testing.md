@@ -56,6 +56,8 @@
 | T-15 | paper §7 的 F1/F2：infra 失败不计完成 + 完整性有独立期望 | 2 | 任一 | ✅ 通过（upstream #303 已合入 metrics/runner 修复；编排层另用 validation.py） |
 | T-16 | 多卡共享 CPU/内存对 N 标定的影响 | 3 | CPU-sim | ✅ 通过（shared-load penalty 0.50；异 N 偏差 -34%） |
 | T-17 | `per_task` 下 episode 级分片（RNG 快照逐集恢复） | 2/M3 | CPU-sim（LIBERO） | ✅ 6 集逐位验证 + 全量 2000 对齐（followups 97.15% vs 97.00%；pr240 96.35% vs 96.65%） |
+| T-18 | chunk 消费逻辑下沉到 runner 公共层 | 3 | CPU 单测 + CPU-sim（LIBERO） | ✅ 通过（5 条新单测；全量 2000：96.65% vs 96.35%，无回退） |
+| T-19 | 运行间可复现性（batching / 跨进程数值抖动） | 3 | CPU-sim（LIBERO） | ✅ 已定性：即使 batching off，两次相同 run 也只有 93.8% 集 steps 相同 |
 
 ---
 
@@ -413,6 +415,43 @@
   - 全量 followups：2000/2000、0 重启、97.15% vs 97.00%；
   - 全量 pr240（官方语义）：2000/2000、0 重启、96.35% vs vanilla 96.65%（-0.30%，噪声内），worker wall 35.5 min。
 - **结论**：✅ 通过。快照可逐位恢复 per_task 场景，支持 episode 级分片；retry/resume 不改变场景；全量分数与参照一致（差异归因于模型代码数值漂移，已用场景哈希证明）。
+
+### T-18 · chunk 消费逻辑下沉到 runner 公共层 【✅ 通过】
+
+- **对应方案**：`01_architecture.md` §7.6 (2) 的 `EpisodePolicyStepper`。
+- **目的**：让 T-14 的"持有 chunk、空才请求"不再只属于 LIBERO，同时保证未开启时请求节奏与改造前完全一致。
+- **前置**：`_common.EpisodePolicyStepper`；四个 in-process runner 接入。
+- **通过标准**：
+  1. N 步内请求数 = `ceil(N / chunk_execute_steps)`；
+  2. 客户端 chunk 路径执行的动作序列与旧 server-cache 路径逐位相同；
+  3. `disable_action_cache` 每步请求且只用第一个动作；
+  4. ensemble（`chunk_steps=1`）每步请求但仍能拿到整段 `raw_actions`；
+  5. `begin_episode` 丢弃上一集残留 chunk。
+- **数据（2026-10-26）**：
+  - CPU 单测：`test_chunk_consumer.py` 新增 5 条，覆盖上述 5 条通过标准；全套 eval 单测 **144 passed / 1 skipped**。
+  - LIBERO 单集冒烟（pr240 fp32、per_episode、task0 episode 12、同一 ckpt/协议，client 与 cache 分别在 GPU 0/1 并行）：两条路径均 **steps=240、success=1**，且与改造前参照 run 完全一致（`ep12_client` 240/1/24 次请求，`ep12_cache` 240/1/240 次请求）。请求数验证了 chunk 路径 **240→24**。
+  - **全量 2000 集**（pr240、`per_task` + RNG 快照、8 卡、N=64、batching on、`episodes_per_chunk=4`）：**1933/2000 = 96.65%** vs 参照 run **1927/2000 = 96.35%**（+0.3pt）；逐 suite：libero_10 +3、goal +3、object 0、spatial 0；success 翻转 24 上 / 18 下；validation `ok=true`（2000/2000、0 缺失/重复）、server 重启 0。中途在 568 集时会话中断，`run.resume=true` 续跑补齐。
+  - **速度（同配置、512 并发）**：单集中位耗时 249.7s → **248.2s**、均值 323.6s → 302.7s；`steps/request` 9.74 → 9.74。没有可归因于本次改动的速度变化（wall 不可直接比：新 run 分两段、两次模型加载）。
+- **未覆盖**：CALVIN / SimplerEnv / ManiSkill 无可用仿真环境，只做静态检查与单测；RoboTwin 走官方 evaluator bridge，未接入。
+- **结论**：✅ 通过。全量成功率与改造前一致（+0.3pt，逐 suite 无回退）；逐集 steps 只有 49.4% 相同，属于运行间数值抖动（见 T-19），不作为回归判据。
+
+### T-19 · 运行间可复现性（batching / 跨进程数值抖动）
+
+- **目的**：给"改完代码跑一遍，和上次对比"定一个正确的验收口径。
+- **数据（2026-10-26，同一 ckpt/协议，逐集 key 对齐）**：
+
+  | 对比 | 配置差异 | 共同集 | steps 相同 | success |
+  |---|---|---|---|---|
+  | `off16` vs `off16b` | **仅 output_dir 不同**（batching off，N=16） | 1973 | **93.8%**（1851） | 1917 vs 1918，11 翻转 |
+  | `batch_on` vs `batch_off` | 仅 batching（80 集，N=8） | 80 | 100% | 0 翻转 |
+  | `full2000` vs `chunk4` | 仅 `episodes_per_chunk`（50 vs 4） | 2000 | 46.3% | 1937 vs 1936 |
+  | stepper 前后全量 | 代码改 chunk 消费层（batching on，512 并发） | 2000 | 49.4% | 1927 vs 1933（+6） |
+
+- **结论**：
+  1. **逐位复现不是这套 pipeline 的属性**——即使 batching 关闭，两次完全相同的 run 也有 ~6% 的集分叉（跨进程/GPU 数值抖动）。
+  2. batching 叠加第二层抖动：batch 组成由请求到达时序决定，bf16 归约顺序随之变化；并发越高越明显（80 集小规模 A/B 恰好 100%，不能外推）。
+  3. 代码改动的验收看 **success rate / 逐 suite 成功率**（± 运行间噪声）；逐集 steps 只作参考。本次 +0.3pt、逐 suite 无回退。
+- **若要尽量收敛**：`batching.enabled=false` + 固定 shard→GPU 映射 + 同卡重跑；即便如此也只能到 ~94%，做不到 100%。
 
 ### T-06 · 数值一致性（batch>1 vs batch=1） 【✅ 通过】
 

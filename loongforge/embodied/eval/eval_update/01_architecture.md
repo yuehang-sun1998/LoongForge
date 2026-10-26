@@ -321,7 +321,7 @@ vectorization: { num_envs: 1 }                                          # §7.5
 2. **`batching` / `vectorization` 现在就预留块**（`enabled: false` / `num_envs: 1`），保证 schema 前向兼容。
 
 > **已实现子集（M1/M2，当前代码，`coordinator.py`）**：`run.output_dir` / `run.timestamped_output` / `run.max_retries`（coordinator 默认注入 `2`：episode 级 infra 失败——`episode_error`/超时——重试，模型失败不重试）、`servers[].gpus`（=**G**，一张卡一个 server）、`pools.cpu_sim.n_sims_per_server`（=**N**）、`benchmark.{suite|suites, task_ids, episodes_per_task, episode_offset, episodes_per_chunk, max_steps, suite_overrides, return_action_chunk}`、`server.external_url`、`timeouts.policy_call_ms`；编排开关 = config 里有 `coordinator` / `servers` / `pools` 任一 key（`run.py` 按 key 存在性分发）。
-> 其中 **`benchmark.return_action_chunk`**（默认 true）false 时走旧 server-side chunk cache（每步请求），用于 T-14 的旧路径 A/B。
+> 其中 **`benchmark.return_action_chunk`**（LIBERO 默认 true；CALVIN / SimplerEnv / ManiSkill 需显式开启）false 时走旧 server-side chunk cache（每步请求），用于 T-14 的旧路径 A/B。执行细节见 §7.6 (2) 的 `EpisodePolicyStepper`。
 > **`benchmark.episodes_per_chunk`**（默认 0 = 自动）显式指定“一个 worker 进程连续跑几集”，用于摊薄每集一次 torch/robosuite import；`per_task` 下仍强制一 task 一 shard（忽略该值）。
 > 其中 **`benchmark.suite_overrides: {<suite>: {<key>: <val>}}`** 用于**套件差异化**（如 LIBERO 官方 `max_steps`：`libero_10` 700 / 其余 400），使**一条全局队列跨套件**成立。
 > `resources` / `queue` / `calibrated` / `batching` / `vectorization` 仍是**目标 schema**，尚未接线（M2 的队列用进程内内存实现，非 `work/` 文件队列，见 `02_progress.md` §2.11）。
@@ -708,6 +708,12 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 - **收益**：**请求量 10 → 1**、图像传输 10 → 1、server 忙占比从尖峰降到 ~10%；**结果应逐位一致**（同一份 chunk、同一顺序），可直接与现有全量结果比对。
 - **注意**：这一步**本身几乎不加速**（省的 RPC 相对 2s/10步 很小），它的价值是 **消掉 90% 的无效请求**，为 batcher 铺路。
 
+**落地（2026-10-26）**：把"何时请求 / 如何缓冲 / 如何切动作"收敛到 `_common.EpisodePolicyStepper`，四个 in-process runner（LIBERO / CALVIN / SimplerEnv / ManiSkill）都走同一个组件：
+
+- runner 只提供 `request_fn(request_step) -> (response["data"], e2e_ms)`（内含 adapter / payload / RPC / 超时）；stepper 负责 chunk 游标、`disable_action_cache`、`payload_builder.update_from_response` 和 trace 用的 `request_step` / `request_id` / latency。
+- `return_action_chunk=False` 时 server 每次只回 1 行，chunk 每步耗尽 → 请求节奏与旧的逐 step 循环完全一致，所以 CALVIN / SimplerEnv / ManiSkill 默认仍走旧路径，新增 `--return-action-chunk` 显式开启；LIBERO 默认开启（已验证）。
+- **两类必须 opt-out**：`disable_action_cache` 模型（DreamZero / LingBot-VA，闭环 chunk）由 stepper 自动每步请求、只用第一个动作；action ensemble（SimplerEnv `--action-ensemble`）需要每步新预测，传 `chunk_steps=1`，但保留 `PolicyStep.raw_actions` 供 ensemble 使用整段。
+
 #### (3) batching：队列里只剩真推理
 
 **chunk 化之后，batcher 的队列天然只装真推理**（hit 请求根本不出 sim 进程），无需任何特判。
@@ -723,6 +729,8 @@ env.json       # 资源事实 + 硬约束：核数、每 sim 核/内存、卡数
 实测代入（`t_infer≈0.65s`、`t_step≈0.2s`、`N=16`）→ **K ≈ 5**（对照 T-13：batch 4 = 3.9×、batch 8 = 7.3× → **实收 ~4×**）。
 
 **正反馈**：batching 让推理变快 → sim 不再等 → 需求率上升 → 队列保持饱和 → batch 维持（不会自己饿死）。
+
+> **batching 不提供逐位可复现性**：batch 里装哪几个请求由到达时序决定，bf16 归约顺序随组成变化。实测配置相同的两次全量（batching 均开启、仅分片粒度不同）只有 **46.3%** 的集 steps 相同；即使 **batching 关闭**，两次完全相同的 run 也只有 **93.8%**（`off16` vs `off16b`）。所以验收看 **success rate**，不看逐集 steps。数据与结论见 `03_testing.md` T-19。
 
 #### (4) 提 N：两者做完后的真正杠杆
 

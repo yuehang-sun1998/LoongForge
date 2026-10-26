@@ -537,6 +537,31 @@ N=48→80 吞吐持平，内存却从 772GB 涨到 1266GB → **平台在 N≈48
 
 ---
 
+### 2.28 chunk 消费逻辑下沉到 runner 公共层（2026-10-26，单测 + 全量 2000 已过）
+
+- **动机**：T-14 的"持有 chunk、空才请求"原本只在 LIBERO 里实现（`ChunkConsumer` + 手写游标），其余 runner 每步都发完整 observation，`benchmark.return_action_chunk` 对它们等于无效。
+- **改动**：`_common.EpisodePolicyStepper` 统一"何时请求 / 如何缓冲 / 如何切动作 / 何时回填 payload builder"；runner 只提供 `request_fn(request_step) -> (data, e2e_ms)`。
+  - LIBERO 改为使用 stepper（行为不变，`inference_requests` 改读 `stepper.requests`）。
+  - CALVIN / SimplerEnv / ManiSkill 接入 stepper，并新增 `--return-action-chunk`；默认 false → server 每步只回 1 行 → 请求节奏与改造前完全一致。
+  - 三个新接入的 runner 同时把 `PayloadBuilder.disable_action_cache`（DreamZero / LingBot-VA 等闭环 chunk 模型）并入开关：这类模型即使没开 chunk 也必须每步真推理（旧行为会被 server cache 回放旧动作）。
+  - SimplerEnv 的 action ensemble 传 `chunk_steps=1` 强制每步新预测，`PolicyStep.raw_actions` 保留整段供 ensemble 使用。
+- **验证**：
+  - `test_chunk_consumer.py` 新增 5 条（请求数 = ceil(steps/N)、与旧 server-cache 路径动作逐位一致、`disable_action_cache` 每步请求、ensemble opt-out、`begin_episode` 清 chunk）；全套 eval 单测 **144 passed / 1 skipped**，见 `03_testing.md` T-18。
+  - LIBERO 单集冒烟（pr240 fp32、per_episode、task0 ep12）：client 与 cache 两条路径均 **steps=240 / success=1**，与改造前参照完全一致；请求数 **24 vs 240**。
+  - **全量 2000 集**（pr240、per_task + 快照、8 卡、N=64、batching on）：**1933/2000 = 96.65%** vs 参照 **1927/2000 = 96.35%**（+0.3pt）；逐 suite：libero_10 +3、goal +3、object 0、spatial 0；success 翻转 24 上 / 18 下；`validation.ok=true`、0 重启。中途 568 集时会话中断，`run.resume=true` 续跑补齐。
+  - **速度**：同为 512 并发，单集耗时中位数 **249.7s → 248.2s**、均值 323.6s → 302.7s，`steps/request` 9.74 vs 9.74 → **没有可归因于本次改动的速度差异**。端到端 wall 不可直接比（新 run 分两段、两次模型加载）：旧一次跑完 2000 集 2129s，续跑段 1432 集 1657s（含加载，且只有 358 个 unit 在跑）。
+- **未覆盖**：CALVIN / SimplerEnv / ManiSkill 无可用仿真环境，只做了单测与静态检查；RoboTwin 走官方 evaluator 的 bridge（`bridges/robotwin_policy.py`），未接入，仍是每步请求。
+
+---
+
+### 2.29 运行间可复现性（2026-10-26）
+
+- **结论**：这套 pipeline **不保证逐位复现**。两次完全相同的 run（batching off、仅 output_dir 不同，N=16、1973 集）只有 **93.8%** 的集 steps 相同，success 1917 vs 1918（11 个翻转）→ 跨进程/GPU 的 bf16 数值抖动本身就存在。
+- **batching 再叠加一层**：batch 组成由请求到达时序决定，bf16 归约顺序随组成变化。配置相同的两次全量（仅 `episodes_per_chunk` 不同）steps 只有 46.3% 相同；80 集小规模 batch on/off A/B 恰好 100%，不能外推。
+- **验收口径**：代码改动看 **success rate / 逐 suite 成功率**（± 运行间噪声），逐集 steps 只作参考。数据见 `03_testing.md` T-19。
+
+---
+
 ## 3. 待办（按依赖排序）
 
 > 每条格式：目标 / 改动 / 验收 / 产出。

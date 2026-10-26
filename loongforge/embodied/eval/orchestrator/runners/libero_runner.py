@@ -290,7 +290,14 @@ def run_episode(
     e2e_latencies: List[Optional[float]] = []
     episode_start = time.time()
     env = None
-    chunk_consumer = _common.ChunkConsumer()
+    stepper = _common.EpisodePolicyStepper(
+        chunk_steps=int(client.metadata.get("chunk_execute_steps") or 0),
+        return_action_chunk=bool(getattr(args, "return_action_chunk", True)),
+        # Closed-loop-within-chunk models (PayloadBuilder capability) must be
+        # called every env step; others hand the whole chunk to the client.
+        disable_action_cache=bool(getattr(payload_builder, "disable_action_cache", False)),
+        payload_builder=payload_builder,
+    )
 
     try:
         with alarm_timeout(args.per_episode_timeout_sec, EpisodeTimeoutError):
@@ -320,10 +327,7 @@ def run_episode(
             client.reset(episode_id)
             payload_builder.reset(episode_id)
             action_decoder.reset()
-            chunk_consumer.reset()
-            chunk_steps = int(client.metadata.get("chunk_execute_steps") or 0)
-            request_step = 0
-            last_request_id = None
+            stepper.begin_episode()
             env.reset()
             obs = env.set_init_state(initial_state)
             # set_init_state teleports the sim, but the robosuite OSC caches
@@ -374,12 +378,8 @@ def run_episode(
 
                 episode_step = raw_step - args.num_steps_wait
                 controller = env.env.robots[0].controller
-                disable_action_cache = bool(getattr(payload_builder, "disable_action_cache", False))
-                issued_request = chunk_consumer.needs_request(disable_action_cache)
-                data: Dict[str, Any] = {}
-                inference_latency_ms = None
-                e2e_latency_ms = 0.0
-                if issued_request:
+
+                def _request(request_step: int) -> tuple[Dict[str, Any], float]:
                     canonical_obs = adapter.obs_to_canonical(
                         obs,
                         {
@@ -405,30 +405,20 @@ def run_episode(
                                 payload_builder,
                                 canonical_obs,
                                 ctx,
-                                # Closed-loop-within-chunk models (PayloadBuilder
-                                # capability) must be called every env step; others
-                                # hand the whole chunk to the client.
-                                disable_action_cache=disable_action_cache,
-                                return_action_chunk=bool(getattr(args, "return_action_chunk", True)),
+                                disable_action_cache=stepper.disable_action_cache,
+                                return_action_chunk=stepper.return_action_chunk,
                             )
                         )
                     e2e_latency_ms = (time.perf_counter() - request_start) * 1000.0
-                    e2e_latencies.append(e2e_latency_ms)
                     if not response.get("ok", False):
                         raise RuntimeError(f"Policy error: {response}")
+                    return response["data"], e2e_latency_ms
 
-                    data = response["data"]
-                    payload_builder.update_from_response(data)
-                    inference_latency_ms = data.get("inference_latency_ms")
-                    inference_latencies.append(inference_latency_ms)
-                    chunk_consumer.load(
-                        data["actions"],
-                        limit=1 if disable_action_cache else chunk_steps,
-                    )
-                    last_request_id = data.get("request_id")
-                    request_step += 1
-
-                raw_chunk = chunk_consumer.next_action(disable_action_cache)
+                decision = stepper.next_action(_request)
+                if decision.issued_request:
+                    e2e_latencies.append(decision.e2e_latency_ms)
+                    inference_latencies.append(decision.inference_latency_ms)
+                raw_chunk = decision.action
                 # Log raw grip values before decode for debugging
                 if action_decoder_key and raw_chunk.shape[-1] >= 10:
                     raw_grip = float(raw_chunk[0, 9])
@@ -446,13 +436,13 @@ def run_episode(
                         {
                             "step": episode_step,
                             "env_step": episode_step,
-                            "request_step": request_step - 1 if issued_request else None,
-                            "request_id": last_request_id,
+                            "request_step": decision.request_step,
+                            "request_id": decision.request_id,
                             "raw_action": flat_action.tolist(),
                             "env_action": env_action,
-                            "inference_latency_ms": inference_latency_ms,
-                            "e2e_latency_ms": e2e_latency_ms,
-                            "chunk_cache_hit": not issued_request,
+                            "inference_latency_ms": decision.inference_latency_ms,
+                            "e2e_latency_ms": decision.e2e_latency_ms,
+                            "chunk_cache_hit": not decision.issued_request,
                             "done": bool(done),
                             "success": bool(info.get("success", False)),
                         }
@@ -518,7 +508,7 @@ def run_episode(
         "success": int(success),
         "steps": steps,
         "env_steps": steps,
-        "inference_requests": chunk_consumer.requests,
+        "inference_requests": stepper.requests,
         "safety_cost": None,
         "episode_time_sec": time.time() - episode_start,
         "reset_time_sec": reset_time_sec,
