@@ -72,6 +72,19 @@ POLICY_TIMEOUT_SAFETY = 2.0  # queue wait is (N-1) x service; keep 2x head-room
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
 
+def _server_env(index: int, gpu: int) -> Dict[str, str]:
+    """Env overrides for one server: its GPU, plus a per-server timing sink.
+
+    Calibration enables server timing for the whole coordinator; without the
+    suffix every server would write the same file and clobber the counters.
+    """
+    env = {"CUDA_VISIBLE_DEVICES": str(gpu)}
+    timing_base = os.environ.get("LOONGFORGE_EVAL_TIMING_PATH")
+    if timing_base:
+        env["LOONGFORGE_EVAL_TIMING_PATH"] = f"{timing_base}.server{index}"
+    return env
+
+
 def _shard_config(
     config: Dict[str, Any],
     shard: Shard,
@@ -431,7 +444,7 @@ class _ServerWatchdog(threading.Thread):
             _terminate(old_proc)
         print(f"[watchdog] server {index} died; restarting on port {args.port}", flush=True)
         try:
-            proc = start_server(args, {"CUDA_VISIBLE_DEVICES": str(self._gpus[index])})
+            proc = start_server(args, _server_env(index, self._gpus[index]))
             wait_healthz(
                 f"http://{args.host}:{args.health_port}/healthz",
                 min(args.server_start_timeout_sec, WATCHDOG_RESTART_TIMEOUT_SEC),
@@ -570,7 +583,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         server_args.port = port
         server_args.health_port = health_port
         server_args.server_log = server_log
-        servers.append((start_server(server_args, {"CUDA_VISIBLE_DEVICES": str(gpu)}), server_args))
+        servers.append((start_server(server_args, _server_env(index, gpu)), server_args))
     urls = [f"ws://{args.host}:{args.port}" for _, args in servers]
     slots = _build_slots(server_gpus, n_per_server, sim_gpus, placement, urls)
 
@@ -633,6 +646,12 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     launched_ids = [shard["id"] for shard in all_shards]
     validation = validate(expected_by_shard, launched_ids, read_records_by_unit(output_dir, len(all_shards)))
     print(f"[coordinator] {format_report(validation)}", flush=True)
+    if validation["unexpected"]:
+        print(
+            f"[coordinator] note: {validation['unexpected']} episode(s) ran outside the planned seed range "
+            "(replacements for skipped unstable seeds)",
+            flush=True,
+        )
     if not validation["ok"]:
         print(
             f"[coordinator] WARNING: coverage still incomplete after {repair_rounds} repair round(s) "

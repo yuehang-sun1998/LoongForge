@@ -635,16 +635,17 @@ records       = 10（2 条重复）
 - coordinator 默认端口基址改 **6000**；`coordinator_result.json` 增加 `sim_gpus` / `placement`。
 - `external_url → server.host/port` 同步；`_unit_completed()` 避免“已跑完但返回非 0”时的重复执行。
 - `calibrate.py` 对 GPU-sim 产出 `pools.gpu_sim` fallback + `env.json`。
+- **GPU-sim 标定入口**：`calibrate.py --n ... --gpus 0..7` 自动识别 GPU-sim family；每个 N 用全部 GPU（每卡 1 server + N sim）、点间串行；`episodes_per_task` 自动抬到 `G×N`；每 server 独立 timing 文件并按请求数加权聚合；采每卡显存峰值；产物 `report.json/report.md/env.json/cache.json`。
 - RoboTwin worker 补丁：评测循环捕获 `UnStableError` 并跳过该 seed。
-- **seed 跳步**：`plan_robotwin` 注入 `seed_stride = shard 数 × chunk`（≈ 总 episode 数向上取整到 chunk 的倍数），worker 的 `now_seed += 1` 改为 `+= seed_stride`；跳过 unstable 时进入下一轮自己的 seed 区间，不再与相邻 shard 重叠（待 GPU 空闲做 E2E 复测）。
+- **seed 跳步**：`plan_robotwin` 注入 `seed_stride = shard 数 × chunk`（≈ 总 episode 数向上取整到 chunk 的倍数），worker 的 `now_seed += 1` 改为 `+= seed_stride`；跳过 unstable 时进入下一轮自己的 seed 区间，不再与相邻 shard 重叠。E2E：`duplicates=0`，8 个计划 seed + 5 个替补（100010/100013/100016/100021/100024），wall 235.6s。
 - 单测：`test_coordinator.py` + `test_robotwin_adapter.py` **48 passed**；全量 eval 单测 **154 passed / 1 skipped**。
 
 **待做**
 
-- N=2/4/8 扫描；同卡 vs 异卡 `t_infer` 对比。**2026-10-29 起 8 卡被他人 DeepSeek-V3-8MoE 预训练占用约 44–54GB/卡**，N≥2 需等卡或只用 1–2 卡做功能验证。
-- **稳定 seed 预扫描 + 分片**（推荐）：扫描 `(task, task_config, seed)` 的稳定性并缓存，planner 只分稳定 seed，消除越界重复；或改用全局 seed 游标。
-- bf16 eval 支持（autocast + 保留 `_FP32_PARAM_SELECTORS`），可省 ~8GB。
-- 官方 evaluator 的 `Fail!` 退出码已在 unit 级用 `_unit_completed` 兜住；如需严格 `ok=true`，还需处理上面的 seed 越界重复。
+- N=2/4/8 扫描；同卡 vs 异卡 `t_infer` 对比。入口已就绪（`calibrate.py --gpus 0..7`）；2026-10-29 曾因他人 DeepSeek-V3-8MoE 预训练占用 44–54GB/卡而推迟，训练结束后可跑。
+- **稳定 seed 预扫描 + 分片**（可选）：`seed_stride` 已消除越界重复；若要跨机器保证稳定 seed 集合，仍可扫描并缓存；或改用全局 seed 游标。
+- bf16 eval 支持（autocast + 保留 `_FP32_PARAM_SELECTORS`），可省 ~8GB；当前按配置问题处理，`use_bf16: false` 即可。
+- 官方 evaluator 的 `Fail!` 退出码已由 `_unit_completed` 兜住；`unexpected` 已改为允许的替补 episode。
 
 ---
 

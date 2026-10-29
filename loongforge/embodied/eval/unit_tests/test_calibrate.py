@@ -5,7 +5,13 @@
 
 from __future__ import annotations
 
-from loongforge.embodied.eval.orchestrator.calibrate import _sweep_rows, fallback_n
+from loongforge.embodied.eval.orchestrator.calibrate import (
+    _point_config,
+    _read_timing,
+    _sweep_rows,
+    fallback_n,
+    is_gpu_sim,
+)
 
 
 def test_fallback_n_picks_smallest_reaching_threshold() -> None:
@@ -39,3 +45,44 @@ def test_sweep_rows_reads_result_and_timing(tmp_path) -> None:
     assert rows[0]["N"] == 4
     assert rows[0]["throughput_ep_per_min"] == 2.4  # 4 / 100 * 60
     assert rows[0]["server_busy_frac"] == 0.2  # 400 * 50ms / 1000 / 100s
+
+
+def test_read_timing_aggregates_per_server_files(tmp_path) -> None:
+    """GPU-sim starts one server per GPU; each writes its own timing file."""
+    (tmp_path / "timing.json.server0").write_text('{"count": 100, "mean": 10.0, "max": 20.0}')
+    (tmp_path / "timing.json.server1").write_text('{"count": 300, "mean": 30.0, "max": 40.0}')
+    timing = _read_timing(tmp_path / "timing.json")
+    assert timing["count"] == 400
+    assert timing["mean"] == 25.0  # weighted by request count
+    assert timing["max"] == 40.0
+    assert timing["servers"] == 2
+
+
+def test_point_config_gpu_sim_uses_all_gpus_and_covers_slots(tmp_path) -> None:
+    """GPU-sim: N is sims per server and every point uses all server GPUs."""
+    config = {
+        "benchmark": {"name": "robotwin", "episodes_per_task": 4},
+        "servers": [{"gpus": [0, 1]}],
+        "pools": {"gpu_sim": {"placement": "co_locate"}},
+    }
+    cfg, cfg_path = _point_config(config, 2, 0, tmp_path, gpu_sim=True, gpus=[0, 1])
+    assert cfg["servers"] == [{"gpus": [0, 1]}]
+    assert cfg["pools"]["gpu_sim"]["n_sims_per_server"] == 2
+    assert cfg["benchmark"]["episodes_per_task"] == 4  # 2 GPUs x 2 sims
+    assert "coordinator" not in cfg
+    assert cfg_path.exists()
+
+
+def test_point_config_cpu_sim_sets_workers(tmp_path) -> None:
+    config = {"benchmark": {"name": "libero"}, "servers": [{"gpus": [0]}]}
+    cfg, _ = _point_config(config, 8, 0, tmp_path, gpu_sim=False, gpus=[0])
+    assert cfg["coordinator"]["n_workers"] == 8
+    assert "pools" not in cfg or "gpu_sim" not in (cfg.get("pools") or {})
+
+
+def test_is_gpu_sim_detects_sapien_families() -> None:
+    assert is_gpu_sim({"benchmark": {"name": "robotwin"}})
+    assert is_gpu_sim({"benchmark": {"name": "simplerenv"}})
+    assert is_gpu_sim({"benchmark": {"name": "maniskill"}})
+    assert not is_gpu_sim({"benchmark": {"name": "libero"}})
+    assert not is_gpu_sim({"benchmark": {"name": "calvin"}})

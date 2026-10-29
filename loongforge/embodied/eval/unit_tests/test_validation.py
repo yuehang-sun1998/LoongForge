@@ -45,11 +45,11 @@ def test_two_shards_claiming_the_same_episode_is_a_duplicate() -> None:
     assert not report["ok"]
 
 
-def test_extra_episodes_are_unexpected() -> None:
-    """Run test_extra_episodes_are_unexpected."""
+def test_extra_episodes_are_allowed_replacements() -> None:
+    """RoboTwin skips unstable seeds; the replacement seed is extra, not a fault."""
     report = validate({"a": 1}, ["a"], [[_rec("x/1"), _rec("x/2")]])
     assert report["unexpected"] == 1
-    assert not report["ok"]
+    assert report["ok"]
 
 
 def test_short_shards_reports_only_the_short_ones() -> None:

@@ -142,7 +142,13 @@
 - **GPU-sim（2026-10-29，预实验）**：
   - 环境已具备（RoboTwin stable_2.0 + 真实 pi05）；单 sim 显存 ~5.5GB（见 T-07）。
   - 8 卡 N=1：8 个 server 各 15.9GB（fp32 pi05）。首轮 worker 未绑卡 → 8 个 sim 全落 GPU 0（wall 689s）；修复 bind/端口/重试后复测：每卡 18.1–21.9GB、wall 172.8s、单 episode 82s。
-  - `pools.gpu_sim` + `placement` + worker 绑卡 + 显存校验已实现；**N=2/4/8 扫描待跑**（当前 8 卡被他人训练占用）。
+  - `pools.gpu_sim` + `placement` + worker 绑卡 + 显存校验已实现；**N=2/4/8 扫描待跑**。
+- **GPU-sim 正式入口（2026-10-29 已接线）**：
+  - 命令：`python -m loongforge.embodied.eval.orchestrator.calibrate --config run.yaml --n 1,2,4,8 --gpus 0,1,2,3,4,5,6,7 --out /tmp/gpu_cal`
+  - 行为：每个 N 使用**全部 GPU**（每卡 1 server + N sim），不同 N **串行**；`episodes_per_task` 自动抬到 `G × N`，保证每个 worker 有独立 seed；端口按 N 偏移，避免 TIME_WAIT。
+  - 采集：`N{n}/out/coordinator_result.json`、`N{n}/timing.json.server*`（每 server 一份，按请求数加权聚合）、`N{n}/gpu_peak.json`（每卡显存峰值）。
+  - 产物：`calibration_report/{report.json,report.md,env.json,cache.json}`；fallback N 写入 `pools.gpu_sim`，并带 `placement`。
+  - 状态：入口与单测已完成，正式 N 扫描待跑。
 
 ### T-03 · 一行命令起 1+N（external server + 最小 coordinator）
 
@@ -511,7 +517,7 @@
   - **8 卡 N=1 复测（修复 external_url 端口 / UnStableError / 重试语义后）**：
     - 每卡峰值 **18.1–21.9GB**（8 张卡都有 sim）；`failed_units=[]`、unique 8/8
     - **wall 172.8s**、单 episode 平均 **82.0s**（53.2–113.2s）
-    - 仍有 2 条重复：跳过 unstable seed 会越界进入相邻 shard 的固定 seed 区间（已实现 `seed_stride = shard 数 × chunk` 跳步，待 GPU 空闲复测）
+    - **seed_stride 复测（2026-10-29）**：`duplicates=0`；13 条记录 = 8 个计划 seed + 5 个替补（100010/100013/100016/100021/100024）。替补落在固定 seed 区间外，validation 记 `unexpected`，但已改为**不判失败**（`ok = missing==0 and duplicates==0 and unkeyed==0`）。
   - seed 稳定性重复实验：`100003` 连续 3 次 unstable（同一物体），`100001` 两次 stable → **同机可复现**。
   - 限制：2026-10-29 起 8 卡被他人训练任务占用 44–54GB/卡，N≥2 需等卡。
 - **结论**：🔄 显存基线与 8 卡放置验证完成；同卡 vs 异卡的 `t_infer` / wall-clock 对比待跑。

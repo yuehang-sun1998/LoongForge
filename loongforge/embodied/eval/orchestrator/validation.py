@@ -3,10 +3,14 @@
 
 """Post-run coverage validation for a coordinated evaluation.
 
-A coordinated run is only trustworthy if the episodes that *ran* are exactly the
-episodes the plan *asked for*: nothing missing, nothing duplicated, nothing
-extra. ``_aggregate`` merely dedups and counts successes, so a dropped or
-re-run unit would silently skew the rate.
+A coordinated run is only trustworthy if the episodes the plan asked for all ran
+and no episode was produced twice. ``_aggregate`` merely dedups and counts
+successes, so a dropped or re-run unit would silently skew the rate.
+
+Extra episodes are allowed: benchmarks that skip unstable seeds (RoboTwin's
+``UnStableError``) replace them with later seeds, which fall outside the fixed
+seed range in the plan. They are reported as ``unexpected`` for visibility but
+do not fail the run.
 
 The check is deliberately benchmark-agnostic: it never expands a
 ``(suite, task, episode)`` grid (that only fits LIBERO). Instead each shard
@@ -105,7 +109,9 @@ def validate(
             infra_failed += 1
 
     return {
-        "ok": missing == 0 and unexpected == 0 and not duplicates and unkeyed == 0,
+        # Extra episodes are legitimate replacements for skipped unstable seeds
+        # (e.g. RoboTwin), so they are reported but do not fail the run.
+        "ok": missing == 0 and not duplicates and unkeyed == 0,
         "expected": expected,
         "actual": actual,
         "records": n_records,
