@@ -511,7 +511,7 @@
   - **8 卡 N=1 复测（修复 external_url 端口 / UnStableError / 重试语义后）**：
     - 每卡峰值 **18.1–21.9GB**（8 张卡都有 sim）；`failed_units=[]`、unique 8/8
     - **wall 172.8s**、单 episode 平均 **82.0s**（53.2–113.2s）
-    - 仍有 2 条重复：跳过 unstable seed 会越界进入相邻 shard 的固定 seed 区间（待稳定 seed 预扫描解决）
+    - 仍有 2 条重复：跳过 unstable seed 会越界进入相邻 shard 的固定 seed 区间（已实现 `seed_stride = shard 数 × chunk` 跳步，待 GPU 空闲复测）
   - seed 稳定性重复实验：`100003` 连续 3 次 unstable（同一物体），`100001` 两次 stable → **同机可复现**。
   - 限制：2026-10-29 起 8 卡被他人训练任务占用 44–54GB/卡，N≥2 需等卡。
 - **结论**：🔄 显存基线与 8 卡放置验证完成；同卡 vs 异卡的 `t_infer` / wall-clock 对比待跑。

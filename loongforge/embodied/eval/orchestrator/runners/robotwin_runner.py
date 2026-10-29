@@ -157,6 +157,11 @@ def _worker_eval_script(args: argparse.Namespace) -> Optional[pathlib.Path]:
     )
     if unstable_old in text:
         text = text.replace(unstable_old, unstable_new, 1)
+    # Advance by a full round of shard blocks, not by one seed: neighbouring
+    # shards own adjacent ranges, so +1 would run another shard's seed.
+    seed_stride = int(getattr(args, "seed_stride", 1) or 1)
+    if seed_stride != 1:
+        text = text.replace("now_seed += 1", f"now_seed += {seed_stride}")
     script_dir = pathlib.Path(args.output_dir) / "worker_files"
     script_dir.mkdir(parents=True, exist_ok=True)
     worker_script = script_dir / f"eval_policy_{args.ckpt_setting}.py"
@@ -343,6 +348,7 @@ def _apply_config(args: argparse.Namespace, config: Dict[str, object]) -> argpar
         (benchmark, "task_config", "task_config"),
         (benchmark, "max_steps", "max_steps"),
         (benchmark, "start_seed", "start_seed_override"),
+        (benchmark, "seed_stride", "seed_stride"),
         (benchmark, "test_num", "test_num_override"),
         (benchmark, "episodes_per_task", "test_num_override"),
         (benchmark, "disable_expert_check", "disable_expert_check"),
@@ -660,6 +666,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--test-num-override", type=int, default=None)
     parser.add_argument("--start-seed-override", type=int, default=None)
     parser.add_argument("--disable-expert-check", action="store_true")
+    parser.add_argument("--seed-stride", type=int, default=1)
     parser.add_argument("--control-hz", type=int, default=10)
     parser.add_argument("--instruction-type", default="unseen")
     parser.add_argument("--disable-action-cache", action="store_true")

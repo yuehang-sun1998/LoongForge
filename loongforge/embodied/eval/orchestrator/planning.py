@@ -153,22 +153,35 @@ def plan_episode_indexed(config: Dict[str, Any], total_workers: int) -> List[Sha
 
 
 def plan_robotwin(config: Dict[str, Any], total_workers: int) -> List[Shard]:
-    """RoboTwin: task x task-config x seed range (episodes are seeds, not an index)."""
+    """RoboTwin: task x task-config x seed range (episodes are seeds, not an index).
+
+    ``seed_stride`` is the width of one full round (all shard blocks). The runner
+    advances by it when a seed is unstable, so the retry lands in that shard's
+    next block instead of crossing into a neighbour's seed range.
+    """
     benchmark = _benchmark(config)
     task = str(benchmark.get("task_name") or "")
     task_config = str(benchmark.get("task_config") or "demo_clean")
     episodes = int(benchmark.get("episodes_per_task") or benchmark.get("test_num") or 1)
     start = int(benchmark.get("episode_offset") or benchmark.get("start_seed") or 0)
     chunk = chunk_size(episodes, total_workers)
+    ranges = list(_ranges(start, episodes, chunk))
+    seed_stride = len(ranges) * chunk
     return [
         {
             "id": f"{task}/{task_config}/seed={seed}-{seed + count - 1}",
             "overrides": {
-                "benchmark": {"task_name": task, "task_config": task_config, "start_seed": seed, "test_num": count}
+                "benchmark": {
+                    "task_name": task,
+                    "task_config": task_config,
+                    "start_seed": seed,
+                    "test_num": count,
+                    "seed_stride": seed_stride,
+                }
             },
             "expected": count,
         }
-        for seed, count in _ranges(start, episodes, chunk)
+        for seed, count in ranges
     ]
 
 

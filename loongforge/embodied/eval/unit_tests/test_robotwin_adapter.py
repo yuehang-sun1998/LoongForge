@@ -409,9 +409,11 @@ def test_worker_script_skips_unstable_seeds(tmp_path: pathlib.Path) -> None:
         test_num_override=None,
         disable_expert_check=False,
         disable_eval_video_log=False,
+        seed_stride=8,
     )
     script = robotwin_runner._worker_eval_script(args)
     text = script.read_text(encoding="utf-8")
     assert "except UnStableError" in text
-    assert "now_seed += 1" in text
+    assert "now_seed += 8" in text  # jump a full round, not into the next shard
+    assert "now_seed += 1" not in text
     assert "continue" in text

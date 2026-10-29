@@ -177,6 +177,8 @@ def test_plan_robotwin_slices_by_seed_range() -> None:
     assert sum(shard["expected"] for shard in shards) == 100
     assert shards[0]["overrides"]["benchmark"]["start_seed"] == 0
     assert all("test_num" in shard["overrides"]["benchmark"] for shard in shards)
+    # chunk = ceil(100 / (4 slots x 4 units)) = 7; 15 shard blocks -> stride 105
+    assert all(shard["overrides"]["benchmark"]["seed_stride"] == 105 for shard in shards)
 
 
 def test_plan_calvin_is_one_shard_until_the_runner_takes_an_offset() -> None:

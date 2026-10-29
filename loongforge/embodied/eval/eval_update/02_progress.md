@@ -636,6 +636,7 @@ records       = 10（2 条重复）
 - `external_url → server.host/port` 同步；`_unit_completed()` 避免“已跑完但返回非 0”时的重复执行。
 - `calibrate.py` 对 GPU-sim 产出 `pools.gpu_sim` fallback + `env.json`。
 - RoboTwin worker 补丁：评测循环捕获 `UnStableError` 并跳过该 seed。
+- **seed 跳步**：`plan_robotwin` 注入 `seed_stride = shard 数 × chunk`（≈ 总 episode 数向上取整到 chunk 的倍数），worker 的 `now_seed += 1` 改为 `+= seed_stride`；跳过 unstable 时进入下一轮自己的 seed 区间，不再与相邻 shard 重叠（待 GPU 空闲做 E2E 复测）。
 - 单测：`test_coordinator.py` + `test_robotwin_adapter.py` **48 passed**；全量 eval 单测 **154 passed / 1 skipped**。
 
 **待做**
