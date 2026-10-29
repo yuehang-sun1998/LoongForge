@@ -33,6 +33,7 @@ from loongforge.embodied.eval.orchestrator.calibration_config import (
     validate_parallel_config,
 )
 from loongforge.embodied.eval.orchestrator.calibration_report import build_report, render_markdown
+from loongforge.embodied.eval.orchestrator.planning import benchmark_family
 
 
 def fallback_n(rows: Sequence[Dict[str, Any]], plateau_frac: float = 0.95) -> Any:
@@ -121,8 +122,13 @@ def run(
 
     # deterministic fallback: validate + cache it (an agent's decision supersedes).
     n_fallback = fallback_n(rows)
-    calibrated = {"calibrated": {"pools": {"cpu_sim": {"n_sims_per_server": n_fallback}}}}
-    validation = validate_parallel_config(calibrated, {}, 0.0) if n_fallback else {"result": "SKIP"}
+    pool_name = "gpu_sim" if benchmark_family(config) in {"robotwin", "simplerenv", "maniskill"} else "cpu_sim"
+    env_facts = dict((config.get("resources") or {}).get(pool_name) or {})
+    if env_facts:
+        report["env"] = env_facts
+        (report_dir / "env.json").write_text(json.dumps(env_facts, indent=2), encoding="utf-8")
+    calibrated = {"calibrated": {"pools": {pool_name: {"n_sims_per_server": n_fallback}}}}
+    validation = validate_parallel_config(calibrated, env_facts, 0.0) if n_fallback else {"result": "SKIP"}
     key = calibration_key(
         str((config.get("model") or {}).get("name") or "model"),
         str((config.get("benchmark") or {}).get("suite") or "benchmark"),

@@ -26,7 +26,7 @@
 |---|---|---|---|---|---|
 | — | 设计收敛（架构/标定/队列） | ✅ 完成（文档） | `01_architecture.md` | — | — |
 | — | 代码触点核实 | ✅ 完成 | 见 `01_architecture.md` §10 | — | — |
-| 0 | **N 扫描 + 报告 + agent 决策**（CPU-sim） | 🔄 扫描/报告/决策完成；GPU-sim 待做 | 探针 + `orchestrator/calibration_report.py` | `03_testing.md` T-02 | 需空闲 GPU |
+| 0 | **N 扫描 + 报告 + agent 决策**（CPU-sim） | 🔄 CPU-sim ✅；GPU-sim 显存基线 ✅，N 扫描待做（见 §2.30） | 探针 + `orchestrator/calibration_report.py` | `03_testing.md` T-02 | 需空闲 GPU |
 | 0 | server 侧服务时间插桩 | ✅ 完成 | `transport/timing.py` + `rpc_server.py` | `03_testing.md` T-01 通过 | — |
 | 0 | 标定报告生成器（三件套） | ✅ 完成 | `orchestrator/calibration_report.py` | 单测 3 passed | — |
 | 0 | 配置校验 + 缓存 | ✅ 完成 | `orchestrator/calibration_config.py` | 单测 7 passed | — |
@@ -35,7 +35,7 @@
 | 1 | **最小 coordinator（一行命令起 1 server + N worker）** | ✅ 完成 | `orchestrator/coordinator.py` | `03_testing.md` T-03 | external ✅ |
 | 1 | **episode-chunk 分片（+ runner episode offset）** | ✅ 完成 | `coordinator.py` + `libero_runner.py` | `03_testing.md` T-03 | T1-5 |
 | 1 | N 标定（报告 + agent 决策 + 配置缓存） | 🔄 报告/校验/缓存 ✅；扫描走手动探针 | `calibration_report.py` + `calibration_config.py` | T-02 | 插桩 ✅ + 最小 coordinator |
-| 1 | GPU-sim 放置决策（同卡 vs 异卡） | ⏸ 暂缓（当前环境不支持 GPU-sim；待 CPU-sim 完成后统一做） | — | T-07 | 需 GPU-sim 环境 |
+| 1 | GPU-sim 放置决策（同卡 vs 异卡） | 🔄 环境已具备、显存基线完成；同卡/异卡 `t_infer` 对比待跑（A2–A4 已实现，见 §2.30） | `coordinator.py` + `calibrate.py` | T1-4 / T-07 | GPU-sim 环境 ✅ |
 | 2 | shard/worker 契约 | ✅ 完成（由 `run.py` 统一分发吸收，**无需新 adapter 层**，见 §2.11） | `run.py` + 各 `*_runner` | `03_testing.md` T-04 | — |
 | 2 | coordinator **动态化**（队列 + 按 ckpt 分片 + 按资源分池 + 看门狗） | ✅ 完成 + 全量对照（**全局队列 + 有界进程池 + 失败重试**；56.2 min / 3.09×，见 §2.11–§2.13） | `coordinator.py` | `03_testing.md` T-05 | 契约 |
 | 2 | episode-chunk 粒度抢占 | ✅ 完成（chunk 细到 1 集，快槽可抢下一个 unit） | `coordinator.py` | `03_testing.md` T-05 | 队列 |
@@ -44,6 +44,7 @@
 | 2 | **健壮性兜底**（unit 超时 / 收尾信号 / 竞态 / hung 探活） | ✅ 完成（`dc07c75`/`2e28ce0`/`e5f077c`/`cf9abb6`） | `coordinator.py` + `run.py` + `transport/client.py` | `03_testing.md` T-11 | §2.16 |
 | 2 | **运维陷阱兜底**（output_dir 冲突 / 超时下限 / 崩溃循环） | ✅ 完成（`a01390b`/`2d43e73`）；GPU-sim 只写方案 | `coordinator.py` + `run.py` | `03_testing.md` T-11 | §2.17 |
 | 2 | **分片：per-benchmark planner 表** | ✅ 完成 | `planning.py` + `coordinator.py` + `validation.py` | `03_testing.md` T-12 | §2.18 |
+| 2 | **GPU-sim 编排**（worker 绑卡 / `pools.gpu_sim` / `placement` / 显存校验） | ✅ 代码完成 + 8 卡 N=1 验证（每卡 server+sim，wall 172.8s）；N 扫描待跑 | `coordinator.py` + `calibrate.py` | `03_testing.md` T-02/T-07 | §2.30 |
 | 3 | **chunk 客户端化**（消 90% 请求） | ✅ 完成（请求量 9.83×；80/80 逐集一致） | 各 runner + `_common` | `03_testing.md` T-14 | §2.23 |
 | 3 | server 侧 batcher（M3） | 🔄 **探针实测：`per_sample_ms` 583→79ms（batch 8，7.3×）→ 判定 GO**；**server 侧 `AsyncBatcher` 已实现（异步聚合 + cache-hit 过滤）**；**T-06 已过（bf16 max|d|=0.0054），真 batch 路径已接通** | `transport/batcher.py` + `batch_probe.py`（诊断） | `03_testing.md` T-06/T-13/T-14 | 下一步重扫 N |
 | 3 | **单卡多 server vs batch**（T-08） | ✅ 已结案：**多副本只 1.25×、batch 7.3×** → 选 batch | —（A/B 用现有 coordinator 跑） | `03_testing.md` T-08 | — |
@@ -559,6 +560,90 @@ N=48→80 吞吐持平，内存却从 772GB 涨到 1266GB → **平台在 N≈48
 - **结论**：这套 pipeline **不保证逐位复现**。两次完全相同的 run（batching off、仅 output_dir 不同，N=16、1973 集）只有 **93.8%** 的集 steps 相同，success 1917 vs 1918（11 个翻转）→ 跨进程/GPU 的 bf16 数值抖动本身就存在。
 - **batching 再叠加一层**：batch 组成由请求到达时序决定，bf16 归约顺序随组成变化。配置相同的两次全量（仅 `episodes_per_chunk` 不同）steps 只有 46.3% 相同；80 集小规模 batch on/off A/B 恰好 100%，不能外推。
 - **验收口径**：代码改动看 **success rate / 逐 suite 成功率**（± 运行间噪声），逐集 steps 只作参考。数据见 `03_testing.md` T-19。
+
+---
+
+### 2.30 GPU-sim 环境打通与首轮实测（2026-10-29）
+
+**环境**（`03_testing.md` T-07 预实验）
+
+- RoboTwin stable_2.0 可运行：`script/eval_policy.py` + `task_config/` 布局匹配，assets 接好，curobo 可用；补齐 NVIDIA 用户态 Vulkan 库后 SAPIEN 可渲染。
+- 真实 pi05 + RoboTwin 端到端首次跑通（`returncode=0`，20 步，单次真推理 285ms）。三个兼容性结论：
+  1. **transformers 必须用仓库 pin 的 5.3.0**；5.12 会在推理时报 `create_causal_mask() got an unexpected keyword argument 'cache_position'`。
+  2. 视觉塔 key 命名与 transformers 版本绑定：5.3 下**原始 checkpoint**（`vision_tower.vision_model.*`）正确；5.12 下才需要重命名。
+  3. `server.use_bf16` 目前必须为 **false**：推理入口把 embedding/state 固定为 float32，bf16 权重会触发 `mat1 and mat2 must have the same dtype`。
+- NFS 冷启动影响很大：权重与 venv 放本地后 pi05 加载 **135s**，NFS 上 >10 分钟。
+
+**显存基线（RoboTwin `adjust_bottle`，独立进程）**
+
+| k（同卡） | 峰值增量 | 每 sim 边际 |
+|---|---|---|
+| 1 | 4.97GB | 4.97GB |
+| 2 | 10.94GB | 5.47GB |
+| 4 | 21.87GB | 5.47GB |
+
+→ 近似线性，**边际 ~5.5GB/sim**；进程退出全部释放。k=4 的单步耗时被拉长 3.4×，但测试卡有邻居占用，不能作为同卡争用结论。
+
+**pi05 加载显存**
+
+| 口径 | 数值 |
+|---|---|
+| fp32 权重（当前可用） | **16.6GB** |
+| bf16 活权重 / `nvidia-smi` | 7.72GiB / **15.9GB**（allocator 缓存） |
+| `empty_cache()` 后 | **8.7GB** |
+| fp32 + `empty_cache` | 基本无收益（最终权重 16.6GB 已复用中间态缓存） |
+
+bf16 的回收收益已由 `fix/eval-server-release-load-cache`（`f093865`）实现，尚未进入本分支。
+
+**8 卡 N=1 首轮（暴露问题）**
+
+- 8 个 server 全部 healthy；**端口基址必须避开临时端口范围**：默认 14560 会让 3/8 个 server 因 `address already in use` 退出，改用 6000 段后正常。
+- **worker 没有绑卡**：coordinator 只给 server 设了 `CUDA_VISIBLE_DEVICES`，worker 继承父进程环境 → 8 个 sim 全部落在 GPU 0。结果单 episode 338s、wall 689s，首批 client 连接超时触发重试（16 条记录、去重后 8 集）。
+- server 占卡 15.9GB（fp32），GPU 0 峰值 19.9GB（server + 8 sim），其余卡只有 server。
+
+**8 卡 N=1 复测（修复后，2026-10-29）**
+
+又发现并修复了两个问题：
+
+1. **`external_url` 与 `server.port` 不一致**：coordinator 给 unit 注入 `server.external_url=ws://...:6140`，但 RoboTwin runner 从 `server.port`（仍是 base 6125）建 client → 连到不存在的端口，300s 超时。修复：`_shard_config` 从 `external_url` 同时推导 `server.host` / `server.port`。
+2. **不稳定 seed 只在 official 的 `expert_check` 分支被捕获**：`disable_expert_check=true` 时正式评测循环无 try/except → 整集崩溃、coordinator 重试同一确定性 seed。修复：worker 副本在评测循环里复刻 `UnStableError → now_seed += 1 → continue`。
+3. **重试语义**：新增 `_unit_completed()`——unit 已写出计划要求的全部 episode 时，即使进程返回非 0（模型失败）也不再重跑。修复前 `failed_units` 全满且记录翻倍。
+
+复测结果：
+
+```
+failed_units = []          # 不再重试
+elapsed      = 172.8s      # 首轮 689s → 332s → 172.8s
+unique        = 8/8
+records       = 10（2 条重复）
+```
+
+- 每卡峰值：GPU 0/2/3/6/7 **21.4–21.9GB**，GPU 1/4/5 **18.1GB**（对应 seed 提前结束）→ **8 张卡都跑上了 sim**
+- 单 episode 平均 **82.0s**（53.2–113.2s），首轮全挤 GPU 0 时是 338s
+- 2 条重复的来源：跳过 unstable seed 后 `now_seed += 1` 越界进入相邻 shard 的固定 seed 区间（seed 100002 / 100006）
+
+**seed 稳定性重复实验**
+
+- seed `100003` 连续 3 次 `UnStableError`，且都是 `001_bottle`；seed `100001` 两次稳定（另一次是无关 OOM）
+- 结论：**同一机器上稳定 seed 可复现**，可以做“预扫描稳定 seed 列表 + 按列表分片”（见待做）；跨机器/驱动仍需复测
+
+**已实现（A2–A4 + GPU-sim 修复，本分支未提交）**
+
+- worker 绑卡：`_shard_config` / `_launch_unit` 注入 `run.cuda_visible_devices`，仅 GPU-sim 生效。
+- `pools.gpu_sim.{n_sims_per_server, placement, sim_gpus}`；`placement=co_locate` 时 sim 跟 server 同卡，`separate` 时 sim 用独立卡且拒绝与 server 卡重叠。
+- 显存校验 `N*vram_per_sim + vram_model <= vram_total`（`resources.gpu_sim`）。
+- coordinator 默认端口基址改 **6000**；`coordinator_result.json` 增加 `sim_gpus` / `placement`。
+- `external_url → server.host/port` 同步；`_unit_completed()` 避免“已跑完但返回非 0”时的重复执行。
+- `calibrate.py` 对 GPU-sim 产出 `pools.gpu_sim` fallback + `env.json`。
+- RoboTwin worker 补丁：评测循环捕获 `UnStableError` 并跳过该 seed。
+- 单测：`test_coordinator.py` + `test_robotwin_adapter.py` **48 passed**；全量 eval 单测 **154 passed / 1 skipped**。
+
+**待做**
+
+- N=2/4/8 扫描；同卡 vs 异卡 `t_infer` 对比。**2026-10-29 起 8 卡被他人 DeepSeek-V3-8MoE 预训练占用约 44–54GB/卡**，N≥2 需等卡或只用 1–2 卡做功能验证。
+- **稳定 seed 预扫描 + 分片**（推荐）：扫描 `(task, task_config, seed)` 的稳定性并缓存，planner 只分稳定 seed，消除越界重复；或改用全局 seed 游标。
+- bf16 eval 支持（autocast + 保留 `_FP32_PARAM_SELECTORS`），可省 ~8GB。
+- 官方 evaluator 的 `Fail!` 退出码已在 unit 级用 `_unit_completed` 兜住；如需严格 `ok=true`，还需处理上面的 seed 越界重复。
 
 ---
 

@@ -218,7 +218,9 @@ worker                    work/                       server/sim            结�
 
 **同卡的坑**：SAPIEN/Vulkan 渲染与 PyTorch 推理同卡分时，会**拉长 `t_infer` 并带来抖动**（无 MPS 时更明显）→ 同卡部署后必须**重测 `t_infer`**，别拿 CPU-sim 的 0.5s 算 N；并留显存余量防 OOM。
 
-> **两种都要实测对比**（见 `03_testing.md` T-07）：同一 GPU-sim benchmark，分别跑「同卡」与「异卡」两种放置，比 wall-clock、`t_infer`（含抖动）、显存峰值。**当前无实测数据，默认按"同卡"起步。**
+> **两种都要实测对比**（见 `03_testing.md` T-07）：同一 GPU-sim benchmark，分别跑「同卡」与「异卡」两种放置，比 wall-clock、`t_infer`（含抖动）、显存峰值。**已有单 sim 显存基线（~5.5GB/sim），同卡/异卡的 `t_infer` 对比待跑；默认按"同卡"起步。**
+
+> **实现（2026-10-29）**：coordinator 已支持 `pools.gpu_sim.placement`（`co_locate` / `separate`），并为每个 worker 注入 `run.cuda_visible_devices`，绑定到 server 所在卡（`co_locate`）或 `sim_gpus`（`separate`）；`separate` 要求 `sim_gpus` 与 server 卡不相交。显存上限由 `resources.gpu_sim` 做 fail-fast 校验。见 `02_progress.md` §2.30。
 
 **并行关系不是一一对应**：仍是 1 server : N sims（N>1）。理由：单 sim 流水 `obs→推理→step→obs` 严格串行有气泡，N>1 才能让 server 在 A 步进时给 B 推理。差别在 N 的约束：CPU 仿真由**核数**定，GPU 仿真由**显存**定。
 
@@ -306,7 +308,7 @@ calibrated:
     - { ckpt: /path/to/ckptA, replicas: 8, gpus: [0,1,2,3,4,5,6,7] }
   pools:
     cpu_sim: { n_sims_per_server: 6 }
-    gpu_sim: { n_sims_per_server: 3, placement: co_located }
+    gpu_sim: { n_sims_per_server: 3, placement: co_locate }   # separate 时再加 sim_gpus: [8,9]
   timeouts: { policy_call_ms: 8000 }        # 按 N 放宽
   rationale: "..."
 
@@ -321,6 +323,9 @@ vectorization: { num_envs: 1 }                                          # §7.5
 2. **`batching` / `vectorization` 现在就预留块**（`enabled: false` / `num_envs: 1`），保证 schema 前向兼容。
 
 > **已实现子集（M1/M2，当前代码，`coordinator.py`）**：`run.output_dir` / `run.timestamped_output` / `run.max_retries`（coordinator 默认注入 `2`：episode 级 infra 失败——`episode_error`/超时——重试，模型失败不重试）、`servers[].gpus`（=**G**，一张卡一个 server）、`pools.cpu_sim.n_sims_per_server`（=**N**）、`benchmark.{suite|suites, task_ids, episodes_per_task, episode_offset, episodes_per_chunk, max_steps, suite_overrides, return_action_chunk}`、`server.external_url`、`timeouts.policy_call_ms`；编排开关 = config 里有 `coordinator` / `servers` / `pools` 任一 key（`run.py` 按 key 存在性分发）。
+> **GPU-sim（2026-10-29 已接线）**：`pools.gpu_sim.{n_sims_per_server, placement, sim_gpus}` 决定 sim 的卡；worker 通过 `run.cuda_visible_devices` 绑定到 server 卡（`co_locate`）或 `sim_gpus`（`separate`，要求与 server 卡不相交）；`resources.gpu_sim.{vram_total_mb, vram_per_sim_mb, vram_model_mb}` 做 `N*vram_per_sim + vram_model <= vram_total` 的 fail-fast 校验。
+> **unit 级细节**：`_shard_config` 从 `server.external_url` 同步 `server.host/port`（部分 runner 只读 port）；`_unit_completed()` 在 unit 已写出全部预期 episode 时不再因进程返回码非 0 而重试。
+> **端口**：coordinator 基址默认 **6000**（`LOONGFORGE_COORD_PORT_BASE` 可覆盖），不要落在 10000–61000 的内核临时端口段。
 > 其中 **`benchmark.return_action_chunk`**（LIBERO 默认 true；CALVIN / SimplerEnv / ManiSkill 需显式开启）false 时走旧 server-side chunk cache（每步请求），用于 T-14 的旧路径 A/B。执行细节见 §7.6 (2) 的 `EpisodePolicyStepper`。
 > **`benchmark.episodes_per_chunk`**（默认 0 = 自动）显式指定“一个 worker 进程连续跑几集”，用于摊薄每集一次 torch/robosuite import；`per_task` 下仍强制一 task 一 shard（忽略该值）。
 > 其中 **`benchmark.suite_overrides: {<suite>: {<key>: <val>}}`** 用于**套件差异化**（如 LIBERO 官方 `max_steps`：`libero_10` 700 / 其余 400），使**一条全局队列跨套件**成立。

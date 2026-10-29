@@ -137,6 +137,26 @@ def _worker_eval_script(args: argparse.Namespace) -> Optional[pathlib.Path]:
             '    args["ckpt_setting"] = ckpt_setting\n' '    args["eval_video_log"] = False\n',
             1,
         )
+    # The official script only catches UnStableError inside the expert-check
+    # branch. With --disable-expert-check, an unstable seed in the eval loop
+    # aborts the whole run (and the coordinator would retry the same
+    # deterministic seed). Skip the seed instead, mirroring the official branch.
+    unstable_old = (
+        "        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)\n"
+        "        TASK_ENV.set_instruction(instruction=instruction)"
+    )
+    unstable_new = (
+        "        try:\n"
+        "            TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)\n"
+        "        except UnStableError:\n"
+        "            TASK_ENV.close_env()\n"
+        "            now_seed += 1\n"
+        '            args["render_freq"] = render_freq\n'
+        "            continue\n"
+        "        TASK_ENV.set_instruction(instruction=instruction)"
+    )
+    if unstable_old in text:
+        text = text.replace(unstable_old, unstable_new, 1)
     script_dir = pathlib.Path(args.output_dir) / "worker_files"
     script_dir.mkdir(parents=True, exist_ok=True)
     worker_script = script_dir / f"eval_policy_{args.ckpt_setting}.py"

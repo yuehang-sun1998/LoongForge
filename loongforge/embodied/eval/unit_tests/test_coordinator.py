@@ -37,6 +37,8 @@ def test_shard_config_applies_overrides_and_strips_coordinator_keys() -> None:
     assert shard["benchmark"]["episode_offset"] == 10
     assert shard["benchmark"]["episodes_per_task"] == 20
     assert shard["server"]["external_url"] == "ws://h:1"
+    assert shard["server"]["host"] == "h"
+    assert shard["server"]["port"] == 1
     assert shard["run"]["timestamped_output"] is False
     assert "coordinator" in base  # base not mutated
 
@@ -421,3 +423,127 @@ def test_run_tears_down_servers_when_startup_fails(monkeypatch: Any, tmp_path: A
     with pytest.raises(RuntimeError, match="never healthy"):
         coord.run(config, "")
     assert server.terminated  # not leaked
+
+
+def test_resolve_placement_uses_gpu_pool_for_robotwin() -> None:
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    config = {
+        "benchmark": {"name": "robotwin"},
+        "servers": [{"gpus": [0, 1]}],
+        "pools": {"gpu_sim": {"n_sims_per_server": 3}},
+    }
+    server_gpus, n_per_server, sim_gpus, placement, is_gpu = coord._resolve_placement(config)
+    assert server_gpus == [0, 1]
+    assert n_per_server == 3
+    assert sim_gpus == [0, 1]  # co_locate by default
+    assert placement == "co_locate"
+    assert is_gpu is True
+
+
+def test_resolve_placement_uses_cpu_pool_for_libero() -> None:
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    config = {
+        "benchmark": {"name": "libero"},
+        "servers": [{"gpus": [2]}],
+        "pools": {"cpu_sim": {"n_sims_per_server": 7}},
+    }
+    server_gpus, n_per_server, sim_gpus, placement, is_gpu = coord._resolve_placement(config)
+    assert (server_gpus, n_per_server, sim_gpus, placement, is_gpu) == ([2], 7, [2], "co_locate", False)
+
+
+def test_separate_placement_requires_sim_gpus() -> None:
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    config = {
+        "benchmark": {"name": "robotwin"},
+        "servers": [{"gpus": [0]}],
+        "pools": {"gpu_sim": {"n_sims_per_server": 1, "placement": "separate"}},
+    }
+    with pytest.raises(ValueError, match="sim_gpus"):
+        coord._resolve_placement(config)
+
+
+def test_separate_placement_rejects_gpu_overlap() -> None:
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    config = {
+        "benchmark": {"name": "robotwin"},
+        "servers": [{"gpus": [0, 1]}],
+        "pools": {"gpu_sim": {"n_sims_per_server": 1, "placement": "separate", "sim_gpus": [1, 2]}},
+    }
+    with pytest.raises(ValueError, match="both a server and sims"):
+        coord._resolve_placement(config)
+
+
+def test_build_slots_co_locate_pins_worker_to_its_server_gpu() -> None:
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    slots = coord._build_slots([0, 1], 2, [0, 1], "co_locate", ["ws://a", "ws://b"])
+    assert slots == [("ws://a", 0), ("ws://a", 0), ("ws://b", 1), ("ws://b", 1)]
+
+
+def test_build_slots_separate_spreads_workers_over_sim_gpus() -> None:
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    slots = coord._build_slots([0, 1], 2, [4, 5], "separate", ["ws://a", "ws://b"])
+    assert slots == [("ws://a", 4), ("ws://a", 5), ("ws://b", 4), ("ws://b", 5)]
+
+
+def test_gpu_vram_budget_rejects_too_many_sims() -> None:
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    config = {
+        "resources": {"gpu_sim": {"vram_total_mb": 80_000, "vram_per_sim_mb": 5_500, "vram_model_mb": 16_000}},
+    }
+    coord._validate_gpu_resources(config, 11, True)  # 76.5GB: fits
+    with pytest.raises(ValueError, match="vram_total_mb"):
+        coord._validate_gpu_resources(config, 12, True)  # 82GB: does not
+
+
+def test_shard_config_pins_worker_gpu_only_when_requested() -> None:
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    base = {"benchmark": {"name": "robotwin"}, "run": {}}
+    shard = _shard("robotwin/seed=1", {}, 1)
+    pinned = coord._shard_config(base, shard, "ws://h:1", "/tmp/out", gpu=3, pin_gpu=True)
+    unpinned = coord._shard_config(base, shard, "ws://h:1", "/tmp/out", gpu=3, pin_gpu=False)
+    assert pinned["run"]["cuda_visible_devices"] == "3"
+    assert "cuda_visible_devices" not in unpinned["run"]
+
+
+def test_run_does_not_retry_a_unit_that_wrote_every_episode(monkeypatch: Any, tmp_path: Any) -> None:
+    """A non-zero exit code after all episodes were recorded must not re-run the unit."""
+    import json
+    from pathlib import Path
+
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    launches: dict[int, int] = {}
+
+    def fake_launch(config: Any, shard: Any, index: int, url: str, output_dir: Any, tmp: Any) -> _FakeProc:
+        launches[index] = launches.get(index, 0) + 1
+        worker = Path(output_dir) / f"worker_{index}"
+        worker.mkdir(parents=True, exist_ok=True)
+        patch = (shard.get("overrides") or {}).get("benchmark") or {}
+        episode = int(patch.get("episode_offset") or patch.get("start_seed") or index)
+        record = {"episode_id": f"task/{episode}", "success": False}
+        (worker / "results.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+        return _FakeProc(1)  # benchmark exits non-zero on a model failure
+
+    monkeypatch.setattr(coord, "_launch_unit", fake_launch)
+    monkeypatch.setattr(coord, "start_server", lambda args, env=None: _FakeProc(0))
+    monkeypatch.setattr(coord, "wait_healthz", lambda *args, **kwargs: None)
+    monkeypatch.setattr(coord, "_aggregate", lambda *args, **kwargs: {})
+    monkeypatch.setattr(coord, "short_shards", lambda *args, **kwargs: [])
+
+    config = {
+        "benchmark": {"name": "libero", "suite": "libero_10", "task_ids": [0], "episodes_per_task": 2},
+        "servers": [{"gpus": [0]}],
+        "pools": {"cpu_sim": {"n_sims_per_server": 1}},
+        "run": {"output_dir": str(tmp_path)},
+    }
+    result = coord.run(config, "")
+    assert all(count == 1 for count in launches.values())  # no retry
+    assert result["failed_units"] == []

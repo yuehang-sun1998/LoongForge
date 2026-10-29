@@ -139,6 +139,10 @@
   - **固定 workload 会封顶并发**：第一轮（chunk=16、固定 200 集/点）在 N≥25 时实际只有 200 个 worker，`N/mean(wall)` 高估吞吐，该轮数据作废。
   - **第二轮（已完成）**：8 server 常驻 external 模式、每 client 1 集、总并发 = 8N、chunk=10、`max_wait_ms=50`；N=16/24/48/80 容量 70.7/77.8/81.8/81.9 eps/min，平台在 N≈48。明细见 `02_progress.md` §2.25。
   - **内存实测**（N=64、200 workers）：峰值 467GB、单 sim PSS ~2.0GB、无 OOM → `N_mem≈75`。
+- **GPU-sim（2026-10-29，预实验）**：
+  - 环境已具备（RoboTwin stable_2.0 + 真实 pi05）；单 sim 显存 ~5.5GB（见 T-07）。
+  - 8 卡 N=1：8 个 server 各 15.9GB（fp32 pi05）。首轮 worker 未绑卡 → 8 个 sim 全落 GPU 0（wall 689s）；修复 bind/端口/重试后复测：每卡 18.1–21.9GB、wall 172.8s、单 episode 82s。
+  - `pools.gpu_sim` + `placement` + worker 绑卡 + 显存校验已实现；**N=2/4/8 扫描待跑**（当前 8 卡被他人训练占用）。
 
 ### T-03 · 一行命令起 1+N（external server + 最小 coordinator）
 
@@ -488,8 +492,29 @@
   2. **异卡**：server 独占卡，sim 在其余卡（"1 server : N 张 sim 卡"）。
 - **指标**：wall-clock、`t_infer`（mean/p50/p95，**看抖动**）、显存峰值、`utilization.memory`、单 sim 的显存。
 - **通过标准**：给出两种放置的对比结论 + 推荐配置；重点确认**同卡是否把 `t_infer` 显著拉长**（若显著 → 改异卡，并回填 `01_architecture.md` §4.4 与风险栏）。
-- **数据**：_未执行_（本机缺少 GPU-sim 环境：RoboTwin 缺 EGL 驱动，SimplerEnv/ManiSkill 依赖未装）
-- **结论**：⏸ 暂缓，待 GPU-sim 环境具备后补测。
+- **数据（2026-10-28，预实验：单卡共享环境，仅测显存基线）**：
+  - 环境：RoboTwin stable_2.0、`adjust_bottle` / `demo_clean`、RoboTwin Python env（sapien 3.0.0 + curobo），A800-80GB，`CUDA_VISIBLE_DEVICES=4`。该卡被其他任务占用 ~49.2GB，剩余 ~32GB。
+  - **单 sim（独立进程）**：setup 增量 **+1.77GB**，rollout 峰值 **+4.97GB**，进程退出后显存全部释放。
+  - **k 个 sim 并发（同卡、独立进程、每进程 10 步）**：
+
+    | k | 峰值增量 | 每 sim 边际 | 单步耗时（所有 sim） |
+    |---|---|---|---|
+    | 1 | 4.97GB | 4.97GB | 0.429s |
+    | 2 | 10.94GB | 5.47GB | 0.66–0.69s |
+    | 4 | 21.87GB | 5.47GB | 1.45s |
+
+  - **暂定结论**：显存近似线性，边际 **~5.5GB/sim**（每进程 CUDA context 另计 ~0.5GB，首进程略低）；k=4 时单步耗时被拉长 3.4×，但该卡本身有邻居占用，**不能据此判断同卡争用**。
+- **数据（2026-10-29，真实 pi05 server + 8 卡）**：
+  - pi05 fp32 权重占 **16.6GB**；`use_bf16: false`（bf16 推理入口存在 float32/bf16 dtype 不兼容，见 §2.30）。
+  - bf16 对照（仅加载、无推理）：活权重 7.72GiB，`nvidia-smi` 15.9GB，`empty_cache()` 后 8.7GB。
+  - 8 卡 N=1 首轮：8 个 server 各 15.9GB；**worker 未绑卡 → 8 个 sim 全落在 GPU 0**（峰值 19.9GB），其余卡仅 server；单 episode 338s、wall 689s，连接超时触发重试。
+  - **8 卡 N=1 复测（修复 external_url 端口 / UnStableError / 重试语义后）**：
+    - 每卡峰值 **18.1–21.9GB**（8 张卡都有 sim）；`failed_units=[]`、unique 8/8
+    - **wall 172.8s**、单 episode 平均 **82.0s**（53.2–113.2s）
+    - 仍有 2 条重复：跳过 unstable seed 会越界进入相邻 shard 的固定 seed 区间（待稳定 seed 预扫描解决）
+  - seed 稳定性重复实验：`100003` 连续 3 次 unstable（同一物体），`100001` 两次 stable → **同机可复现**。
+  - 限制：2026-10-29 起 8 卡被他人训练任务占用 44–54GB/卡，N≥2 需等卡。
+- **结论**：🔄 显存基线与 8 卡放置验证完成；同卡 vs 异卡的 `t_infer` / wall-clock 对比待跑。
 
 ### T-08 · 同 ckpt：大 batch vs 单卡多副本 【✅ 已结案】
 

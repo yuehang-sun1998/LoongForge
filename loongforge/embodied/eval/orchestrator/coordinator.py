@@ -8,10 +8,12 @@ sections; ``run.py`` dispatches such configs here. The coordinator:
 
 1. starts one policy server per GPU (from ``servers[0].gpus``),
 2. asks the benchmark family's planner (``planning.py``) for the shards,
-3. runs a **bounded pool** of ``len(gpus) * pools.cpu_sim.n_sims_per_server``
+3. runs a **bounded pool** of ``len(server_gpus) * pool.n_sims_per_server``
    concurrent unit processes, pulling the next shard from a global queue as one
    finishes -- so a fast slot picks up the next unit instead of idling (this is
-   what flattens the long tail; a static one-shard-per-slot launch does not), and
+   what flattens the long tail; a static one-shard-per-slot launch does not),
+   pinning each worker's CUDA device for GPU simulators (``co_locate`` or
+   ``separate``; see ``pools.gpu_sim``), and
 4. aggregates the per-unit results and checks coverage.
 
 Each unit is an ordinary ``orchestrator.run`` subprocess pointed at a shared
@@ -31,6 +33,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
 
 from loongforge.embodied.eval.orchestrator.config import apply_config
 from loongforge.embodied.eval.orchestrator.server_manager import (
@@ -38,7 +41,7 @@ from loongforge.embodied.eval.orchestrator.server_manager import (
     start_server,
     wait_healthz,
 )
-from loongforge.embodied.eval.orchestrator.planning import Shard, plan_shards
+from loongforge.embodied.eval.orchestrator.planning import Shard, benchmark_family, plan_shards
 from loongforge.embodied.eval.transport.client import PolicyClient
 from loongforge.embodied.eval.orchestrator.validation import (
     format_report,
@@ -48,6 +51,9 @@ from loongforge.embodied.eval.orchestrator.validation import (
 )
 
 PORT_STRIDE = 20
+DEFAULT_PORT_BASE = 6000  # outside the kernel ephemeral range (10000-61000), see docs §4
+GPU_SIM_FAMILIES = {"robotwin", "simplerenv", "maniskill"}
+PLACEMENT_MODES = {"co_locate", "separate"}
 UNITS_PER_SLOT = 4  # shards per worker slot: slack so fast slots can steal work
 DEFAULT_MAX_RETRIES = 2  # episode-level infra retries (episode_error / timeouts) per unit
 MAX_REPAIR_ROUNDS = 3  # auto re-dispatch rounds for episodes the plan asked for but that never ran
@@ -66,10 +72,19 @@ POLICY_TIMEOUT_SAFETY = 2.0  # queue wait is (N-1) x service; keep 2x head-room
 MAX_ATTEMPTS = 2  # a failed unit is re-queued once before it is reported as failed
 
 
-def _shard_config(config: Dict[str, Any], shard: Shard, external_url: str, output_dir: str) -> Dict[str, Any]:
+def _shard_config(
+    config: Dict[str, Any],
+    shard: Shard,
+    external_url: str,
+    output_dir: str,
+    gpu: int | None = None,
+    pin_gpu: bool = False,
+) -> Dict[str, Any]:
     """Build one unit's config: a copy of the base, minus coordinator, plus this shard's patch.
 
     Benchmark-agnostic -- the planner already expressed the slice as config overrides.
+    ``pin_gpu`` injects the worker's CUDA device for GPU simulators; without it a
+    SAPIEN-based benchmark silently lands every worker on GPU 0.
     """
     shard_cfg = copy.deepcopy(config)
     for key in ("coordinator", "servers", "pools"):
@@ -82,11 +97,21 @@ def _shard_config(config: Dict[str, Any], shard: Shard, external_url: str, outpu
     run_cfg = shard_cfg.setdefault("run", {})
     run_cfg["output_dir"] = output_dir
     run_cfg["timestamped_output"] = False  # deterministic path so the coordinator can aggregate
+    if pin_gpu and gpu is not None:
+        run_cfg["cuda_visible_devices"] = str(gpu)
     # Retry infra-level episode failures (episode_error / timeouts / server_unreachable) by
     # default: a transient sim<->server disconnect must not be scored as a model failure.
     # Model failures (not_successful_within_max_steps) are never retried.
     run_cfg.setdefault("max_retries", DEFAULT_MAX_RETRIES)
-    shard_cfg.setdefault("server", {})["external_url"] = external_url
+    server_cfg = shard_cfg.setdefault("server", {})
+    server_cfg["external_url"] = external_url
+    # Some runners (e.g. RoboTwin) build their client from server.host/server.port
+    # and ignore external_url, so derive both from the URL the coordinator assigned.
+    parsed = urlparse(external_url)
+    if parsed.hostname:
+        server_cfg["host"] = parsed.hostname
+    if parsed.port:
+        server_cfg["port"] = parsed.port
     return shard_cfg
 
 
@@ -137,22 +162,110 @@ def _warn_policy_timeout(config: Dict[str, Any], n_per_server: int) -> None:
         )
 
 
-def _resolve_placement(config: Dict[str, Any]) -> tuple[List[int], int]:
-    """Resolve (gpus, n_sims_per_server) from servers/pools, falling back to coordinator."""
+def _resolve_pool(config: Dict[str, Any]) -> tuple[str, Dict[str, Any], bool]:
+    """Return (pool_name, pool_config, is_gpu_sim) for this benchmark family."""
+    pools = config.get("pools") or {}
+    if benchmark_family(config) in GPU_SIM_FAMILIES:
+        return "gpu_sim", pools.get("gpu_sim") or {}, True
+    return "cpu_sim", pools.get("cpu_sim") or {}, False
+
+
+def _resolve_placement(config: Dict[str, Any]) -> tuple[List[int], int, List[int], str, bool]:
+    """Resolve (server_gpus, n_sims_per_server, sim_gpus, placement, is_gpu_sim).
+
+    Backwards compatible: without a pool section the worker count falls back to
+    ``coordinator.n_workers`` and sims are co-located with their server.
+    """
     servers = config.get("servers") or []
     coordinator = config.get("coordinator") or {}
-    gpus = (servers[0].get("gpus") if servers else None) or coordinator.get("gpus") or [0]
+    server_gpus = (servers[0].get("gpus") if servers else None) or coordinator.get("gpus") or [0]
+    server_gpus = [int(g) for g in server_gpus]
+
+    pools = config.get("pools") or {}
+    _pool_name, pool, is_gpu_sim = _resolve_pool(config)
     n_per_server = (
-        ((config.get("pools") or {}).get("cpu_sim") or {}).get("n_sims_per_server") or coordinator.get("n_workers") or 1
+        pool.get("n_sims_per_server")
+        or (pools.get("cpu_sim") or {}).get("n_sims_per_server")
+        or coordinator.get("n_workers")
+        or 1
     )
-    return [int(g) for g in gpus], max(1, int(n_per_server))
+    n_per_server = max(1, int(n_per_server))
+
+    mode = str(pool.get("placement") or config.get("placement") or "co_locate")
+    if mode not in PLACEMENT_MODES:
+        raise ValueError(f"placement must be one of {sorted(PLACEMENT_MODES)}, got {mode!r}")
+
+    if mode == "co_locate" or not is_gpu_sim:
+        sim_gpus = list(server_gpus)
+    else:
+        sim_gpus = [int(g) for g in (pool.get("sim_gpus") or config.get("sim_gpus") or [])]
+        if not sim_gpus:
+            raise ValueError("placement='separate' requires pools.gpu_sim.sim_gpus (the GPUs that host sims)")
+        overlap = sorted(set(sim_gpus) & set(server_gpus))
+        if overlap:
+            raise ValueError(f"placement='separate' but these GPUs host both a server and sims: {overlap}")
+    return server_gpus, n_per_server, sim_gpus, mode, is_gpu_sim
+
+
+def _build_slots(
+    server_gpus: List[int], n_per_server: int, sim_gpus: List[int], mode: str, urls: List[str]
+) -> List[tuple[str, int]]:
+    """One (server_url, sim_gpu) pair per worker slot.
+
+    ``co_locate`` pins a server's workers to that server's GPU; ``separate``
+    spreads all workers over ``sim_gpus`` while keeping the server URLs paired
+    round-robin.
+    """
+    slots: List[tuple[str, int]] = []
+    sim_index = 0
+    for index, url in enumerate(urls):
+        for _ in range(n_per_server):
+            gpu = server_gpus[index] if mode == "co_locate" else sim_gpus[sim_index % len(sim_gpus)]
+            sim_index += 1
+            slots.append((url, gpu))
+    return slots
+
+
+def _validate_gpu_resources(config: Dict[str, Any], n_per_server: int, is_gpu_sim: bool) -> None:
+    """Fail fast when the requested sim count cannot fit next to the model.
+
+    Only runs when the config provides the hardware facts; the numbers come
+    from the calibration report (``resources.gpu_sim``).
+    """
+    if not is_gpu_sim:
+        return
+    resources = (config.get("resources") or {}).get("gpu_sim") or {}
+    vram_total = resources.get("vram_total_mb")
+    vram_per_sim = resources.get("vram_per_sim_mb")
+    vram_model = resources.get("vram_model_mb")
+    if vram_model is None and resources.get("vram_model_gb") is not None:
+        vram_model = float(resources["vram_model_gb"]) * 1024
+    if not (vram_total and vram_per_sim and vram_model is not None):
+        return
+    need = n_per_server * float(vram_per_sim) + float(vram_model)
+    if need > float(vram_total):
+        raise ValueError(
+            f"GPU-sim placement needs {need:.0f} MiB per card "
+            f"(N={n_per_server} x {vram_per_sim} MiB + model {vram_model:.0f} MiB) "
+            f"but resources.gpu_sim.vram_total_mb is {vram_total}"
+        )
+
 
 
 def _launch_unit(
-    config: Dict[str, Any], shard: tuple, index: int, external_url: str, output_dir: Path, tmp: Path
+    config: Dict[str, Any],
+    shard: tuple,
+    index: int,
+    external_url: str,
+    output_dir: Path,
+    tmp: Path,
+    gpu: int | None = None,
+    pin_gpu: bool = False,
 ) -> subprocess.Popen:
     """Launch one unit as an ``orchestrator.run`` subprocess pointed at its server."""
-    shard_cfg = _shard_config(config, shard, external_url, str(output_dir / f"worker_{index}"))
+    shard_cfg = _shard_config(
+        config, shard, external_url, str(output_dir / f"worker_{index}"), gpu=gpu, pin_gpu=pin_gpu
+    )
     cfg_path = tmp / f"unit_{index}.json"
     cfg_path.write_text(json.dumps(shard_cfg), encoding="utf-8")
     # Resume runs refuse a missing output_dir (typo protection). A resumed plan can
@@ -338,26 +451,48 @@ class _ServerWatchdog(threading.Thread):
         print(f"[watchdog] server {index} back up (pid={proc.pid})", flush=True)
 
 
+def _unit_completed(output_dir: Path, index: int, expected: int) -> bool:
+    """True when a unit already wrote the episodes the plan asked for.
+
+    Some official evaluators exit non-zero for a *model* failure (e.g. RoboTwin
+    prints ``Fail!``) even though every episode ran and was recorded. Re-running
+    such a unit wastes a full episode budget and produces duplicate records.
+    """
+    path = output_dir / f"worker_{index}" / "results.jsonl"
+    if not path.exists():
+        return False
+    seen = set()
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "episode_id" in record:
+            seen.add(str(record["episode_id"]))
+    return len(seen) >= max(1, int(expected or 1))
+
+
+
 def _run_batch(
     config: Dict[str, Any],
     shards: List[tuple],
     indices: List[int],
-    urls: List[str],
-    concurrency: int,
+    slots: List[tuple[str, int]],
     output_dir: Path,
     tmp: Path,
     timeout_sec: float = 0.0,
+    pin_gpu: bool = False,
 ) -> Tuple[Dict[int, int], List[int]]:
     """Run ``indices`` (into ``shards``) through a bounded pool fed by a global queue.
 
-    A unit that exits non-zero -- or that blows its ``timeout_sec`` budget -- is
-    re-queued once, then reported as failed.
-    Returns ``(returncodes_by_index, failed_indices)``.
+    ``slots`` pairs each worker slot with its server URL and sim GPU. A unit that
+    exits non-zero -- or that blows its ``timeout_sec`` budget -- is re-queued
+    once, then reported as failed. Returns ``(returncodes_by_index, failed_indices)``.
     """
     returncodes: Dict[int, int] = {}
     failures: List[int] = []
     pending = list(indices)
-    free_slots = list(range(concurrency))  # slot -> server = slot % len(urls)
+    free_slots = list(range(len(slots)))
     attempts: Dict[int, int] = {}
     started_at: Dict[int, float] = {}
     pool: Dict[subprocess.Popen, tuple] = {}
@@ -365,26 +500,37 @@ def _run_batch(
         while pending and free_slots:
             slot = free_slots.pop()
             index = pending.pop(0)
-            url = urls[slot % len(urls)]
+            url, gpu = slots[slot]
             started_at[index] = time.time()
-            pool[_launch_unit(config, shards[index], index, url, output_dir, tmp)] = (slot, index)
+            if pin_gpu:
+                proc = _launch_unit(
+                    config, shards[index], index, url, output_dir, tmp, gpu=gpu, pin_gpu=True
+                )
+            else:
+                proc = _launch_unit(config, shards[index], index, url, output_dir, tmp)
+            pool[proc] = (slot, index)
         finished, timed_out = _await_slot(pool, started_at, timeout_sec)
         slot, index = pool.pop(finished)
         free_slots.append(slot)
         returncodes[index] = finished.returncode
-        if finished.returncode != 0 or timed_out:
+        expected = int((shards[index] or {}).get("expected") or 1)
+        completed = _unit_completed(output_dir, index, expected)
+        if (finished.returncode != 0 or timed_out) and not completed:
             attempts[index] = attempts.get(index, 0) + 1
             if attempts[index] < MAX_ATTEMPTS:
                 pending.append(index)  # re-queue once; a fresh unit may just be a flaky sim
             else:
                 failures.append(index)
+        # A unit that wrote every expected episode is done even when the
+        # benchmark's own exit code is non-zero (model failure, not infra).
     return returncodes, failures
 
 
 def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     """Run a coordinated (G server : G x N worker) evaluation with dynamic dispatch."""
-    gpus, n_per_server = _resolve_placement(config)
-    concurrency = max(1, len(gpus) * n_per_server)
+    server_gpus, n_per_server, sim_gpus, placement, is_gpu_sim = _resolve_placement(config)
+    concurrency = max(1, len(server_gpus) * n_per_server)
+    _validate_gpu_resources(config, n_per_server, is_gpu_sim)
     plan = plan_shards(config, concurrency)
     expected_by_shard = {shard["id"]: int(shard["expected"]) for shard in plan}
     shards_by_id = {shard["id"]: shard for shard in plan}
@@ -402,9 +548,9 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     base_args = apply_config(build_server_argparser().parse_args([]), config)
     base_args.config = config_path
 
-    port_base = int(os.environ.get("LOONGFORGE_COORD_PORT_BASE", "14560"))
+    port_base = int(os.environ.get("LOONGFORGE_COORD_PORT_BASE", str(DEFAULT_PORT_BASE)))
     servers = []
-    for index, gpu in enumerate(gpus):
+    for index, gpu in enumerate(server_gpus):
         port = port_base + PORT_STRIDE * index
         health_port = port + 1
         server_log = str(output_dir / f"policy_server_{index}.log")
@@ -426,6 +572,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         server_args.server_log = server_log
         servers.append((start_server(server_args, {"CUDA_VISIBLE_DEVICES": str(gpu)}), server_args))
     urls = [f"ws://{args.host}:{args.port}" for _, args in servers]
+    slots = _build_slots(server_gpus, n_per_server, sim_gpus, placement, urls)
 
     unit_timeout = _unit_timeout_sec(config, plan)
     all_shards: List[Shard] = list(plan)
@@ -435,7 +582,7 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     coordinator_cfg = config.get("coordinator") or {}
     watchdog = _ServerWatchdog(  # started once the servers are healthy
         servers,
-        gpus,
+        server_gpus,
         interval_sec=float(coordinator_cfg.get("watchdog_interval_sec") or WATCHDOG_INTERVAL_SEC),
         probe_interval_sec=float(coordinator_cfg.get("watchdog_probe_interval_sec") or WATCHDOG_PROBE_INTERVAL_SEC),
     )
@@ -451,7 +598,8 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             _, failed_units = _run_batch(
-                config, all_shards, list(range(len(all_shards))), urls, concurrency, output_dir, tmp, unit_timeout
+                config, all_shards, list(range(len(all_shards))), slots, output_dir, tmp, unit_timeout,
+                pin_gpu=is_gpu_sim,
             )
             # Coverage gate: re-run the shards that came up short rather than aborting.
             # A re-run lands in a fresh worker dir, so the overlap is deduped by
@@ -466,7 +614,8 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
                 first = len(all_shards)
                 all_shards.extend(shards_by_id[shard_id] for shard_id in short)
                 _, extra_failed = _run_batch(
-                    config, all_shards, list(range(first, len(all_shards))), urls, concurrency, output_dir, tmp, unit_timeout
+                    config, all_shards, list(range(first, len(all_shards))), slots, output_dir, tmp,
+                    unit_timeout, pin_gpu=is_gpu_sim,
                 )
                 failed_units.extend(extra_failed)
                 repair_rounds += 1
@@ -504,7 +653,9 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         "benchmark": (config.get("benchmark") or {}).get("suites")
         or (config.get("benchmark") or {}).get("suite")
         or (config.get("benchmark") or {}).get("name"),
-        "gpus": gpus,
+        "gpus": server_gpus,
+        "sim_gpus": sim_gpus,
+        "placement": placement,
         "n_sims_per_server": n_per_server,
         "concurrency": concurrency,
         "n_units": len(plan),

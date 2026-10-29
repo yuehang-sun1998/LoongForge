@@ -381,3 +381,37 @@ def test_build_robotwin_records_fallback_without_log() -> None:
     assert records[0]["success"] == 0
     assert records[0]["success_rate"] == pytest.approx(0.0)
     assert records[0]["seed"] == 100001
+
+
+def test_worker_script_skips_unstable_seeds(tmp_path: pathlib.Path) -> None:
+    """The worker copy handles UnStableError in the eval loop, not just expert_check."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    robotwin = tmp_path / "RoboTwin"
+    (robotwin / "script").mkdir(parents=True)
+    source = (
+        "import sys\n"
+        'sys.path.append("./description/utils")\n'
+        "def eval_policy():\n"
+        "    while True:\n"
+        "        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)\n"
+        "        TASK_ENV.set_instruction(instruction=instruction)\n"
+    )
+    (robotwin / "script" / "eval_policy.py").write_text(source, encoding="utf-8")
+
+    args = argparse.Namespace(
+        worker_local_files=True,
+        robotwin_path=str(robotwin),
+        output_dir=str(tmp_path / "out"),
+        ckpt_setting="test",
+        step_limit_override=None,
+        start_seed_override=None,
+        test_num_override=None,
+        disable_expert_check=False,
+        disable_eval_video_log=False,
+    )
+    script = robotwin_runner._worker_eval_script(args)
+    text = script.read_text(encoding="utf-8")
+    assert "except UnStableError" in text
+    assert "now_seed += 1" in text
+    assert "continue" in text
