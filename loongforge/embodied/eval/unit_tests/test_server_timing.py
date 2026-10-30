@@ -115,3 +115,15 @@ def test_error_path_records_and_returns_error(tmp_path) -> None:
     response = server._route_message(_infer_message())
     assert response["ok"] is False
     assert server._latency.summary()["count"] == 1
+
+
+def test_concurrent_flush_is_safe(tmp_path) -> None:
+    """Many sims on one server flush concurrently; the temp file must not race."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "timing.json"
+    recorder = LatencyRecorder(enabled=True, path=str(path), flush_every=1)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(recorder.record, range(200)))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["count"] == 200

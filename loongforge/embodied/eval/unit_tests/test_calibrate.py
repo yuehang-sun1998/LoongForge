@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from loongforge.embodied.eval.orchestrator.calibrate import (
+    _GpuPeakSampler,
     _point_config,
     _read_timing,
     _sweep_rows,
@@ -86,3 +87,15 @@ def test_is_gpu_sim_detects_sapien_families() -> None:
     assert is_gpu_sim({"benchmark": {"name": "maniskill"}})
     assert not is_gpu_sim({"benchmark": {"name": "libero"}})
     assert not is_gpu_sim({"benchmark": {"name": "calvin"}})
+
+
+def test_gpu_peak_sampler_stops_and_writes_its_sink(tmp_path) -> None:
+    """Thread._stop is private; the sampler must not shadow it with an Event."""
+    import time
+
+    out = tmp_path / "gpu_peak.json"
+    sampler = _GpuPeakSampler([], out, interval=0.01)
+    sampler.start()
+    time.sleep(0.05)
+    sampler.stop()  # would raise TypeError if the Event shadowed Thread._stop
+    assert out.exists()

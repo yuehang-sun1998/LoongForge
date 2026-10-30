@@ -113,6 +113,8 @@ def _sweep_rows(ns: Sequence[int], root: Path) -> List[Dict[str, Any]]:
             "workers": result.get("concurrency") or result.get("n_workers"),
             "wall_sec": elapsed,
             "episodes": episodes,
+            "successes": summary.get("successes"),
+            "success_rate": summary.get("success_rate"),
             "requests": requests,
             "throughput_ep_per_min": round(episodes / elapsed * 60, 2) if (episodes and elapsed) else None,
             "server_busy_frac": busy,
@@ -175,11 +177,11 @@ class _GpuPeakSampler(threading.Thread):
         self._gpus = list(gpus)
         self._out = out_path
         self._interval = interval
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._peak: Dict[str, int] = {}
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             for gpu in self._gpus:
                 try:
                     out = subprocess.check_output(
@@ -191,10 +193,10 @@ class _GpuPeakSampler(threading.Thread):
                 except Exception:
                     continue
                 self._peak[str(gpu)] = max(self._peak.get(str(gpu), 0), used)
-            self._stop.wait(self._interval)
+            self._stop_event.wait(self._interval)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=2)
         self._out.write_text(json.dumps(self._peak, indent=2), encoding="utf-8")
 
@@ -215,7 +217,7 @@ def _timing_env(out: Path) -> Dict[str, str]:
     return {
         "LOONGFORGE_EVAL_TIMING": "1",
         "LOONGFORGE_EVAL_TIMING_PATH": str(out / "timing.json"),
-        "LOONGFORGE_EVAL_TIMING_FLUSH_EVERY": "100",
+        "LOONGFORGE_EVAL_TIMING_FLUSH_EVERY": "1",
     }
 
 

@@ -50,6 +50,8 @@ def _write_deploy_policy(args: argparse.Namespace, path: pathlib.Path) -> None:
         "control_hz": args.control_hz,
         "disable_action_cache": args.disable_action_cache,
         "return_action_chunk": args.return_action_chunk,
+        "skip_intra_chunk_obs": bool(getattr(args, "skip_intra_chunk_obs", False)),
+        "chunk_execute_steps": int(getattr(args, "chunk_execute_steps", 0) or 0),
         "action_bridge": getattr(args, "action_bridge", "ee6d_dual"),
         "domain_id": getattr(args, "domain_id", None),
         "trace_path": str(_robotwin_artifact_dir(args) / "trace.json"),
@@ -142,21 +144,63 @@ def _worker_eval_script(args: argparse.Namespace) -> Optional[pathlib.Path]:
     # aborts the whole run (and the coordinator would retry the same
     # deterministic seed). Skip the seed instead, mirroring the official branch.
     unstable_old = (
-        "        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)\n"
-        "        TASK_ENV.set_instruction(instruction=instruction)"
+        "\n        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)\n"
     )
     unstable_new = (
-        "        try:\n"
+        "\n        try:\n"
         "            TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)\n"
         "        except UnStableError:\n"
         "            TASK_ENV.close_env()\n"
+        # succ_seed/test_num are incremented BEFORE setup_demo in the official
+        # loop, so a skipped seed must undo that count or the loop exits early.
+        "            succ_seed -= 1\n"
+        "            if suc_test_seed_list:\n"
+        "                suc_test_seed_list.pop()\n"
         "            now_seed += 1\n"
         '            args["render_freq"] = render_freq\n'
         "            continue\n"
-        "        TASK_ENV.set_instruction(instruction=instruction)"
     )
     if unstable_old in text:
         text = text.replace(unstable_old, unstable_new, 1)
+    # Chunk execution only needs a rendered frame when the next step will
+    # actually hit the policy server. `model.needs_obs()` (the bridge) knows
+    # whether the buffered chunk still has actions; everything else gets a
+    # cheap proprio-only dict, which is all the decoders read. Camera
+    # rendering is the dominant sim cost on GPU-sim.
+    if getattr(args, "skip_intra_chunk_obs", False):
+        loop_old = (
+            "        while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:\n"
+            "            observation = TASK_ENV.get_obs()\n"
+            "            eval_func(TASK_ENV, model, observation)\n"
+        )
+        loop_new = (
+            "        while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:\n"
+            "            observation = (\n"
+            "                TASK_ENV.get_obs() if model.needs_obs()\n"
+            "                else _vla_proprio_observation(TASK_ENV)\n"
+            "            )\n"
+            "            eval_func(TASK_ENV, model, observation)\n"
+        )
+        helper = (
+            "\ndef _vla_proprio_observation(TASK_ENV):\n"
+            '    """Robot state only: a buffered chunk needs no camera render."""\n'
+            "    left = TASK_ENV.robot.get_left_arm_jointState()\n"
+            "    right = TASK_ENV.robot.get_right_arm_jointState()\n"
+            "    return {\n"
+            '        "joint_action": {\n'
+            '            "left_arm": left[:-1],\n'
+            '            "left_gripper": left[-1],\n'
+            '            "right_arm": right[:-1],\n'
+            '            "right_gripper": right[-1],\n'
+            '            "vector": np.array(left + right),\n'
+            "        },\n"
+            "    }\n\n"
+        )
+        if loop_old in text:
+            text = text.replace(loop_old, loop_new, 1)
+            anchor = "def eval_policy(task_name,"
+            if anchor in text:
+                text = text.replace(anchor, helper + anchor, 1)
     # Advance by a full round of shard blocks, not by one seed: neighbouring
     # shards own adjacent ranges, so +1 would run another shard's seed.
     seed_stride = int(getattr(args, "seed_stride", 1) or 1)
@@ -349,11 +393,18 @@ def _apply_config(args: argparse.Namespace, config: Dict[str, object]) -> argpar
         (benchmark, "max_steps", "max_steps"),
         (benchmark, "start_seed", "start_seed_override"),
         (benchmark, "seed_stride", "seed_stride"),
-        (benchmark, "test_num", "test_num_override"),
+        # episodes_per_task is the whole-run default; a shard's explicit test_num
+        # must win, so it is applied after this line.
         (benchmark, "episodes_per_task", "test_num_override"),
+        (benchmark, "test_num", "test_num_override"),
         (benchmark, "disable_expert_check", "disable_expert_check"),
         (benchmark, "domain_id", "domain_id"),
         (benchmark, "action_bridge", "action_bridge"),
+        (benchmark, "return_action_chunk", "return_action_chunk"),
+        (benchmark, "disable_action_cache", "disable_action_cache"),
+        (benchmark, "chunk_execute_steps", "chunk_execute_steps"),
+        (benchmark, "skip_intra_chunk_obs", "skip_intra_chunk_obs"),
+        (server, "chunk_execute_steps", "chunk_execute_steps"),
         (server, "ckpt_path", "policy_ckpt_path"),
         (model, "unnorm_key", "unnorm_key"),
         (model, "action_mode", "action_mode"),
@@ -492,6 +543,13 @@ def _build_robotwin_records(
         return records
 
     # Fallback: no parseable episodes — one synthetic row (legacy-compatible shape).
+    # Fallback: no parseable episodes.
+    if official_rate is None and int(returncode) != 0:
+        # The official process died before completing an episode (e.g. an
+        # uncaught UnStableError). Do not fabricate a model failure: return no
+        # record so the coordinator retries/repaire the shard instead of
+        # counting a fake 100-step episode.
+        return []
     if official_rate is not None:
         success = int(official_rate > 0.0)
         rate = float(official_rate)
@@ -671,6 +729,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--instruction-type", default="unseen")
     parser.add_argument("--disable-action-cache", action="store_true")
     parser.add_argument("--return-action-chunk", action="store_true")
+    parser.add_argument("--skip-intra-chunk-obs", action="store_true")
     parser.add_argument("--disable-eval-video-log", action="store_true")
     parser.add_argument("--cuda-visible-devices", default=None)
     parser.add_argument("--timeout-sec", type=float, default=None)

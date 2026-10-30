@@ -10,8 +10,10 @@ recording is a no-op.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -58,6 +60,11 @@ class LatencyRecorder:
         self.path = path
         self.flush_every = flush_every
         self._values: List[float] = []
+        self._lock = threading.RLock()
+        if self.enabled and self.path:
+            # Best-effort final write on a clean interpreter exit. A SIGTERM does
+            # not run atexit handlers, so calibration also sets FLUSH_EVERY=1.
+            atexit.register(self.flush)
 
     @classmethod
     def from_env(cls) -> "LatencyRecorder":
@@ -72,9 +79,10 @@ class LatencyRecorder:
         """Append one service time in milliseconds; no-op when disabled."""
         if not self.enabled:
             return
-        self._values.append(float(ms))
-        if self.flush_every and len(self._values) % self.flush_every == 0:
-            self.flush()
+        with self._lock:
+            self._values.append(float(ms))
+            if self.flush_every and len(self._values) % self.flush_every == 0:
+                self.flush()
 
     def summary(self) -> Dict[str, Any]:
         """Return the current distribution summary."""
@@ -85,7 +93,10 @@ class LatencyRecorder:
         if not self.enabled or not self.path:
             return
         out = Path(self.path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_name(out.name + ".tmp")
-        tmp.write_text(json.dumps(self.summary(), indent=2), encoding="utf-8")
-        os.replace(tmp, out)
+        with self._lock:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            # Unique temp name: concurrent requests (one server, many sims) may
+            # flush at the same time and would otherwise race on the same file.
+            tmp = out.with_name(f"{out.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(self.summary(), indent=2), encoding="utf-8")
+            os.replace(tmp, out)

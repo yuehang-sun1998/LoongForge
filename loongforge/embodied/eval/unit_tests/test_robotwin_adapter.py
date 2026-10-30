@@ -414,6 +414,166 @@ def test_worker_script_skips_unstable_seeds(tmp_path: pathlib.Path) -> None:
     script = robotwin_runner._worker_eval_script(args)
     text = script.read_text(encoding="utf-8")
     assert "except UnStableError" in text
+    assert "succ_seed -= 1" in text  # undo the pre-setup increment
     assert "now_seed += 8" in text  # jump a full round, not into the next shard
     assert "now_seed += 1" not in text
     assert "continue" in text
+
+
+def test_crashed_run_without_result_is_not_a_fake_episode() -> None:
+    """An official crash before any episode must not become a 100-step failure row."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    args = argparse.Namespace(
+        task_name="adjust_bottle",
+        task_config="demo_clean",
+        ckpt_setting="test",
+        max_steps=100,
+        seed=0,
+        start_seed_override=100003,
+    )
+    records = robotwin_runner._build_robotwin_records(
+        args,
+        returncode=1,
+        artifacts={},
+        episode_time_sec=54.0,
+        result_txt=None,
+        log_text="UnStableError: Objects is unstable in seed(100003)",
+    )
+    assert records == []
+
+
+def test_shard_test_num_wins_over_episodes_per_task() -> None:
+    """A coordinator shard sets test_num; the run-wide episodes_per_task must not override it."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    args = robotwin_runner.build_argparser().parse_args([])
+    config = {
+        "benchmark": {"task_name": "adjust_bottle", "episodes_per_task": 8, "test_num": 1},
+        "server": {},
+    }
+    args = robotwin_runner._apply_config(args, config)
+    assert args.test_num_override == 1
+
+
+def test_apply_config_maps_chunk_flags() -> None:
+    """benchmark.return_action_chunk must reach the bridge; it was previously dropped."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    args = robotwin_runner.build_argparser().parse_args([])
+    config = {
+        "benchmark": {
+            "return_action_chunk": True,
+            "disable_action_cache": True,
+            "chunk_execute_steps": 24,
+        },
+        "server": {},
+    }
+    args = robotwin_runner._apply_config(args, config)
+    assert args.return_action_chunk is True
+    assert args.disable_action_cache is True
+    assert args.chunk_execute_steps == 24
+
+
+def test_chunk_rows_are_consumed_in_order() -> None:
+    """The bridge holds the client-owned chunk and advances one row per env step."""
+    from loongforge.embodied.eval.bridges.robotwin_policy import ModelClient
+
+    model = object.__new__(ModelClient)
+    model._chunk = np.arange(6, dtype=np.float32).reshape(3, 2)
+    model._chunk_cursor = 0
+    model._chunk_len = 3
+    assert model._take_chunk_row().tolist() == [[0.0, 1.0]]
+    assert model._take_chunk_row().tolist() == [[2.0, 3.0]]
+    assert model._take_chunk_row().tolist() == [[4.0, 5.0]]
+    assert model._chunk_cursor == 3
+
+
+def test_deploy_policy_records_chunk_depth(tmp_path: pathlib.Path) -> None:
+    """The bridge can only execute 24 steps if the deploy file carries the depth."""
+    import yaml
+
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    args = robotwin_runner.build_argparser().parse_args([])
+    args.robotwin_path = "/workspace/RoboTwin"
+    args.output_dir = str(tmp_path)
+    args.task_name = "adjust_bottle"
+    args.task_config = "demo_clean"
+    args.policy_ckpt_path = "/tmp/ckpt"
+    args.return_action_chunk = True
+    args.chunk_execute_steps = 24
+
+    path = tmp_path / "deploy_policy.yml"
+    robotwin_runner._write_deploy_policy(args, path)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert data["return_action_chunk"] is True
+    assert data["chunk_execute_steps"] == 24
+
+
+def test_needs_obs_follows_the_buffered_chunk() -> None:
+    """Only steps that will hit the server need a rendered frame."""
+    # ModelClient.__init__ dials the policy server, so exercise the predicate
+    # on a bare instance: it only reads the chunk cursor and the cache mode.
+    chunked = ModelClient.__new__(ModelClient)
+    chunked.return_action_chunk = True
+    chunked._chunk = None
+    chunked._chunk_cursor = 0
+    chunked._chunk_len = 0
+    assert chunked.needs_obs() is True  # nothing buffered yet
+
+    chunked._chunk = np.zeros((4, 14), dtype=np.float32)
+    chunked._chunk_cursor = 1
+    chunked._chunk_len = 4
+    assert chunked.needs_obs() is False  # replaying a buffered row
+
+    chunked._chunk_cursor = 4
+    assert chunked.needs_obs() is True  # chunk exhausted -> request
+
+    server_cache = ModelClient.__new__(ModelClient)
+    server_cache.return_action_chunk = False
+    server_cache._chunk = np.zeros((4, 14), dtype=np.float32)
+    server_cache._chunk_cursor = 1
+    server_cache._chunk_len = 4
+    assert server_cache.needs_obs() is True  # one request per step
+
+
+def test_worker_script_skips_intra_chunk_render(tmp_path: pathlib.Path) -> None:
+    """The opt-in switch replaces get_obs() with a proprio-only observation."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    robotwin = tmp_path / "RoboTwin"
+    (robotwin / "script").mkdir(parents=True)
+    source = (
+        "import numpy as np\n"
+        "def eval_policy(task_name, TASK_ENV, args, model):\n"
+        "        while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:\n"
+        "            observation = TASK_ENV.get_obs()\n"
+        "            eval_func(TASK_ENV, model, observation)\n"
+    )
+    (robotwin / "script" / "eval_policy.py").write_text(source, encoding="utf-8")
+
+    def run(skip: bool) -> str:
+        args = argparse.Namespace(
+            worker_local_files=True,
+            robotwin_path=str(robotwin),
+            output_dir=str(tmp_path / f"out_{skip}"),
+            ckpt_setting="test",
+            step_limit_override=None,
+            start_seed_override=None,
+            test_num_override=None,
+            disable_expert_check=False,
+            disable_eval_video_log=False,
+            seed_stride=1,
+            skip_intra_chunk_obs=skip,
+        )
+        return robotwin_runner._worker_eval_script(args).read_text(encoding="utf-8")
+
+    enabled = run(True)
+    assert "model.needs_obs()" in enabled
+    assert "_vla_proprio_observation(TASK_ENV)" in enabled
+    assert "def _vla_proprio_observation(TASK_ENV):" in enabled
+
+    disabled = run(False)
+    assert "needs_obs" not in disabled
+    assert "observation = TASK_ENV.get_obs()" in disabled

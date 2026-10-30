@@ -92,12 +92,16 @@ def _shard_config(
     output_dir: str,
     gpu: int | None = None,
     pin_gpu: bool = False,
+    worker_index: int | None = None,
 ) -> Dict[str, Any]:
     """Build one unit's config: a copy of the base, minus coordinator, plus this shard's patch.
 
     Benchmark-agnostic -- the planner already expressed the slice as config overrides.
     ``pin_gpu`` injects the worker's CUDA device for GPU simulators; without it a
     SAPIEN-based benchmark silently lands every worker on GPU 0.
+    ``worker_index`` makes ``run.ckpt_setting`` unique: RoboTwin names its official
+    result directory by ``(ckpt_setting, second)``, so concurrent workers would
+    otherwise overwrite each other's ``_result.txt``.
     """
     shard_cfg = copy.deepcopy(config)
     for key in ("coordinator", "servers", "pools"):
@@ -110,6 +114,9 @@ def _shard_config(
     run_cfg = shard_cfg.setdefault("run", {})
     run_cfg["output_dir"] = output_dir
     run_cfg["timestamped_output"] = False  # deterministic path so the coordinator can aggregate
+    if worker_index is not None:
+        base_setting = str(run_cfg.get("ckpt_setting") or "unit")
+        run_cfg["ckpt_setting"] = f"{base_setting}_w{worker_index}"
     if pin_gpu and gpu is not None:
         run_cfg["cuda_visible_devices"] = str(gpu)
     # Retry infra-level episode failures (episode_error / timeouts / server_unreachable) by
@@ -277,7 +284,8 @@ def _launch_unit(
 ) -> subprocess.Popen:
     """Launch one unit as an ``orchestrator.run`` subprocess pointed at its server."""
     shard_cfg = _shard_config(
-        config, shard, external_url, str(output_dir / f"worker_{index}"), gpu=gpu, pin_gpu=pin_gpu
+        config, shard, external_url, str(output_dir / f"worker_{index}"),
+        gpu=gpu, pin_gpu=pin_gpu, worker_index=index,
     )
     cfg_path = tmp / f"unit_{index}.json"
     cfg_path.write_text(json.dumps(shard_cfg), encoding="utf-8")

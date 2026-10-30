@@ -547,3 +547,15 @@ def test_run_does_not_retry_a_unit_that_wrote_every_episode(monkeypatch: Any, tm
     result = coord.run(config, "")
     assert all(count == 1 for count in launches.values())  # no retry
     assert result["failed_units"] == []
+
+
+def test_shard_config_makes_ckpt_setting_unique_per_worker() -> None:
+    """RoboTwin's official result dir is keyed by ckpt_setting; workers must not collide."""
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    base = {"benchmark": {"name": "robotwin"}, "run": {"ckpt_setting": "pi05_robotwin2"}}
+    shard = _shard("robotwin/seed=1", {}, 1)
+    unique = coord._shard_config(base, shard, "ws://h:1", "/tmp/out", worker_index=3)
+    plain = coord._shard_config(base, shard, "ws://h:1", "/tmp/out")
+    assert unique["run"]["ckpt_setting"] == "pi05_robotwin2_w3"
+    assert plain["run"]["ckpt_setting"] == "pi05_robotwin2"
