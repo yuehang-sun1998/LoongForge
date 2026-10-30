@@ -69,6 +69,7 @@ class PolicyServer:
                     max_batch_size=int(self._batching.get("max_batch_size", 8)),
                     max_wait_ms=float(self._batching.get("max_wait_ms", 5.0)),
                     latency_recorder=self._latency,
+                    stats_interval_s=float(self._batching.get("stats_interval_s", 30.0)),
                 )
                 await self._batcher.start()
                 logger.info("Server-side batching enabled: %s", self._batching)

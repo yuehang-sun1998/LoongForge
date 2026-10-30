@@ -124,6 +124,10 @@ class PI05ModelFactory:
             "action_horizon": model_cfg.action_horizon,
             "dataset_statistics_path": server_args.dataset_statistics_path,
             "tokenizer_path": model._tokenizer_path,
+            # Server-side batching contract: per-row noise comes from a fixed
+            # seed, so batch and sequential rows stay comparable.
+            "supports_batching": True,
+            "noise_seed": int(model_cfg.noise_seed),
         }
         return PredictActionModelSpec(model=model, metadata=metadata)
 

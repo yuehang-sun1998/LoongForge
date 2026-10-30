@@ -28,7 +28,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Sequence
 
 import numpy as np
 import torch
@@ -1058,7 +1058,8 @@ class PI05Policy(nn.Module):
         return self.predict_action_chunk(batch, **kwargs)[:, 0]
 
     @torch.no_grad()
-    def predict_action(self, images, instructions, state=None, dataset_stats=None) -> np.ndarray:
+    def predict_action(self, images, instructions, state=None, dataset_stats=None,
+                       seeds: Optional[Sequence[int]] = None) -> np.ndarray:
         """Inference: Euler ODE denoising, returns ndarray (B, action_horizon, max_action_dim)."""
         from loongforge.embodied.data.datasets.pi05.transforms.pi05_transform import StateDiscretizationTransform
         from loongforge.embodied.data.datasets.transforms.utils.builders import convert_stats
@@ -1106,7 +1107,28 @@ class PI05Policy(nn.Module):
         tokens = tok["input_ids"].to(device)
         masks = tok["attention_mask"].bool().to(device)
 
-        actions = self.model.sample_actions(images_list, img_masks, tokens, masks)
+        noise = None
+        if seeds is not None:
+            seed_list = [int(seed) for seed in seeds]
+            if len(seed_list) != B:
+                raise ValueError(f"expected {B} seeds, got {len(seed_list)}")
+            chunk_size = self.model.config.chunk_size
+            action_dim = self.model.config.max_action_dim
+            rows = []
+            for seed in seed_list:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
+                rows.append(
+                    torch.randn(
+                        (chunk_size, action_dim),
+                        generator=generator,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                )
+            noise = torch.stack(rows, dim=0)
+
+        actions = self.model.sample_actions(images_list, img_masks, tokens, masks, noise=noise)
         action_stats = convert_stats(dataset_stats.get("action")) if dataset_stats else None
         actions = _q99_unnormalize_actions(actions, action_stats)
         return actions.cpu().numpy()

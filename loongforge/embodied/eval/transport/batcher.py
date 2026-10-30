@@ -36,13 +36,18 @@ class AsyncBatcher:
         max_batch_size: int = 8,
         max_wait_ms: float = 5.0,
         latency_recorder: Optional[Any] = None,
+        stats_interval_s: float = 30.0,
     ) -> None:
         self._policy = policy
         self._max_batch_size = max(1, int(max_batch_size))
         self._max_wait_s = max(0.0, float(max_wait_ms) / 1000.0)
         self._latency = latency_recorder
+        # Periodic heartbeat so a SIGTERM'd server still leaves batch stats in
+        # the log (the finally block never runs on SIGTERM).
+        self._stats_interval_s = max(0.0, float(stats_interval_s))
         self._queue: asyncio.Queue = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
+        self._stats_task: Optional[asyncio.Task] = None
         self._closed = False
         self.total_requests = 0
         self.total_batches = 0
@@ -52,6 +57,10 @@ class AsyncBatcher:
         """Start the background batch loop."""
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="eval-batcher")
+        if self._stats_interval_s > 0 and self._stats_task is None:
+            self._stats_task = asyncio.create_task(
+                self._log_stats_loop(), name="eval-batcher-stats"
+            )
         if not getattr(self._policy, "supports_batching", False):
             logger.warning(
                 "Server batching is enabled but the model has no batch contract "
@@ -68,6 +77,13 @@ class AsyncBatcher:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+            try:
+                await self._stats_task
+            except asyncio.CancelledError:
+                pass
+            self._stats_task = None
 
     @property
     def stats(self) -> Dict[str, Any]:
@@ -80,6 +96,22 @@ class AsyncBatcher:
             ),
             "max_batch_size": max(self._batch_sizes) if self._batch_sizes else 0,
         }
+
+    async def _log_stats_loop(self) -> None:
+        """Emit a heartbeat with cumulative batch statistics."""
+        while not self._closed:
+            await asyncio.sleep(self._stats_interval_s)
+            if self._closed:
+                return
+            stats = self.stats
+            logger.info(
+                "Batcher stats: requests=%d batches=%d mean_batch=%.2f max_batch=%d pending=%d",
+                stats["requests"],
+                stats["batches"],
+                stats["mean_batch_size"],
+                stats["max_batch_size"],
+                self._queue.qsize(),
+            )
 
     async def submit(self, payload: Dict[str, Any]) -> Any:
         """Submit one inference payload and await its result."""

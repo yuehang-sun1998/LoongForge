@@ -229,6 +229,14 @@ class GenericPredictActionPolicy:
             raise ValueError(
                 f"batched model returned {actions.shape[0]} rows for {len(payloads)} payloads"
             )
+        # Models emit the padded max_action_dim; trim exactly like the
+        # sequential path in call_predict_action so both paths agree.
+        action_dim = int(self._metadata["action_dim"])
+        if actions.shape[-1] < action_dim:
+            raise ValueError(
+                f"batched model returned action dim {actions.shape[-1]}, expected at least {action_dim}"
+            )
+        actions = actions[..., :action_dim]
 
         responses = []
         for payload, row in zip(payloads, actions):

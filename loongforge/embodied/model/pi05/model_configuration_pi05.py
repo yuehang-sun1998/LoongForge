@@ -60,6 +60,9 @@ class Pi05ModelConfig:
     action_horizon: int = 50
     max_action_dim: int = 32
     max_state_dim: int = 32
+    # Fixed initial action-noise seed so batched and sequential requests are
+    # comparable (server-side batching requires a deterministic seed).
+    noise_seed: int = 0
 
     # Training-time model switches
     freeze_vision_encoder: bool = False
