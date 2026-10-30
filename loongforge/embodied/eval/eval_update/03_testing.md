@@ -40,12 +40,12 @@
 | 用例 | 对应功能 | 阶段 | benchmark 类 | 状态 |
 |---|---|---|---|---|
 | T-01 | server 侧插桩 + vanilla 1:1 标定 | 0 | CPU-sim（LIBERO） | ✅ 通过 |
-| T-02 | N 扫描 → 标定报告 + 并行配置 | 0/1 | CPU-sim + GPU-sim 各一 | 🔄 CPU-sim ✅（含报告+决策）；GPU-sim 待做 |
+| T-02 | N 扫描 → 标定报告 + 并行配置 | 0/1 | CPU-sim + GPU-sim 各一 | ✅ 两类均通过；GPU-sim N=1/2/4/8，拐点 N=4（5.81 ep/min） |
 | T-03 | 一行命令起 1+N（external + 最小 coordinator） | 1 | CPU-sim | ✅ 通过（N=1 两步 / N=2 一条命令） |
 | T-04 | shard/worker 契约 | 2 | 至少两个 family | ✅ 通过（由 `run.py` 分发吸收，M2 E2E 驱动多 server 分片） |
 | T-05 | 动态队列 + 全量 wall-clock | 2 | 全 benchmark | ✅ 静态基线 94.2 min；**M2 全量 56.2 min / 96.45%**（vs 基线 1.68×、vs 1卡1server 3.09×） |
-| T-06 | 数值一致性（batch>1 vs batch=1） | 3（M3 前置） | 任一 | 📋 **方案已定**（per-row seeds 比对，见下）；待契约落地 |
-| T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | ⏸ 暂缓（环境不支持 GPU-sim，待 CPU-sim 完成后统一做） |
+| T-06 | 数值一致性（batch>1 vs batch=1） | 3（M3 前置） | 任一 | ✅ 通过（FastWAM bf16 `4.9e-3`；pi05 fp32 `2.9e-2`，无结构差异） |
+| T-07 | GPU-sim：sim/server 同卡 vs 异卡 | 1 | GPU-sim | 🔄 同卡基线 + 显存/吞吐已测；异卡 A/B 待做（详见 `02_progress.md` §2.31/§2.33） |
 | T-08 | 同 ckpt：大 batch vs 单卡多副本 | 3 | 任一 | ✅ 已结案（batch 7.3× vs 多副本 1.25×） |
 | T-09 | 运行后覆盖校验（漏/重/多出）+ 自动补跑 | 2 | 任一 | ✅ 通过（单测 5 passed；真实 M2 全量 `ok=true`） |
 | T-10 | 故障注入：漏集补跑 / kill server 自愈 | 2 | 任一 | ✅ 通过（漏集补跑 ✅；kill server → 看门狗重启、`infra_failed=0`） |
@@ -488,6 +488,20 @@
   - **首次真实数据**（external、chunk=10、`max_wait_ms=50`、N=64、512 集）：**512/512 完成、成功率 97.27%、mean batch=3.29（8415 req / 2561 batch）**、CPU 80%、PSS 峰值 982GB。
   - 模型层等价性结论不受影响（`batch_probe` 直接调 `infer_action`，不经过 batcher）。
 
+- **2026-10-30 补充：pi05（fp32）+ RoboTwin 口径**
+
+  | 项 | 结果 |
+  |---|---|
+  | 单请求缩放 | k=1 287ms；k=2 163ms/样本；k=4 95ms/样本；k=8 67ms/样本（**4.1×**） |
+  | 串行 vs k=2 batch | `max=2.90e-2`、`mean=3.32e-3`（未归一化，量纲 scale≈0.9 → ~0.4% 相对） |
+  | 同 batch 内相同 payload 两行 | 逐位相等（无跨行污染） |
+  | 重复调用 / `use_deterministic_algorithms` | 逐位一致 / 无变化 |
+  | batch 路径逐样本跑视觉塔 | 反而略差（`4.41e-2`），不采用 |
+
+  - **踩坑记录**：第一版探针把 `instructions` 写成字符串，串行路径 `instructions[i]` 取到首字符 `"a"`、batch 路径转成 list 拿到完整指令，导致假差异（0.46）。`pi05.predict_action` 对字符串入参应加类型校验。
+  - **结论**：pi05 的 batching 差异与 bf16 的 FastWAM 同属归约噪声量级，**无结构性差异**；验收仍看 success rate。
+  - **端到端（RoboTwin `adjust_bottle`，N=4，8 卡，200 步，32 集）**：off 537s/8 成功；on 561s/3 成功；**off 复跑 11/32 集翻转，与 off-vs-on 完全相同** → 吞吐无收益、成功率差异不可归因于 batching。详见 `02_progress.md` §2.31。
+
 ### T-07 · GPU-sim：sim/server 同卡 vs 异卡
 
 - **对应功能**：§4.4 的放置决策（`01_architecture.md`）。
@@ -510,6 +524,18 @@
     | 4 | 21.87GB | 5.47GB | 1.45s |
 
   - **暂定结论**：显存近似线性，边际 **~5.5GB/sim**（每进程 CUDA context 另计 ~0.5GB，首进程略低）；k=4 时单步耗时被拉长 3.4×，但该卡本身有邻居占用，**不能据此判断同卡争用**。
+- **数据（2026-10-30，跳过非 replan 步渲染的 A/B）**：两臂均 N=4、8 卡、`adjust_bottle`、200 步、32 集、`return_action_chunk + chunk_execute_steps=24`，唯一变量是 `skip_intra_chunk_obs`。
+
+  | 臂 | 单步 | 单集 | 吞吐 | 成功率 |
+  |---|---|---|---|---|
+  | off | 2.297s | 459.4s | 3.82 ep/min | 5/32 |
+  | on | **0.773s** | **154.6s** | **11.29 ep/min** | 4/32 |
+
+  - 渲染占单步 ≈66%，端到端 **2.96×**；成功率差异在 run-to-run 噪声内。
+  - 单步变快后每 server 请求间隔从 18.4s 降到 4.6s，**server busy 从 ~13% 升到 ~40–50%**，batching/N 需在新 cadence 下重标定。
+  - **N=8（8 sim/server，64 集）**：elapsed 315.2s、12.18 ep/min、单步 1.58s、成功 6/64 → 相比 N=4 只 +7.9%，**拐点仍是 N=4**。
+  - **batching 在新 cadence 下重测（N=4 + skip，32 集）**：off 11.29 ep/min；`max_wait=50ms` 11.50（无差别）；`max_wait=2000ms` **10.74**，但 `mean_batch=3.27 / max=4`（心跳日志实测）。→ 批能形成，但等待代价更大，**保持 batching 关闭**。
+
 - **数据（2026-10-29，真实 pi05 server + 8 卡）**：
   - pi05 fp32 权重占 **16.6GB**；`use_bf16: false`（bf16 推理入口存在 float32/bf16 dtype 不兼容，见 §2.30）。
   - bf16 对照（仅加载、无推理）：活权重 7.72GiB，`nvidia-smi` 15.9GB，`empty_cache()` 后 8.7GB。

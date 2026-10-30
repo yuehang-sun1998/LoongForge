@@ -647,6 +647,147 @@ records       = 10（2 条重复）
 - bf16 eval 支持（autocast + 保留 `_FP32_PARAM_SELECTORS`），可省 ~8GB；当前按配置问题处理，`use_bf16: false` 即可。
 - 官方 evaluator 的 `Fail!` 退出码已由 `_unit_completed` 兜住；`unexpected` 已改为允许的替补 episode。
 
+### 2.31 pi05 推理端 batching：契约补齐与实测（2026-10-30）
+
+**背景**：GPU-sim 下 sim 与 server 同卡，4 sim/卡时 `t_infer` 被拉长到 ~2.9s。先确认“batch 一次前向”能把多少固定开销摊薄，再决定是否值得端到端接入。
+
+**补齐的三处契约**（本分支，未提交）
+
+1. `pi05_factory` metadata 增加 `supports_batching: True` 与 `noise_seed`（来自 `Pi05ModelConfig.noise_seed`）。
+2. `modeling_pi05.predict_action(..., seeds=[...])`：每行用独立 `torch.Generator(manual_seed=seed)` 生成 `(chunk, max_action_dim)` 噪声，再 `torch.stack` 成 batch 噪声传给 `sample_actions`，保证**每行噪声与 batch=1 时逐位相同**。
+3. `GenericPredictActionPolicy._predict_action_batch`：
+   - 要求同一 batch 内 cache 模式一致，否则回退串行；
+   - 模型输出是 padded `max_action_dim`，**必须裁到 `metadata.action_dim`**（此前缺失，k≥2 直接 reshape 失败）；
+   - 成功后按行写回 `_chunk_cache`（legacy 模式）。
+
+**单次前向缩放（GPU 0，单请求、fp32、horizon=32、`max_action_dim=32`）**
+
+| k | 串行总时延 | batch 总时延 | 串行/样本 | batch/样本 | 加速 |
+|---|---|---|---|---|---|
+| 1 | 287ms | 276ms | 287ms | 276ms | 1.0× |
+| 2 | 554ms | 326ms | 277ms | 163ms | 1.7× |
+| 4 | 1111ms | 381ms | 278ms | 95ms | 2.9× |
+| 8 | 2212ms | 539ms | 277ms | 67ms | 4.1× |
+
+→ 固定开销占比很高：batch=8 的 wall 只有 batch=1 的 1.9×，**每样本成本降到 1/4**。
+
+**数值性**
+
+- 串行自身、同组成 batch 重复调用均 **逐位一致**（diff=0）。
+- ⚠️ **2026-10-30 更正**：此前“batch 与串行差 2~3%（`max_abs≈0.46`）”的结论**来自探针 payload 写错**——探针把 `instructions` 写成了字符串 `"adjust bottle"`，串行路径把它原样传给模型后 `instructions[0]` 取到的是首字符 `"a"`，而 batch 路径会转成单元素列表拿到完整指令。两条路径的 prompt 文本不同，所以差异与 batching 无关。已改为 `["adjust bottle"]` 重测。
+- 副产品：`pi05.predict_action` 对 `instructions` 为字符串时**静默按字符索引**、不报错，建议加类型校验（生产路径 bridge 传的是 list，不影响评测）。
+- 视觉塔的 batch 差异是真实的：同一张图 `embed_image` 在 B=1/B=2 下 `max=1.99e-2`、`mean=3.03e-4`（cuDNN 卷积按 batch 选算法）。
+- **修正后的真实差异（2026-10-30，payload 改为 `["adjust bottle"]`）**：串行 vs k=2 batch `max=2.90e-2`、`mean=3.32e-3`（未归一化动作，量纲 scale≈0.9 → 约 0.4% 相对差），与 T-06 的“仅归约顺序噪声”结论一致，**没有结构性差异**。
+- 无效的尝试：`torch.use_deterministic_algorithms(True)` 结果完全相同；batch 路径“视觉塔逐样本前向”反而略差（`max=4.41e-2`），不再采用。
+- 副产品：`pi05.predict_action` 对 `instructions` 为字符串时会静默按字符索引（`instructions[0] == "a"`），建议加类型校验。
+- 验收口径与 T-19 一致：**看 success rate，不看逐位可复现**。
+
+**单测**：`test_server_batcher.py` 新增 3 条（padded 输出裁剪、batch 行写入缓存、混合 cache 模式回退）；全量 eval 单测 **169 passed / 1 skipped**。
+
+**端到端 A/B（RoboTwin `adjust_bottle`，N=4，8 卡 = 8 server × 4 sim，max_steps=200，32 集）**
+
+| 臂 | elapsed | wall（含加载） | success | 吞吐 |
+|---|---|---|---|---|
+| batching off | 537.0s | 827s | 8/32 = 25.0% | 3.57 ep/min |
+| batching on（`max_batch_size=8`、`max_wait_ms=50`） | 561.2s | 843s | 3/32 = 9.4% | 3.42 ep/min |
+| **off 复跑（off2）** | — | 835s | **7/32 = 21.9%** | — |
+
+逐 seed 翻转：**off vs on = 11/32**，但 **off vs off2 = 11/32**（同一份 batching-off 配置跑两遍）。
+
+→ 两条结论：
+1. **batching 对吞吐无收益**（3.57 → 3.42 ep/min）。原因：请求稀疏（每 sim 每 ~74s 一次真推理，N=4 时每 server 18.4s 一个请求），`max_wait_ms=50` 内几乎不可能聚合；且推理只占单集 wall 的 3~4%，收益上限本就 ~2%。
+2. **成功率翻转不可归因于 batching**：RoboTwin 自身 run-to-run 就是 11/32 集翻转（同 seed、同配置、同分片）。所以 A/B 只能得出“吞吐不变”，成功率需要多轮均值 + 置信区间，不能用单轮比较。
+
+**数值不对齐的根因（已定位）**
+
+- 串行与同组成 batch 均逐位可复现；关 TF32 无变化（`0.459` → `0.453`）；同一 batch 内相同 payload 两行逐位相等（无跨行污染）。
+- 分段探针发现差异**从视觉塔就存在**：同一张图，`embed_image` 在 B=1 与 B=2 下输出 `max=1.99e-2`、`mean=3.03e-4`（cuDNN 卷积按 batch 选不同算法），随后 prompt embedding / 去噪逐步放大到归一化后 ~2~3%。
+- 结论：不是我们代码里的 batch 分支（推理路径无任何 `batch_size` 判断），而是 **视觉塔的卷积 kernel 选择**；10 步 Euler 复合放大。
+- 待验证的修复：batch 路径里**逐样本前向视觉塔**（`torch.cat([embed_image(x[i:i+1]) ...])`），语言塔/action expert 仍批处理。若最终 diff 回到 1e-6 量级即证明可做到 batch 不变性。
+  - **已验证（2026-10-30）**：无效。逐样本后 `max` 从 `2.90e-2` 变成 `4.41e-2`（略差），说明差异主要来自语言塔/去噪阶段的形状相关 kernel，而不是视觉塔卷积；**结论：接受 batch 数值噪声（≤1%），不做逐样本视觉塔**。
+
+**与 RoboTwin 上游的对照（2026-09-24 `main`）**
+- 上游未修复“每步 `get_obs()` 渲染”（详见 `/workspace/markdowns/robotwin_render_every_step.md`），也无 `skip_get_obs_within_replan` 概念；我们写的该键**无任何消费者**。
+- 上游近期修的是可复现性（#509 clutter bounds 原地累加 + instruction 全局 RNG 就地 shuffle；#490 跨文件系统 model 选择）。`demo_clean` 下 `cluttered_table: false`，clutter 那条不影响我们；instruction 那条只在“每 worker 多集”时才会咬到。
+
+### 2.32 合入 eval server 加载后释放 allocator 缓存（原 PR #316，2026-10-30）
+
+**来源**：`baidu-baige/LoongForge#316`（已关闭），不再单独合入，随本分支一起提交。
+
+**改动**
+
+- `servers/loongforge_server.py`：新增 `_release_loader_cached_memory()`，在 `build_model_spec()` 之后、`_warmup_model()` 之前调用一次 `torch.cuda.empty_cache()`；只释放 allocator 里的空闲块，不动活权重；有释放时打一行 `reserved X GiB -> Y GiB`。
+- 新增 `unit_tests/test_server_memory_release.py`（CUDA / 非 CUDA 两条路径）。
+
+**动机**：pi05 / xvla / GR00T / DreamZero 等工厂先以 fp32 构建再转 bf16，瞬态 fp32 副本与 staging 张量留在 caching allocator 里，`nvidia-smi` 看到的是加载高水位而不是活权重（pi0.5 bf16：15.9GB → 8.7GB，活权重 7.72GiB 不变）。同卡部署的 sim 进程看不到这块内存，会直接影响 `pools.gpu_sim` 的显存预算。
+
+**验证**：新增单测 2 条；全量 eval 单测 **171 passed / 1 skipped**。GPU 侧未复测（沿用 PR 内的 bf16 数据）。
+
+### 2.33 RoboTwin 新入口迁移（`fix/skip-intra-chunk-render`，2026-10-30）
+
+**背景**：RoboTwin 上游已迁移到 `RoboTwin-Platform/RoboTwin`，本地方 `/workspace/RoboTwin` 现位于分支 `fix/skip-intra-chunk-render`（`a9d2f5e`），新增 `skip_intra_chunk_obs`：chunk 内跳过 `get_obs()/update_obs()`，用 `get_proprio_observation()` 只读关节/末端位姿。默认关，`eval_video_log` 打开时自动忽略。
+
+**已核实**
+
+- 该分支**已删除 `script/eval_policy.py`**，只剩 `scripts/` 新入口（`eval_policy.sh` → `eval_policy_xpolicylab.py` / `eval_policy_server.py` / `eval_policy_multitask.py`）。我们的 `robotwin_runner` 硬编码旧路径 + 文本注入，切分支后不可用。
+- `XPolicyLab/` 子模块原本为空；已 `git submodule update --init --recursive`（pin `fa431ec`）。
+- 新入口已内建 `UnStableError` 捕获（`scripts/eval_policy_xpolicylab.py:637/659/819/840`）与 `max_seed_attempts` 游标 → 我们的 `seed_stride` / UnstableError 补丁可退役。
+- `skip_get_obs_within_replan` 是我们自己写的**死键**（RoboTwin 与 bridge 均不读），迁移时删除或由 `skip_intra_chunk_obs` 取代。
+
+**迁移方案（三选一，推荐 B）**
+
+| 方案 | 做法 | 取舍 |
+|---|---|---|
+| A | adapter 进程内建模型 | 改动小；每 GPU 只能 1 个 server，丢掉 batching/chunk cache/timing |
+| **B** | adapter 做 ws 客户端连现有 LoongForge server | **复用全部已有 server 能力**；多一层 hop |
+| C | 把 `skip_intra_chunk_obs` 回植到 stable_2.0 的旧入口 | 最快见效，但偏离“用新分支”的决定 |
+
+**B 的工作项**
+
+1. `XPolicyLab/policy/<LoongForgePi05>/{model.py, deploy.yml}`：实现 `ModelTemplate`（`update_obs` / `get_action` / `reset`），内部用 `transport/client.py` 调我们的 server。
+2. `robotwin_runner` 改为启动 `scripts/eval_policy_xpolicylab.py`（`--policy_name/--host/--port/--protocol ws/--task_name/--task_config/--test_num/--skip_intra_chunk_obs`）。
+3. 语义对齐：seed 从“固定区间 + stride”改为 `seed + max_seed_attempts` 游标；结果文件（`_result.txt`）格式重新确认；worker GPU 绑定与端口分配沿用 coordinator。
+4. 先做 **1 GPU / 1 sim / 1 集** 的 spike，再上 8 卡与 A/B。
+
+**状态（2026-10-30）**
+
+- **旧入口（stable_2.0）已实现同等能力，无需改 RoboTwin**：`_worker_eval_script` 在 `benchmark.skip_intra_chunk_obs: true` 时把评测循环改成
+  `observation = TASK_ENV.get_obs() if model.needs_obs() else _vla_proprio_observation(TASK_ENV)`；
+  `ModelClient.needs_obs()` 依据本地 chunk 游标判断（chunk 有剩余 → 不取观测）；`step()` 只在真正发请求时才构建 `canonical_obs`，其余步只读 `joint_action.vector`。
+  - **生效前提**：必须 `benchmark.return_action_chunk: true` + `chunk_execute_steps > 0`。server-cache 模式下每步都会发请求，`needs_obs()` 恒为 True，等于没开。
+  - 闭环模型（`disable_action_cache` / chunk=1）自动恒 True，不会喂旧帧。
+  - 单测：`test_needs_obs_follows_the_buffered_chunk`、`test_worker_script_skips_intra_chunk_render`；全量 **173 passed / 1 skipped**。
+  - 旧的死键 `skip_get_obs_within_replan` 已删除，统一为 `skip_intra_chunk_obs`。
+  - **batcher 心跳（2026-10-30）**：`AsyncBatcher` 新增 `stats_interval_s`（默认 30s，配置 `server.batching.stats_interval_s`），周期打印 `requests/batches/mean_batch/max_batch/pending`。此前 server 被 SIGTERM 杀掉、`finally` 不执行，`Batcher stats` 永远打不出来，只能靠耗时反推。单测 `test_batcher_logs_periodic_stats`。
+  - **实测（2026-10-30，N=4、8 卡、200 步、32 集，两臂均 `return_action_chunk + chunk_execute_steps=24`）**：
+
+    | 臂 | 单步 | 单集 | 吞吐 | 成功率 |
+    |---|---|---|---|---|
+    | skip off | 2.297s | 459.4s | 3.82 ep/min | 5/32 |
+    | skip on | **0.773s** | **154.6s** | **11.29 ep/min** | 4/32 |
+
+    → 渲染占单步 **≈66%**，端到端 **2.96×**；成功率差异在 RoboTwin run-to-run 噪声内。
+    → **副作用**：单步变快后请求到达率提高 ~3×（每 sim 每 24 步一次 → 18.5s；N=4 时每 server 4.6s 一个请求），server busy 从 ~13% 升到 ~40–50%，**batching 与 N 的标定需要在这个新 cadence 下重做**。
+
+  - **N=8 复测（2026-10-30，已完成）**：8 sim/server、64 worker、200 步、64 集 → elapsed **315.2s**、**12.18 ep/min**、单步 **1.58s**、成功 6/64。
+    对比 N=4 的 11.29 ep/min：**仅 +7.9%**，但 sim 数翻倍、单步慢 2.05×、显存 38GB→~60GB → **N=4 仍是拐点**，N=8 不划算。
+  - **新 cadence 下的 batching 调参（2026-10-30，N=4 + skip_obs，32 集/200 步）**：
+
+    | 臂 | elapsed | 吞吐 | 单步 | mean_batch（心跳） |
+    |---|---|---|---|---|
+    | batching off | 170.0s | 11.29 ep/min | 0.773s | — |
+    | on，`max_wait_ms=50` | 166.9s | 11.50 ep/min | 0.763s | 未采集（旧代码） |
+    | on，`max_wait_ms=2000` | 178.8s | **10.74 ep/min** | 0.830s | **3.27（max 4）** |
+
+    → `max_wait=50ms` 与关闭无差别（到达间隔 4.6s，50ms 内凑不出批）；`2000ms` 确实凑出 mean_batch≈3.3，但**等待代价大于并行收益**（-5%）。**结论：RoboTwin 这条链保持 batching 关闭**，除非将来出现 lockstep/向量化。
+  - **下一步**：用 N=4 + skip_obs 跑成功率验证（多轮均值，单轮不可比）。
+- **新入口（XPolicyLab）迁移**：仍未开工，等待确认拓扑。
+
+
+
+
+
+
 ---
 
 ## 3. 待办（按依赖排序）
@@ -858,3 +999,5 @@ records       = 10（2 条重复）
 4. **N=48/80 补点**（可选）：确认膝点；N=80 需盯 CPU/内存。
 5. **`per_episode` 逐集参照**：用旧分支小网格自建，回答 rebase 是否改变 per_episode 行为（M2 原始记录未找到）。
 6. **GPU-sim / CALVIN**：环境具备后再补标定与评测。
+7. **GPU-sim 新 cadence 标定**：`skip_intra_chunk_obs` 下重扫 N（1/2/4/8）→ 重做 batching A/B → 成功率验证。
+8. **RoboTwin 新入口迁移**（§2.33）：`fix/skip-intra-chunk-render` × XPolicyLab adapter（方案 B：adapter 做 ws 客户端）；先 1 GPU/1 sim/1 集 spike，再上 8 卡。

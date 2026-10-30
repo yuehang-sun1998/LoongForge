@@ -327,6 +327,7 @@ vectorization: { num_envs: 1 }                                          # §7.5
 > **unit 级细节**：`_shard_config` 从 `server.external_url` 同步 `server.host/port`（部分 runner 只读 port）；`_unit_completed()` 在 unit 已写出全部预期 episode 时不再因进程返回码非 0 而重试。RoboTwin 分片额外注入 `seed_stride = shard 数 × chunk`，unstable seed 按整轮跳步，避免与相邻 shard 的 seed 区间重叠。
 > **端口**：coordinator 基址默认 **6000**（`LOONGFORGE_COORD_PORT_BASE` 可覆盖），不要落在 10000–61000 的内核临时端口段。
 > 其中 **`benchmark.return_action_chunk`**（LIBERO 默认 true；CALVIN / SimplerEnv / ManiSkill 需显式开启）false 时走旧 server-side chunk cache（每步请求），用于 T-14 的旧路径 A/B。执行细节见 §7.6 (2) 的 `EpisodePolicyStepper`。
+> **`benchmark.skip_intra_chunk_obs`（RoboTwin，默认 false，2026-10-30）**：chunk 由客户端持有时，非 replan 步不再调用 `get_obs()`（不渲染 3 路相机），只构造 `joint_action` 供 decoder 锚定；`ModelClient.needs_obs()` 决定当前步是否需要观测。**仅在 `return_action_chunk: true` + `chunk_execute_steps > 0` 时有效**（server-cache 模式每步都请求，恒为 True）；闭环模型自动恒 True。实测渲染占单步 ≈66%，端到端 2.96×（`03_testing.md` T-07）。
 > **`benchmark.episodes_per_chunk`**（默认 0 = 自动）显式指定“一个 worker 进程连续跑几集”，用于摊薄每集一次 torch/robosuite import；`per_task` 下仍强制一 task 一 shard（忽略该值）。
 > 其中 **`benchmark.suite_overrides: {<suite>: {<key>: <val>}}`** 用于**套件差异化**（如 LIBERO 官方 `max_steps`：`libero_10` 700 / 其余 400），使**一条全局队列跨套件**成立。
 > `resources` / `queue` / `calibrated` / `batching` / `vectorization` 仍是**目标 schema**，尚未接线（M2 的队列用进程内内存实现，非 `work/` 文件队列，见 `02_progress.md` §2.11）。
@@ -757,6 +758,15 @@ N_max ≈ K × (10 × t_step) / t_infer
 > - **第二轮改用 external 模式**：8 server 常驻、每 client 1 集、总并发 = 8N；`chunk=10`、`max_wait_ms=50`，同时采集实际 mean batch size、timing、内存与 CPU。
 > - 上表的 `N_max ≈ K × 10 × t_step / t_infer` 只算 **server 容量**；实际约束是 **CPU/内存 + 吞吐平台**。`N*` 不能跨 cadence 搬运（10 的请求率是 16 的 1.6×）。
 > - **T-16 实测（2026-10-23）**：8 卡同 N=16 的 per-server 吞吐 8.84 eps/min，单卡独跑 17.6 → **shared-load penalty ≈ 0.50**；8 卡并行不同 N 时，同 N=16 的 server 只有 5.8（-34%）。**正式标定必须 8 卡同 N**，或用 0.50 修正单卡结果；明细见 `03_testing.md` T-16。
+
+> **2026-10-30 GPU-sim 实测（RoboTwin + pi05，N=4，8 卡）**：batching 端到端**无收益**（3.57 → 3.42 ep/min）。
+> - 不是 batch 契约的问题（模型侧 k=8 时单样本快 4.1×），而是**到达率**：每 sim 每 ~74s 一次真推理，N=4 时每 server 18.4s 一个请求，`max_wait_ms=50` 内几乎不可能聚合（理论 mean batch ≈ 1.003）；要到 mean batch≈2 需要 ~370 sim/卡。
+> - 推理只占单集 wall 的 3~4%；GPU 被 sim 渲染占满（`utilization.gpu` 100%），N=8 吞吐反而下降。
+> - 因此 **“N 不够大”不是解法**，真正的杠杆是 sim 侧渲染成本（见 `/workspace/markdowns/robotwin_render_every_step.md`）。
+> - 成功率侧：同配置复跑（batching 均关）也有 11/32 集翻转，单轮 A/B 无法判断成功率变化，需多轮均值。
+> - 数值侧：pi05 batch vs 串行 `max=2.9e-2`、`mean=3.3e-3`（~0.4% 相对），与 FastWAM bf16 同属归约噪声，无结构性差异（`03_testing.md` T-06）。
+> - **2026-10-30 之后 cadence 已变**：开启 `skip_intra_chunk_obs` 后单步 2.30s → 0.77s（渲染占 66%，端到端 2.96×），每 server 请求间隔从 18.4s 降到 4.6s，server busy 预计 40–50%。**上一条“batching 无收益”只对旧 cadence 成立**；batching 与 N 需要在 skip_obs 配置下重测（N=8 复测进行中）。
+
 
 > ⚠️ **`N` 是 per-server，CPU/内存是整机共享**：并行在 8 张卡上跑不同 N 时，每个点的 `ΣN` 和背景负载不同，per-server 吞吐/膝点会被污染。正式标定用“8 卡同 N”，或用 `03_testing.md` T-16 测出的 shared-load penalty 修正单卡扫描结果。显存/内存是**硬上限**，不是“效率最高”的判据。
 
