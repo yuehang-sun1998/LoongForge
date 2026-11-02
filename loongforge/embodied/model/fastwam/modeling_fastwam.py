@@ -95,17 +95,20 @@ class _ZScoreStats:
 
     Mirrors the official ``SingleFieldLinearNormalizer`` z-score branch:
     ``scale = 1 / (std + 1e-8)``, ``offset = -mean / (std + 1e-8)`` — i.e.
-    normalize is ``(x - mean) / (std + 1e-8)`` (no [-1, 1] output range).
+    normalize is ``(x - mean) / (std + 1e-8)`` (no [-1, 1] output range),
+    clipped to [-5, 5] like ``SingleFieldLinearNormalizer.forward`` and the
+    training-side ``FastWAMLinearNormalizeTransform``.
     """
 
     std_reg = 1e-8
+    clamp_range = 5.0
 
     def __init__(self, mean: np.ndarray, std: np.ndarray):
         self.mean = np.asarray(mean, dtype=np.float32).reshape(-1)
         self.std = np.asarray(std, dtype=np.float32).reshape(-1)
 
     def normalize(self, x: np.ndarray) -> np.ndarray:
-        """x -> (x - mean) / (std + 1e-8)."""
+        """x -> clip((x - mean) / (std + 1e-8), -5, 5)."""
         x = np.asarray(x, dtype=np.float32)
         if x.ndim == 1:
             x = x[None, :]
@@ -113,7 +116,8 @@ class _ZScoreStats:
             raise ValueError(
                 f"z-score normalize: input shape {x.shape} != stats dim {self.mean.size}"
             )
-        return ((x - self.mean) / (self.std + self.std_reg)).astype(np.float32)
+        out = (x - self.mean) / (self.std + self.std_reg)
+        return np.clip(out, -self.clamp_range, self.clamp_range).astype(np.float32)
 
     def unnormalize(self, x: np.ndarray) -> np.ndarray:
         """Inverse of :meth:`normalize`."""

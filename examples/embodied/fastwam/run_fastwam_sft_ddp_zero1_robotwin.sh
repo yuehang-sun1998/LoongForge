@@ -12,7 +12,7 @@
 #   - norm       : z-score (data.norm_stats_path = official dataset_stats.json, data.fastwam_norm_mode=z-score)
 #   - action     : 14D; proprio 14D; no delta dims (delta_action_dim_mask = 14 x false)
 #   - video DiT  : pretrained (skip_dit_load_from_pretrain=false)
-#   - action DiT : null (random init, same as standalone)
+#   - action DiT : pretrained ActionDiT backbone (model/action_dit_pretrained_path)
 #   - text cond  : precomputed cache (load_text_encoder=false)
 #   - lr         : 1e-4, warmup 1500 (5% of 30k steps), min-lr 1e-6 (standalone: 5% warmup + eta_min=1e-6)
 #   - optim      : AdamW, wd 1e-2, cosine; grad clip 1.0 (official train.yaml max_grad_norm)
@@ -29,8 +29,9 @@
 #   bash run_fastwam_sft_ddp_zero1_robotwin.sh [extra args passed to train.py]
 #
 # Key env vars: LOONGFORGE_PATH, DIFFSYNTH_MODEL_BASE_PATH, TOKENIZER_PATH,
-#   DATASET_PATH, TEXT_EMBEDDING_CACHE_DIR, PRETRAINED_NORM_STATS, OUTPUT_DIR,
-#   TRAIN_ITERS, PER_DEVICE_BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS, SEED
+#   DATASET_PATH, ACTION_DIT_PRETRAINED_PATH, TEXT_EMBEDDING_CACHE_DIR,
+#   PRETRAINED_NORM_STATS, OUTPUT_DIR, TRAIN_ITERS, PER_DEVICE_BATCH_SIZE,
+#   GRADIENT_ACCUMULATION_STEPS, SEED
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -48,8 +49,10 @@ export PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-16}
 export GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-8}   # 16 * 8 * 8 GPU = 1024
 export SAVE_INTERVAL=${SAVE_INTERVAL:-2500}
 export SEED=${SEED:-42}
-# RoboTwin standalone uses a random action expert (action_dit_pretrained_path=null)
-export ACTION_DIT_PRETRAINED_PATH=""
+# Official recipe loads the interpolated Wan2.2 action backbone
+# (configs/model/fastwam.yaml: action_dit_pretrained_path + skip_dit_load_from_pretrain=false).
+# configs/sim_robotwin.yaml is the *eval* config and nulls it — do not copy from there.
+export ACTION_DIT_PRETRAINED_PATH=${ACTION_DIT_PRETRAINED_PATH:-"$DIFFSYNTH_MODEL_BASE_PATH/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"}
 
 # ── Official-aligned recipe (env knobs read by the finetune launcher) ──
 export LR_DECAY_STYLE=${LR_DECAY_STYLE:-linear_warmup_cosine_annealing}
@@ -65,7 +68,7 @@ export EXTRA_MODEL_OVERRIDES="${EXTRA_MODEL_OVERRIDES:-} \
 model.mot_checkpoint_mixed_attn=true model.mot_compile_blocks=none \
 model.disable_train_autocast=false model.drop_all_true_cross_attn_mask=false \
 model.action_dim=14 model.proprio_dim=14 \
-model.action_dit_pretrained_path=null model.redirect_common_files=false \
+model.redirect_common_files=false \
 model.action_scheduler.train_shift=1.0 model.action_scheduler.infer_shift=1.0"
 export EXTRA_DATA_OVERRIDES="${EXTRA_DATA_OVERRIDES:-} \
 data.camera_layout=robotwin_t data.norm_stats_path=$PRETRAINED_NORM_STATS \
@@ -75,6 +78,7 @@ data.delta_action_dim_mask=[false,false,false,false,false,false,false,false,fals
 echo "════════════════════════════════════════════════════════════"
 echo "  LoongForge FastWAM SFT (RoboTwin 2.0, 30k, GBS 1024)"
 echo "  Data:      $DATASET_PATH"
+echo "  ActionDiT: $ACTION_DIT_PRETRAINED_PATH"
 echo "  Iters:     $TRAIN_ITERS  batch=$PER_DEVICE_BATCH_SIZE ga=$GRADIENT_ACCUMULATION_STEPS  (GBS=$((PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * 8)))"
 echo "  Output:    $OUTPUT_DIR"
 echo "════════════════════════════════════════════════════════════"

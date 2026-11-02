@@ -12,6 +12,7 @@ import json
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -20,6 +21,7 @@ from loongforge.embodied.data.datasets.fastwam.transforms.fastwam_transform impo
     _fastwam_linear_params,
 )
 from loongforge.embodied.model.fastwam.modeling_configuration_fastwam import FastWAMModelConfig
+from loongforge.embodied.model.fastwam.modeling_fastwam import _ZScoreStats
 
 
 def _stats(lo, hi, extra=None):
@@ -72,6 +74,15 @@ def test_normalize_unapply_roundtrip(stats_file):
     action = torch.tensor([[0.5, 1.5]])
     out = transform.unapply(transform.apply({"action": action.clone()}))
     assert torch.allclose(out["action"], action)
+
+
+def test_eval_zscore_normalize_clamps_like_official():
+    """Eval-side proprio normalization must clamp to [-5, 5] like training/official."""
+    stats = _ZScoreStats(mean=np.zeros(3, dtype=np.float32), std=np.ones(3, dtype=np.float32))
+
+    np.testing.assert_allclose(stats.normalize([0.5, -2.0, 0.0]), [[0.5, -2.0, 0.0]], rtol=0, atol=1e-6)
+    # Beyond 5 sigma the value is clipped, matching SingleFieldLinearNormalizer.forward.
+    np.testing.assert_array_equal(stats.normalize([3.0, 10.0, -25.0]), [[3.0, 5.0, -5.0]])
 
 
 def test_action_scheduler_defaults_match_fastwam():
