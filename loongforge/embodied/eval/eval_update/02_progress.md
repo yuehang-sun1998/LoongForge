@@ -749,6 +749,176 @@ records       = 10（2 条重复）
 3. 语义对齐：seed 从“固定区间 + stride”改为 `seed + max_seed_attempts` 游标；结果文件（`_result.txt`）格式重新确认；worker GPU 绑定与端口分配沿用 coordinator。
 4. 先做 **1 GPU / 1 sim / 1 集** 的 spike，再上 8 卡与 A/B。
 
+### 2.35 GPU-sim 吞吐的资源分配模型（2026-11-02）
+
+> ⚠️ **本节所有数字均来自旧权重** `pi0.5_robotwin2` + `max_steps=200/chunk 24` 的旧口径，仅用于建立资源分配模型。新权重 `steps_190000_eval` 的正式基线见 **§2.36**。
+
+**问题**：8 卡 GPU-sim 上，`co_locate`（每卡 1 server + N sim）和 `separate`（server 独占部分卡）到底怎么选。
+
+**模型**：本质是"8 张卡在渲染和推理之间怎么分"，两条约束：
+
+1. **推理需求 ≤ server 容量**
+   - 单 sim 每 `chunk_execute_steps` 步请求一次；单步 0.8–1.5s → 每 sim 每 40–75s 一个请求；
+   - 单 server 不批时 ~2–3 req/s（0.3–0.5s/次），开 batching 后更高（实测 mean_batch 5.76，排队延迟 8.2s → 0.5s）；
+   - `co_locate N=4`：32 sim × 1/38.5s ≈ **0.83 req/s**，摊到 8 个 server → 每个 **0.1 req/s（大量空闲）**；
+   - `separate 56 sim`：≈ **0.9 req/s** 全压到 1 个 server → **必须靠 batching**，否则像 sep1 一样排队到 8s。
+2. **sim 侧不饱和**：每卡 8 sim 之后吞吐只涨 8%（渲染/CPU 到顶），继续堆收益很小；显存 5.5GB/sim，12/卡仍在预算内。
+
+**判据**：同 sim 密度下，**谁把推理挤到最少的卡上，谁就赢**；batching 是这个挤压成立的前提。
+
+**实测（官方 400 步、chunk 50、skip on、同一策略）**
+
+| 配置 | 并发 sim | 吞吐 | 单步 | 成功 |
+|---|---|---|---|---|
+| co_locate N=4（8 server + 4/卡） | 32 | 10.80 ep/min | 0.77s | 24/50 |
+| **separate 1 server + 8/卡（batching 200ms）** | 56 | **12.21 ep/min** | 1.21s | **3/50** |
+| co_locate N=4 + batching 50ms（200 步旧口径） | 32 | 11.50（≈关闭） | 0.76s | — |
+| co_locate N=4 + batching 2000ms（200 步旧口径） | 32 | 10.74（−5%） | 0.83s | — |
+
+- **吞吐上 separate 胜**（+13%），且在成功率更低（集更长）的情况下仍然更快；
+- **但成功率从 24/50 掉到 3/50**，差异远超 run-to-run 噪声，必须先解释再采用。头号嫌疑：batch 路径固定了 `noise_seed`（`_predict_action_batch` 传 `seeds=[noise_seed]`），而单请求走全局 RNG——两条路径的采样噪声不同。
+
+**待办扫描**（同一口径，排队中）：co_locate N=6/N=8；separate 10/卡、12/卡。
+
+### 2.36 新权重基线：steps_190000_eval（2026-11-02）
+
+> 本节**只包含新权重**数据；旧权重 `pi0.5_robotwin2` 的结果见 §2.35（不可与本节混用）。
+
+**权重与口径**（来自 checkpoint 自带 `config.json`，不是我们猜的）
+
+| 项 | 值 |
+|---|---|
+| 权重 | `/raid0/workspace/20261026_pi05/pi05_sft_final_chkpts/RoboTwin/steps_190000_eval` |
+| 统计 | 同目录 `dataset_statistics.json` |
+| action_horizon | **30**（旧跑用的是工厂默认 50，是错的） |
+| chunk_execute_steps | 30（执行完整 chunk） |
+| eval_image_normalize_mode | **siglip** |
+| normalization | q99；3 相机；`resize_with_pad`；fp32 |
+| 步数 | 官方 `_eval_step_limit.yml` 逐任务 |
+| 参考分数 | README：50 任务 × 100 集、start_seed=100000 → **77.56%**；`adjust_bottle` **96%** |
+
+**链路校验**
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| `adjust_bottle × 100`（start_seed 100000） | **91/100 = 91%** vs 参考 96% | ✅ 链路正确（n=100 的 95% CI 约 ±6pt） |
+| `grab_roller × N`（参考 100%） | 各臂均 **100%** | ✅ 选作功能测试任务 |
+
+→ 之前旧权重 12–48% 的低分，主要来自**旧权重 + horizon 50 与该 ckpt 的 30 不匹配**。
+
+**并发扫描（grab_roller，官方 400 步，chunk 30，skip on）**
+
+口径：`steady = sims × 60 / 平均单集耗时`（wall 吞吐会被启动成本放大，仅作参考）。
+
+| 臂 | 模式 | sims | 成功率 | wall | steady | 每 sim 卡 |
+|---|---|---|---|---|---|---|
+| cl4 | co_locate | 32 | 32/32 | 165s | 12.8 | 1.60 |
+| cl6 | co_locate | 48 | 48/48 | 211s | 14.8 | 1.85 |
+| **cl8** | co_locate | 64 | 64/64 | 333s | **16.2** | **2.03** |
+| sp8 | separate + batching 200ms | 56 | 56/56 | 242s | 14.8 | 2.11 |
+| sp10 | separate + batching 200ms | 70 | 70/70 | 541s | **24.8**（见下方异常） | 3.55 |
+| sp12 / cl10 | — | 84 / 80 | 待跑 | — | — | — |
+
+要点：
+- co_locate 在 N=8 仍**未饱和**（12.8 → 14.8 → 16.2，环比 +16% / +9.5%），已追加 N=10；
+- 同密度（8/卡）下 separate 每卡只快 **4%**（2.11 vs 2.03），但少一张 sim 卡 → **总量更低**；
+- 当前负载下"推理与渲染抢 SM"已不是主要矛盾（单次推理仅 ~0.4s，请求稀疏）。
+- ⚠️ **sp10 数据异常**：10/卡（s/step 1.89）反而比 8/卡（s/step 2.54）快 34%，与"密度越高越慢"矛盾，且两次推理延迟接近（393ms vs 447ms）。最可能是 sp8 运行时机器上有其他负载/降频。**需要在同一时段背靠背重跑 sp8 与 sp10 才能确认**，暂不据此下结论。
+
+### 2.38 计时口径：把"建场景 + I/O"从吞吐里拆出去（2026-11-02）
+
+**问题**：`results.jsonl` 的 `episode_time_sec` 是整集 wall（建场景 + 资产 I/O + rollout + teardown）。短任务（grab_roller ~90 步）里建场景占 90%+，此前所有 grab_roller 的吞吐对比其实在测 I/O 抖动。
+
+**工具**：`orchestrator/step_timing.py`（CLI：`python -m ...step_timing <out_dir> ...`）。用 `trace.json` 每步的 `timestamp_sec` 拆出：
+
+- `compute` = 首末步时间差（rollout）；
+- `setup` = episode wall − compute；
+- `inference` = Σ `inference_latency_ms`；
+- `render` = compute − inference；
+- 三种吞吐：`wall / compute / render`（ep/min）。
+
+**实测（新权重、grab_roller、100% 成功）**
+
+| 臂 | sims | wall | setup 占比 | compute | render | 中位单步 |
+|---|---|---|---|---|---|---|
+| cl4 | 32 | 150s | **91.7%** | 12s | 9s | 71ms |
+| cl6 | 48 | 194s | 92.7% | 14s | 10s | 66ms |
+| cl8 | 64 | 238s | 93.3% | 16s | 11s | 68ms |
+| cl10 | 80 | 197s | 93.4% | 13s | 10s | 68ms |
+| sp8 | 56 | 227s | 94.8% | 12s | 10s | 66ms |
+| sp10 | 70 | 169s | 93.4% | 11s | 10s | 68ms |
+| sp12 | 84 | 226s | 95.1% | 11s | 10s | 69ms |
+
+（对照：blocks_ranking_rgb 1200 步的任务，setup 占 47%，中位单步 82ms。）
+
+**三个结论**
+1. **中位单步在 66–69ms 之间，与 sim 密度（4→12 每卡）无关** → GPU/CPU 都没有被渲染打满；
+2. **吞吐完全由建场景支配**（占 92–95%），之前的"密度曲线"测的是并发建场景时的 I/O 竞争；
+3. 资产在 CFS（`/workspace/robotwin_env/assets`，16GB）已拷到本地 `/root/local/robotwin_assets` 并切换软链，**实测 setup 只从 215s 降到 195s（−9%）** → 建场景**不是 I/O 瓶颈**。
+
+**setup 的真正构成：官方 `check_stable()`**
+
+`envs/_base_task.py:161` 在每个 `setup_demo` 里跑 **2000 步物理沉降 + 500 步稳定性观测**（共 2500 步，逐步记录所有 actor 位姿）。按 ~60–70ms/步算 ≈ 150–175s，与实测 195s 吻合。
+
+- 这 2500 步**是官方协议的一部分**，且 2000 步沉降直接决定 episode 的初始状态 → **不能跳过、也不能当免费优化**；
+- 结论：**性能测试必须保持官方口径（含稳定性检查）**，不接受"关掉预检换吞吐"的做法；
+- **最终指标 = 端到端时间（含建场景）**：建场景是评测的一部分，不能从对外口径里剔除。`step_timing` 的 setup/compute/render 拆分**只作诊断用**，用来解释差异来源，不用来排名配置；
+- 因此短任务（grab_roller 90 步）的吞吐上限由这 ~200s 固定成本决定，配置差异只能在长任务（如 blocks_ranking_rgb 1200 步，setup 占 47%）上体现。
+
+### 2.37 派发顺序：task / interleave / LPT（2026-11-02）
+
+**背景**：`_run_batch` 是"全局 FIFO 队列 + 空闲槽补位"，而 `plan_robotwin` 产出的顺序是**任务优先**（一个任务的所有 seed 块连续）。因此 10 个 sim、10 个任务时，前 10 个槽会全部落在同一个任务上——形成"任务波次"，长任务（1700 步）会把整波 sim 一起拖住。
+
+**改动**：`benchmark.plan_order`
+
+| 值 | 行为 |
+|---|---|
+| `task`（默认） | 历史行为：按任务成波 |
+| `interleave` | 每波混合所有任务（任务间 round-robin） |
+| `lpt` | 按官方 step limit **降序**排任务，再交错派发 |
+
+只改派发顺序，不改分片覆盖；三种顺序是同一组 shard 的排列（单测校验）。
+
+**为什么用 LPT**：这是并行机调度里的经典启发式（Graham, 1969, *Bounds on multiprocessing timing anomalies*）——**最长任务优先**。makespan 由最后完成的任务决定，把长任务排到后面会让它在尾部"孤零零"地跑。LPT 对 makespan 有 **4/3 近似保证**。
+
+示例（8 槽、8 个 5min 快任务 + 2 个 60min 慢任务）：
+
+| 顺序 | makespan |
+|---|---|
+| 先快后慢 | 65 min（慢任务等第一波结束才开始） |
+| LPT | 60 min |
+
+**估值方式**：用台账 `_eval_step_limit.yml` 的步数上限作为耗时代理（单步耗时近似恒定）；成功提前结束会让实际耗时小于上限，所以这是近似排序。
+
+**Dry-run**（adjust_bottle 400 + blocks_ranking_rgb 1200，各 6 集，8 槽）
+
+```
+task       first wave: A A A A A A B B      # 4 个慢任务排到下一波
+interleave first wave: A B A B A B A B
+lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
+```
+
+**端到端对比**（已排队，`ordtask` vs `ordlpt`）：两任务各 6 集、N=1（8 槽），预期 makespan 1280s → 960–1050s，差约 4–5 分钟。
+
+### 2.34 RoboTwin 多任务分片与官方 step limit（2026-11-02）
+
+**动机**：性能实验一直只用 `adjust_bottle` 单任务（200 步），不能代表 50 个任务的真实工作负载。要在一个 run 内覆盖全部任务，原 planner 不够用。
+
+**改动**
+
+- `planning.py::plan_robotwin` 支持多任务：
+  - `benchmark.tasks: [..]` 显式列表，或 `"all"` / `"*"`（从 `<robotwin_root>/task_config/_eval_step_limit.yml` 读全量任务名，需 `env.robotwin_root`）；
+  - 每个任务独立 seed 区间与 `seed_stride`（unstable 跳步仍留在本任务自己的区间内）；
+  - `benchmark.episodes_per_chunk` 显式指定每 worker 连续跑几集（不设则按 worker 数自动切分）。
+- `robotwin_runner` 新增 `benchmark.use_official_step_limits`：为真时**不**把 `max_steps` 写进 `step_limit_override`，让官方 `_eval_step_limit.yml`（400–1700 步）逐任务生效；同时把 `max_steps` 同步成该任务官方值，保证 adapter context / trace / 记录口径一致。
+
+**Dry-run（50 任务 × 5 集，`episodes_per_chunk` 不设）**
+
+- 250 个 shard，250 个 episode；50 个任务各 5 个 seed（如 `adjust_bottle: 100001–100005`）；`seed_stride = 5`。
+- 官方步数统计：50 个任务 min 400 / median 500 / mean 620 / max 1700。
+
+**单测**：`test_plan_robotwin_fans_out_over_tasks`、`test_plan_robotwin_tasks_all_reads_the_official_task_set`、`test_plan_robotwin_rejects_tasks_all_without_a_root`、`test_official_step_limit_lookup`；全量 **178 passed / 1 skipped**。
+
 **状态（2026-10-30）**
 
 - **旧入口（stable_2.0）已实现同等能力，无需改 RoboTwin**：`_worker_eval_script` 在 `benchmark.skip_intra_chunk_obs: true` 时把评测循环改成
@@ -782,6 +952,44 @@ records       = 10（2 条重复）
     → `max_wait=50ms` 与关闭无差别（到达间隔 4.6s，50ms 内凑不出批）；`2000ms` 确实凑出 mean_batch≈3.3，但**等待代价大于并行收益**（-5%）。**结论：RoboTwin 这条链保持 batching 关闭**，除非将来出现 lockstep/向量化。
   - **下一步**：用 N=4 + skip_obs 跑成功率验证（多轮均值，单轮不可比）。
 - **新入口（XPolicyLab）迁移**：仍未开工，等待确认拓扑。
+
+### 2.39 多集/进程摊销 + separate vs co_locate 终局对比（2026-11-03）
+
+**背景**：§2.35–2.38 定了资源模型、LPT 派发与计时口径后，用新权重 `steps_190000_eval` + 官方协议 + 资产本地化，做两件事：(1) 验证 `episodes_per_chunk`（一个 worker 进程连续跑多集，摊销 torch/SAPIEN import ~100s）本身就是加速手段；(2) 在 3-wave（`episodes_per_chunk=3`）口径下把 separate+batching 与 co_locate 拉通比一次，给出最终推荐。
+
+**`episodes_per_chunk` 加速（separate 10/card，blocks_ranking_rgb）**：单集/进程 6.58 ep/min → `chunk=3` **8.21 ep/min（+25%）**。短任务收益更大（import 占比更高）。
+
+**A/B（blocks_ranking_rgb，1200 步，新权重/官方协议/资产本地化，`episodes_per_chunk=3`）**
+
+| 臂 | 布局 | slots | end-to-end | steady | mean ep | 成功率 | repair |
+|---|---|---|---|---|---|---|---|
+| bsp10_c3 | separate 70 sim + batched server(200ms) | 70 | 8.21 ep/min | **18.28** | 229.7s | 72/211 (34.1%) | 1 轮 / launched 74 |
+| bcl8_c3 | co_locate 8 sim/card | 64 | **10.63 ep/min** | 12.70 | 302.4s | 56/192 (29.2%) | 0 |
+
+**读数**：
+- **单集 separate 快 24%**（230s vs 302s）——server 独占卡，不和 8 个 sim 的渲染抢 GPU；这是结构性优势，体现在 **steady +44%**（18.28 vs 12.70）。
+- **end-to-end 这轮 co_locate 反超**（10.63 vs 8.21），纯粹因为 separate 踩了 1 个 repair round：4 个单元尾部串行重跑，大部分 slot 空等（效率仅 8.21/18.28≈45%；co_locate 10.63/12.70≈84%）。这是尾部 straggler，不是吞吐天花板。
+
+**推荐**：
+- **吞吐优先（全量多任务）→ separate+batching 10/card + `plan_order=lpt` + `episodes_per_chunk=3`**。单集 -24% 的优势在 50 任务上累积；LPT + 多任务调度空间让零散重跑回填进空闲 slot，不再像单任务 210 集那样把尾巴暴露出来。
+- **稳定/省心 → co_locate N=8**：不拆 server/sim 卡、不调 batching，0 重启 0 重跑；end-to-end 也不差。
+- 两者都保留 `episodes_per_chunk=3`。RoboTwin 链 batching 收益有限（§2.34），separate 侧开 batching 主要是因为 server 独占卡后请求汇聚到单卡，需要聚批喂满；co_locate 每卡自带 server，关 batching 即可。
+
+**全量验证（50 clean 任务 × 5 集 = 250 集，官方 step limit，`plan_order=lpt`，`episodes_per_chunk=3`，2026-11-03）**：两组各占满 8 卡串行跑；separate 另跑一遍（从 t=0 采显存峰值 + 复核方差）。三轮均 `validation.ok=true`、`server_restarts=0`、`infra_failed=0`、`unexpected=0`、`duplicates=0`（补跑重复行被按 `episode_id` 去重）。
+
+| 组 | 并发 sim | 成功率 | worker wall | ep/min | repair | 每卡显存峰值 |
+|---|---|---|---|---|---|---|
+| separate 70sim + batched server(200ms) | 70 | 152/250 = **60.8%** | 1519s | 9.88 | 1 轮 (launched 127) | sim 卡 ~56GB / server 卡 ~14GB |
+| separate（复跑） | 70 | 149/250 = **59.6%** | 1986s | 7.55 | 1 轮 (launched 127) | 同上（实测 gpu1–7 42–56GB，gpu0 14GB） |
+| **co_locate N=8** | 64 | 150/250 = **60.0%** | 1502s | 9.99 | 1 轮 (launched 118) | **~57GB/卡**（48–57，实测） |
+
+**结论**：
+- **端到端打平、略偏 co_locate**：co_locate 1502s 比 separate 两轮（1519s / 1986s，均值 ~1753s）**更快且更稳**。separate 单集快 24% 的结构优势（§2.39 A/B 的 steady +44%），在全量 50 任务上被 batched-server 瓶颈 + repair 尾巴抵消——两轮 separate wall 差 31%（1519 vs 1986，取决于补跑轮里落进的长任务），方差明显大于 co_locate。
+- **成功率三轮一致 ~60%**（60.8 / 59.6 / 60.0），50 clean 任务聚合，可作为该 checkpoint 的 clean 协议基线。
+- **全量规模下 co_locate 也会补跑**：COLO launched 118（18 个补跑单元），之前单任务 A/B 的"0 repair"只是样本小，任务一多就有 straggler/不稳定种子。
+- **显存**：co_locate N=8 ~57GB/卡（server+8sim 同卡）；separate 的 sim 卡（10 sim）也到 ~56GB，server 卡仅 14GB——两种布局的 sim 卡峰值接近（都是 ~8–10 个 sim 的量级），80GB 卡均留 ~23GB headroom。
+
+**最终推荐：co_locate N=8**（+ `plan_order=lpt` + `episodes_per_chunk=3`，batching 关）。理由：端到端同样快甚至更快、方差更小；运维最简单——不拆 server/sim 卡、不维护 batched server、不调 batching 窗口；显存同量级。separate+batching 仅在"server 能独占整卡且 sim 卡能堆到远超 co_locate 密度"时才有净收益，当前 8 卡对称场景下不成立。
 
 
 

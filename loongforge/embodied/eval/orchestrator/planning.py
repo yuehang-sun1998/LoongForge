@@ -17,7 +17,10 @@ and one planner per benchmark family produces them. The family key comes from
 
 from __future__ import annotations
 
+import pathlib
 from typing import Any, Callable, Dict, List, Tuple
+
+import yaml
 
 Shard = Dict[str, Any]
 Planner = Callable[[Dict[str, Any], int], List[Shard]]
@@ -152,37 +155,124 @@ def plan_episode_indexed(config: Dict[str, Any], total_workers: int) -> List[Sha
     ]
 
 
+def _robotwin_all_tasks(config: Dict[str, Any]) -> List[str]:
+    """Task names from RoboTwin's official per-task step-limit file."""
+    root = (config.get("env") or {}).get("robotwin_root")
+    if not root:
+        raise ValueError(
+            "benchmark.tasks='all' requires env.robotwin_root to locate task_config/_eval_step_limit.yml"
+        )
+    path = pathlib.Path(root) / "task_config" / "_eval_step_limit.yml"
+    if not path.is_file():
+        raise ValueError(f"RoboTwin step-limit file not found: {path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return sorted(str(name) for name in data)
+
+
+def _robotwin_step_limits(config: Dict[str, Any]) -> Dict[str, int]:
+    """Official per-task step limits (empty when the file is unavailable)."""
+    root = (config.get("env") or {}).get("robotwin_root")
+    if not root:
+        return {}
+    path = pathlib.Path(root) / "task_config" / "_eval_step_limit.yml"
+    if not path.is_file():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return {str(name): int(value) for name, value in data.items() if value is not None}
+
+
+def _interleave(per_task: List[List[Shard]]) -> List[Shard]:
+    """Round-robin across tasks so the first wave mixes every task."""
+    out: List[Shard] = []
+    depth = max((len(items) for items in per_task), default=0)
+    for index in range(depth):
+        for items in per_task:
+            if index < len(items):
+                out.append(items[index])
+    return out
+
+
+def robotwin_tasks(config: Dict[str, Any]) -> List[str]:
+    """Resolve the task list for a RoboTwin run.
+
+    Accepts ``benchmark.tasks`` (a list or one string, ``all``/``*`` expands to the
+    official task set) and falls back to the single ``benchmark.task_name``.
+    """
+    benchmark = _benchmark(config)
+    tasks = benchmark.get("tasks")
+    if isinstance(tasks, str):
+        tasks = [tasks]
+    if tasks:
+        names = [str(task) for task in tasks]
+        if len(names) == 1 and names[0].strip().lower() in {"all", "*"}:
+            names = _robotwin_all_tasks(config)
+        seen: set = set()
+        return [name for name in names if not (name in seen or seen.add(name))]
+    task = str(benchmark.get("task_name") or "")
+    return [task] if task else []
+
+
 def plan_robotwin(config: Dict[str, Any], total_workers: int) -> List[Shard]:
     """RoboTwin: task x task-config x seed range (episodes are seeds, not an index).
+
+    ``benchmark.tasks`` (or ``"all"``) fans one run out over several tasks; each
+    task gets its own seed range and its own ``seed_stride``.
 
     ``seed_stride`` is the width of one full round (all shard blocks). The runner
     advances by it when a seed is unstable, so the retry lands in that shard's
     next block instead of crossing into a neighbour's seed range.
     """
     benchmark = _benchmark(config)
-    task = str(benchmark.get("task_name") or "")
+    tasks = robotwin_tasks(config)
+    if not tasks:
+        raise ValueError("robotwin planning needs benchmark.task_name or benchmark.tasks")
     task_config = str(benchmark.get("task_config") or "demo_clean")
     episodes = int(benchmark.get("episodes_per_task") or benchmark.get("test_num") or 1)
     start = int(benchmark.get("episode_offset") or benchmark.get("start_seed") or 0)
-    chunk = chunk_size(episodes, total_workers)
-    ranges = list(_ranges(start, episodes, chunk))
-    seed_stride = len(ranges) * chunk
-    return [
-        {
-            "id": f"{task}/{task_config}/seed={seed}-{seed + count - 1}",
-            "overrides": {
-                "benchmark": {
-                    "task_name": task,
-                    "task_config": task_config,
-                    "start_seed": seed,
-                    "test_num": count,
-                    "seed_stride": seed_stride,
+    # An explicit episode chunk keeps one worker process on the same task (helps
+    # amortise RoboTwin's import cost); otherwise spread every task wide.
+    chunk_override = int(benchmark.get("episodes_per_chunk") or 0)
+    per_task: List[List[Shard]] = []
+    for task in tasks:
+        chunk = chunk_override if chunk_override > 0 else chunk_size(episodes, total_workers)
+        ranges = list(_ranges(start, episodes, chunk))
+        seed_stride = len(ranges) * chunk
+        per_task.append(
+            [
+                {
+                    "id": f"{task}/{task_config}/seed={seed}-{seed + count - 1}",
+                    "overrides": {
+                        "benchmark": {
+                            "task_name": task,
+                            "task_config": task_config,
+                            "start_seed": seed,
+                            "test_num": count,
+                            "seed_stride": seed_stride,
+                        }
+                    },
+                    "expected": count,
                 }
-            },
-            "expected": count,
-        }
-        for seed, count in ranges
-    ]
+                for seed, count in ranges
+            ]
+        )
+
+    # Dispatch is a FIFO queue, so the order below decides which tasks a wave
+    # runs together. "task" (default) keeps the historical task-major order;
+    # "interleave" mixes tasks in every wave; "lpt" starts the longest tasks
+    # first (then interleaves) to shrink the makespan.
+    order = str(benchmark.get("plan_order") or "task").strip().lower()
+    if order == "task":
+        return [shard for items in per_task for shard in items]
+    if order == "interleave":
+        return _interleave(per_task)
+    if order == "lpt":
+        limits = _robotwin_step_limits(config)
+        # Longest task first, then round-robin so a wave still mixes tasks.
+        per_task.sort(key=lambda items: -limits.get(items[0]["overrides"]["benchmark"]["task_name"], 0))
+        # Each task's own shards run longest-first as well (same seed range, so
+        # order only affects scheduling, not coverage).
+        return _interleave(per_task)
+    raise ValueError(f"benchmark.plan_order must be one of ['task', 'interleave', 'lpt'], got {order!r}")
 
 
 def plan_calvin(config: Dict[str, Any], total_workers: int) -> List[Shard]:

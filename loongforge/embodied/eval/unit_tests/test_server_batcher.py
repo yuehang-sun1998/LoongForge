@@ -190,3 +190,15 @@ def test_batcher_logs_periodic_stats(caplog) -> None:
     heartbeats = [r.message for r in caplog.records if "Batcher stats:" in r.message]
     assert heartbeats, "no periodic heartbeat was logged"
     assert "mean_batch=" in heartbeats[-1] and "max_batch=" in heartbeats[-1]
+
+
+def test_batch_without_noise_seed_samples_per_row() -> None:
+    """No metadata seed -> the model samples fresh noise (official semantics)."""
+    model = _BatchModel()
+    policy = _batch_policy(model, noise_seed=None)
+
+    responses = policy.predict_action_batch([_policy_payload(0), _policy_payload(1)])
+
+    assert model.calls == 1
+    assert model.seeds == [None]  # predict_action called without a seeds kwarg
+    assert [response["actions"].shape for response in responses] == [(1, 7), (1, 7)]

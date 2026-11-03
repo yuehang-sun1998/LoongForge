@@ -1069,7 +1069,12 @@ class PI05Policy(nn.Module):
         if not isinstance(images[0], list):
             images = [[img] for img in images]
         B = len(images)
-        image_transform = ImageTransform(apply_to=[], image_size=self._image_size)
+        # The checkpoint metadata (config.json) and both official eval configs
+        # specify ``eval_image_normalize_mode: siglip``; training used [0,1]
+        # and the model applies ``img * 2 - 1`` itself in forward().
+        image_transform = ImageTransform(
+            apply_to=[], image_size=self._image_size, normalize_mode="siglip"
+        )
         # Use the number of views provided by the eval client so LIBERO (2) and
         # RoboTwin (3) both work without hard-coding a single camera count.
         num_images = max(len(images[0]), 1)

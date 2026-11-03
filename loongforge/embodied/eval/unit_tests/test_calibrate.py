@@ -5,6 +5,10 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from loongforge.embodied.eval.orchestrator.calibrate import (
     _GpuPeakSampler,
     _point_config,
@@ -99,3 +103,28 @@ def test_gpu_peak_sampler_stops_and_writes_its_sink(tmp_path) -> None:
     time.sleep(0.05)
     sampler.stop()  # would raise TypeError if the Event shadowed Thread._stop
     assert out.exists()
+
+
+def test_step_timing_splits_setup_from_compute(tmp_path) -> None:
+    """episode wall = setup + steady-state compute; inference is inside compute."""
+    from loongforge.embodied.eval.orchestrator.step_timing import summarize_run
+
+    worker = tmp_path / "worker_0" / "artifacts" / "robotwin" / "a" / "b"
+    worker.mkdir(parents=True)
+    (tmp_path / "worker_0" / "results.jsonl").write_text(
+        json.dumps({"task_suite": "t", "success": 1, "episode_time_sec": 120.0}) + "\n"
+    )
+    steps = [
+        {"step": i, "timestamp_sec": 100.0 + i * 0.05, "inference_latency_ms": 400 if i % 10 == 0 else 0}
+        for i in range(50)
+    ]
+    (worker / "trace.json").write_text(json.dumps({"steps": steps}))
+    (tmp_path / "coordinator_result.json").write_text(json.dumps({"concurrency": 8}))
+
+    row = summarize_run(str(tmp_path))
+    assert row["episodes"] == 1
+    assert row["mean_steps"] == 50
+    assert row["mean_compute_sec"] == pytest.approx(49 * 0.05)  # first->last timestamp
+    assert row["mean_setup_sec"] == 120.0 - row["mean_compute_sec"]
+    assert row["mean_inference_sec"] == 5 * 0.4
+    assert row["median_step_sec"] == pytest.approx(0.05)

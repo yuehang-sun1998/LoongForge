@@ -287,3 +287,94 @@ def test_plan_shards_dispatches_on_the_family(monkeypatch: Any) -> None:
     maniskill = plan_shards({"benchmark": {"name": "maniskill", "task_name": "t", "episodes_per_task": 1}}, 1)
     assert libero[0]["overrides"]["benchmark"]["suite"] == "a"
     assert maniskill[0]["overrides"]["benchmark"]["task_name"] == "t"
+
+
+def test_plan_robotwin_fans_out_over_tasks() -> None:
+    """benchmark.tasks gives every task its own seed range and stride."""
+    config: dict = {
+        "benchmark": {
+            "name": "robotwin",
+            "tasks": ["adjust_bottle", "click_bell"],
+            "task_config": "demo_clean",
+            "episodes_per_task": 5,
+        }
+    }
+    shards = plan_robotwin(config, 32)
+    assert len(shards) == 10  # 2 tasks x 5 single-episode units
+    assert {shard["overrides"]["benchmark"]["task_name"] for shard in shards} == {
+        "adjust_bottle",
+        "click_bell",
+    }
+    for task in ("adjust_bottle", "click_bell"):
+        seeds = sorted(
+            shard["overrides"]["benchmark"]["start_seed"]
+            for shard in shards
+            if shard["overrides"]["benchmark"]["task_name"] == task
+        )
+        assert seeds == [0, 1, 2, 3, 4]
+        assert all(
+            shard["overrides"]["benchmark"]["seed_stride"] == 5
+            for shard in shards
+            if shard["overrides"]["benchmark"]["task_name"] == task
+        )
+    assert all(shard["expected"] == 1 for shard in shards)
+
+
+def test_plan_robotwin_tasks_all_reads_the_official_task_set(tmp_path) -> None:
+    """`tasks: all` expands to the official per-task step-limit file."""
+    step_limits = tmp_path / "task_config" / "_eval_step_limit.yml"
+    step_limits.parent.mkdir(parents=True)
+    step_limits.write_text("adjust_bottle: 400\nclick_bell: 400\n", encoding="utf-8")
+    config: dict = {
+        "benchmark": {
+            "name": "robotwin",
+            "tasks": "all",
+            "episodes_per_task": 2,
+            "episodes_per_chunk": 2,
+        },
+        "env": {"robotwin_root": str(tmp_path)},
+    }
+    shards = plan_robotwin(config, 8)
+    assert [shard["overrides"]["benchmark"]["task_name"] for shard in shards] == [
+        "adjust_bottle",
+        "click_bell",
+    ]
+    assert all(shard["expected"] == 2 for shard in shards)
+    assert all(shard["overrides"]["benchmark"]["seed_stride"] == 2 for shard in shards)
+
+
+def test_plan_robotwin_rejects_tasks_all_without_a_root() -> None:
+    """`all` cannot be expanded without env.robotwin_root."""
+    config: dict = {"benchmark": {"name": "robotwin", "tasks": "all"}}
+    with pytest.raises(ValueError):
+        plan_robotwin(config, 4)
+
+
+def test_plan_robotwin_order_modes(tmp_path) -> None:
+    """task (default) is task-major; interleave mixes; lpt starts the longest task."""
+    step_limits = tmp_path / "task_config" / "_eval_step_limit.yml"
+    step_limits.parent.mkdir(parents=True)
+    step_limits.write_text("fast_task: 400\nslow_task: 1500\n", encoding="utf-8")
+
+    def plan(order: str):
+        config: dict = {
+            "benchmark": {
+                "name": "robotwin",
+                "tasks": ["fast_task", "slow_task"],
+                "episodes_per_task": 4,
+                "episodes_per_chunk": 1,
+                "plan_order": order,
+            },
+            "env": {"robotwin_root": str(tmp_path)},
+        }
+        return [s["overrides"]["benchmark"]["task_name"] for s in plan_robotwin(config, 8)]
+
+    assert plan("task") == ["fast_task"] * 4 + ["slow_task"] * 4
+    assert plan("interleave") == ["fast_task", "slow_task"] * 4
+    assert plan("lpt") == ["slow_task", "fast_task"] * 4  # longest first, then mixed
+
+    config = {
+        "benchmark": {"name": "robotwin", "task_name": "a", "plan_order": "bogus"},
+    }
+    with pytest.raises(ValueError):
+        plan_robotwin(config, 4)

@@ -404,6 +404,7 @@ def _apply_config(args: argparse.Namespace, config: Dict[str, object]) -> argpar
         (benchmark, "disable_action_cache", "disable_action_cache"),
         (benchmark, "chunk_execute_steps", "chunk_execute_steps"),
         (benchmark, "skip_intra_chunk_obs", "skip_intra_chunk_obs"),
+        (benchmark, "use_official_step_limits", "use_official_step_limits"),
         (server, "chunk_execute_steps", "chunk_execute_steps"),
         (server, "ckpt_path", "policy_ckpt_path"),
         (model, "unnorm_key", "unnorm_key"),
@@ -429,9 +430,34 @@ def _apply_config(args: argparse.Namespace, config: Dict[str, object]) -> argpar
         if value is not None:
             setattr(args, attr, value)
 
-    if args.step_limit_override is None:
+    # Official runs keep each task's own limit from task_config/_eval_step_limit.yml;
+    # performance runs pin one horizon so every arm is comparable.
+    if getattr(args, "use_official_step_limits", False):
+        # Keep metadata (adapter context, trace, records) on the same horizon the
+        # official script will use, without overriding the file itself.
+        official = _official_step_limit(args)
+        if official is not None:
+            args.max_steps = official
+    elif args.step_limit_override is None:
         args.step_limit_override = args.max_steps
     return args
+
+
+def _official_step_limit(args: argparse.Namespace) -> Optional[int]:
+    """Per-task step limit from RoboTwin's `_eval_step_limit.yml`, if present."""
+    task = getattr(args, "task_name", "")
+    root = getattr(args, "robotwin_path", "")
+    if not task or not root:
+        return None
+    path = pathlib.Path(root) / "task_config" / "_eval_step_limit.yml"
+    if not path.is_file():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    value = data.get(task)
+    return int(value) if value is not None else None
 
 
 def _robotwin_rate_from_result(result_txt: Optional[str]) -> Optional[float]:
@@ -482,6 +508,23 @@ def _parse_official_episode_outcomes(log_text: str) -> List[Dict[str, Any]]:
     return episodes
 
 
+def _trace_step_count(trace_path: Optional[str]) -> Optional[int]:
+    """Executed steps of the (single) episode recorded in ``trace.json``.
+
+    ``args.max_steps`` is the horizon cap, not the number of steps actually run:
+    an episode that succeeds early stops before the cap. The trace has one entry
+    per executed step, so it is the only faithful source for ``steps``.
+    """
+    if not trace_path:
+        return None
+    try:
+        data = json.loads(pathlib.Path(str(trace_path)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    steps = data.get("steps") if isinstance(data, dict) else None
+    return len(steps) if isinstance(steps, list) and steps else None
+
+
 def _build_robotwin_records(
     args: argparse.Namespace,
     returncode: int,
@@ -500,6 +543,9 @@ def _build_robotwin_records(
     n_eps = len(episodes)
     # Wall-clock is for the whole official subprocess; split evenly when multi-ep.
     per_ep_time = float(episode_time_sec) / n_eps if n_eps > 0 else float(episode_time_sec)
+    # A single-episode unit's trace is authoritative for the steps actually run;
+    # multi-episode units only keep the last episode's trace, so fall back to the cap.
+    traced_steps = _trace_step_count(artifacts.get("trace_path")) if n_eps <= 1 else None
     common = {
         "benchmark": "robotwin",
         "task_suite": args.task_name,
@@ -507,7 +553,7 @@ def _build_robotwin_records(
         "task_description": args.task_name.replace("_", " "),
         "task_config": args.task_config,
         "ckpt_setting": args.ckpt_setting,
-        "steps": int(args.max_steps),
+        "steps": int(traced_steps or args.max_steps),
         "returncode": int(returncode),
         "result_path": artifacts.get("result_txt"),
         "official_eval_log": artifacts.get("official_eval_log"),
@@ -730,6 +776,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-action-cache", action="store_true")
     parser.add_argument("--return-action-chunk", action="store_true")
     parser.add_argument("--skip-intra-chunk-obs", action="store_true")
+    parser.add_argument("--use-official-step-limits", action="store_true")
     parser.add_argument("--disable-eval-video-log", action="store_true")
     parser.add_argument("--cuda-visible-devices", default=None)
     parser.add_argument("--timeout-sec", type=float, default=None)

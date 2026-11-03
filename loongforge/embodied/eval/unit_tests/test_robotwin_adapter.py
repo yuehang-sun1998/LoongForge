@@ -577,3 +577,49 @@ def test_worker_script_skips_intra_chunk_render(tmp_path: pathlib.Path) -> None:
     disabled = run(False)
     assert "needs_obs" not in disabled
     assert "observation = TASK_ENV.get_obs()" in disabled
+
+
+def test_official_step_limit_lookup(tmp_path: pathlib.Path) -> None:
+    """use_official_step_limits keeps per-task horizons from RoboTwin's YAML."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    config_dir = tmp_path / "task_config"
+    config_dir.mkdir()
+    (config_dir / "_eval_step_limit.yml").write_text(
+        "adjust_bottle: 400\nopen_microwave: 1700\n", encoding="utf-8"
+    )
+    args = argparse.Namespace(task_name="open_microwave", robotwin_path=str(tmp_path))
+    assert robotwin_runner._official_step_limit(args) == 1700
+
+    args.task_name = "not_a_task"
+    assert robotwin_runner._official_step_limit(args) is None
+
+    args.robotwin_path = str(tmp_path / "missing")
+    args.task_name = "open_microwave"
+    assert robotwin_runner._official_step_limit(args) is None
+
+
+def test_records_use_trace_length_for_early_success(tmp_path: pathlib.Path) -> None:
+    """`steps` must be the executed count, not the horizon cap."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    trace = tmp_path / "trace.json"
+    trace.write_text(json.dumps({"steps": [{"step": i} for i in range(37)]}), encoding="utf-8")
+    args = argparse.Namespace(
+        task_name="adjust_bottle",
+        task_config="demo_clean",
+        ckpt_setting="test",
+        max_steps=400,
+        seed=0,
+        start_seed_override=None,
+    )
+    records = robotwin_runner._build_robotwin_records(
+        args,
+        returncode=0,
+        artifacts={"trace_path": str(trace)},
+        episode_time_sec=10.0,
+        result_txt=None,
+        log_text="",
+    )
+    assert len(records) == 1
+    assert records[0]["steps"] == 37

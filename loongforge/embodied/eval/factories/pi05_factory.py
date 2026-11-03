@@ -127,7 +127,7 @@ class PI05ModelFactory:
             # Server-side batching contract: per-row noise comes from a fixed
             # seed, so batch and sequential rows stay comparable.
             "supports_batching": True,
-            "noise_seed": int(model_cfg.noise_seed),
+            "noise_seed": None if model_cfg.noise_seed is None else int(model_cfg.noise_seed),
         }
         return PredictActionModelSpec(model=model, metadata=metadata)
 

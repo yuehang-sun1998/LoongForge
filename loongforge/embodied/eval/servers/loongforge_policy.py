@@ -185,9 +185,9 @@ class GenericPredictActionPolicy:
         }
         if len(modes) != 1:
             raise ValueError("cannot batch payloads with different cache modes")
+        # No fixed seed by default:每一行各自采样（与官方 openpi 客户端一致）。
+        # 设置 ``metadata.noise_seed`` 时才退化为可复现模式（所有行共用该种子）。
         base_seed = self._metadata.get("noise_seed")
-        if base_seed is None:
-            raise ValueError("batched inference requires a fixed model.noise_seed")
 
         images = []
         instructions = []
@@ -214,12 +214,15 @@ class GenericPredictActionPolicy:
         state_batch = np.stack(states, axis=0)
 
         start = time.perf_counter()
+        seed_kwargs = (
+            {"seeds": [int(base_seed)] * len(payloads)} if base_seed is not None else {}
+        )
         result = self._model.predict_action(
             images=images,
             instructions=instructions,
             state=state_batch,
             dataset_stats=self._dataset_stats,
-            seeds=[int(base_seed)] * len(payloads),
+            **seed_kwargs,
         )
         latency_ms = (time.perf_counter() - start) * 1000.0
         actions = np.asarray(result, dtype=np.float32)
