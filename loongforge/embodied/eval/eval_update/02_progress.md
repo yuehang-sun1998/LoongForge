@@ -985,14 +985,51 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
 
 **结论**：
 - **端到端打平、略偏 co_locate**：co_locate 1502s 比 separate 两轮（1519s / 1986s，均值 ~1753s）**更快且更稳**。separate 单集快 24% 的结构优势（§2.39 A/B 的 steady +44%），在全量 50 任务上被 batched-server 瓶颈 + repair 尾巴抵消——两轮 separate wall 差 31%（1519 vs 1986，取决于补跑轮里落进的长任务），方差明显大于 co_locate。
-- **成功率三轮一致 ~60%**（60.8 / 59.6 / 60.0），50 clean 任务聚合，可作为该 checkpoint 的 clean 协议基线。
+- **成功率三轮一致 ~60%**（60.8 / 59.6 / 60.0）。⚠️ **注意：这三轮都是 `disable_expert_check=true`（expert-OFF），不是官方协议，不能与 README 的 77.56% 对比**——官方 expert_check 会先用脚本专家筛掉不可解种子、只在可解场景上评测（见 §2.40）；关闭后评测集变成原始连续种子，且部分任务 `check_success` 丢了 `play_once` 的簿记上下文 → 双向假阳/假阴。此处 ~60% 仅用于"三轮口径一致性"的内部对照，**不是该 checkpoint 的官方成功率**。官方口径见 §2.40。
 - **全量规模下 co_locate 也会补跑**：COLO launched 118（18 个补跑单元），之前单任务 A/B 的"0 repair"只是样本小，任务一多就有 straggler/不稳定种子。
 - **显存**：co_locate N=8 ~57GB/卡（server+8sim 同卡）；separate 的 sim 卡（10 sim）也到 ~56GB，server 卡仅 14GB——两种布局的 sim 卡峰值接近（都是 ~8–10 个 sim 的量级），80GB 卡均留 ~23GB headroom。
 
 **最终推荐：co_locate N=8**（+ `plan_order=lpt` + `episodes_per_chunk=3`，batching 关）。理由：端到端同样快甚至更快、方差更小；运维最简单——不拆 server/sim 卡、不维护 batched server、不调 batching 窗口；显存同量级。separate+batching 仅在"server 能独占整卡且 sim 卡能堆到远超 co_locate 密度"时才有净收益，当前 8 卡对称场景下不成立。
 
+### 2.40 官方协议成功率对齐：根因诊断链（2026-11-03）
 
+**背景**：§2.39 的 ~60% 成功率是 `disable_expert_check=true`（expert-OFF）口径，**不是官方协议，不能与 README 对比**。为对齐 checkpoint README（`steps_200000_eval`，clean 50 任务 **77.56%**）逐层排查。README 参照来自 `examples/embodied/pi05/RoboTwin/README.md`（PR #313 产出）；权重 `robotwin_pi05_h30_100k_q99_s1000/checkpoints/steps_{190000,200000}_eval`、RoboTwin `/raid0/workspace/perf_test/RoboTwin`，均在本 pod。
 
+**判别实验（挑偏差最大的 5 任务 × 50，expert-on）**
+
+| 任务 | expert-off(5集) | 190k官方limit | 200k官方limit | s300(max300) | README |
+|---|---|---|---|---|---|
+| lift_pot | 0–2/5 | 96% | 94% | 98% | 97% |
+| place_empty_cup | 1/5 | 98% | 98% | 100% | 99% |
+| open_microwave | 4/5 | 78% | 88% | **8%** | 16% |
+| put_bottles_dustbin | 4/5 | 62% | 58% | **0%** | 0% |
+| handover_block | 0/5 | 2% | 14% | 4% | 72% |
+
+**逐层结论（逐一排除）**
+
+1. **expert_check（主因之一）**：§2.39 低分部分源于 `disable_expert_check=true`。开启后 `lift_pot` 2%→96%、`place_empty_cup` 1%→98%，对上 README。expert_check 是官方协议的**种子筛选闸门**（`eval_policy_client.py:391-421`：脚本专家 `play_once` 先验证场景可解才录取该 seed），**不是 `check_success` 能替代的**——两者角色不同（准入门 vs 判分）。
+2. **checkpoint 190k vs 200k**：**排除**。3 个背离任务换 200k 仍同向偏离（microwave 88%、dustbin 58%、handover 14%）。
+3. **eval 管线 vs 上游 PR#313**（已合入 `upstream/master 7ea02e4`）：**排除**。`action_decoders/joint.py`（`pi05_aloha_robotwin` decoder）逐字节相同；`payload_builders/pi05.py` 仅差 LIBERO `libero_ee8`（与 RoboTwin 无关）；`modeling_pi05.predict_action` 对本权重语义等价（siglip + q99，与 config.json 一致）。偏差是任务特异的（50 个里仅 3 个），也排除任何全局管线差异。
+4. **RoboTwin 版本/判据**：**排除**。README 作者用的 `/raid0/workspace/perf_test/RoboTwin`，这 3 个任务的 `check_success` 与我们 `13c3c47` 逐字相同。
+5. **step-limit 协议差（根因）**：README 用固定 `max_steps: 300`（官方 pi05 模板），我们用 `use_official_step_limits`（`_eval_step_limit.yml`，每任务 400–1700）。按 README 的 300 重跑：`open_microwave` 88%→**8%**（README 16%）、`put_bottles_dustbin` 58%→**0%**（README 0%）——塌到 README 水平，**坐实**。这俩是长程任务，300 步做不完→README 低，我们给 5× 步数→高。
+
+**结论**：50 任务里 **47 个对齐协议后与 README 一致**；`open_microwave`/`put_bottles_dustbin` 是 **step-limit 口径差**（我们给 5× 步数，非错误）；**`handover_block` 是唯一真·单点异常**——我们 2–14% vs README 72%，**反向**（我们步数更多反而更低），`max_steps=300` 对它无效（仍 4%），与步数无关，待单独查（instruction / bimanual 交接执行 / 初始位姿）。
+
+**口径铁律**：要和 README 逐任务对比，必须 `max_steps: 300` 固定（关 `use_official_step_limits`）；要测模型真实能力上限才用官方 per-task limit。**两套口径不可混用**。
+
+### 2.41 handover_block 单点异常（未解决，2026-11-03）
+
+**现象**：`handover_block` 我们 2–14%（官方 limit）/ 0%（max 300），README 72%——**反向**（我们低）、`max_steps` 改不动。
+
+**已排除的假设**：
+- **chunk / 开环 cadence**：曾怀疑我们用 30 步开环 chunk + `skip_intra_chunk_obs` 破坏了双臂交接。但按 **README 精确口径重跑**（`return_action_chunk=false` → server 端 30-replay cache、关 skip、每步渲染、`max_steps=300`、expert-on、co_locate N=8，`/tmp/ab_t8_ho.json`）仍 **0/42**。而 README 同口径 72%。→ **cadence 排除**（且已确认 README 本身也是 server-cache 30-replay，不是每步重推理；见 §server `loongforge_policy.py:108-148`）。
+- **checkpoint / eval 管线 / RoboTwin 判据**：均已在 §2.40 排除。
+
+**关键线索**：expert_check 开着仍能录取到 42 个 seed → **专家 `play_once` 在我们环境里能完成这个 handover、场景可解、`check_success` 正常**；但**策略 42 集全败**。专家能做、策略全挂，且与 README 同 checkpoint/同口径却 0 vs 72。
+
+**收窄到**：策略实际吃到的**输入**与 README 不同——最可能是 **instruction 文本/`instruction_type`**（handover 是语言条件的双臂交接，指令不对就不会做），其次是 proprio/state 某处差异。**下一步**（未做）：调 `handover_block` 的 `trace.json`，看实际喂进去的 instruction + state，与官方 deploy 对比；必要时跑真·闭环（`disable_action_cache=true`）排除最后的 cadence 可能。
+
+**状态**：handover 是 50 任务里唯一未收口的单点；其余 47 一致、microwave/dustbin 是 step-limit 口径差（§2.40）。
 
 
 
@@ -1133,6 +1170,12 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
 13. **`batching.enabled` 必须显式或非空块**：旧实现只认 `enabled: true`，只写 `max_batch_size/max_wait_ms` 时 batcher **不会启动**（历史“ON/OFF 没区别”即由此而来）。现改为非空块默认启用，显式 `enabled: false` 才关闭；跑完用 server `stats` 的 `mean_batch_size` 确认真的生效。
 14. **batching 会引入 run-to-run 非确定性**：batch 组成随请求到达时序变化，bf16 batched-GEMM 归约顺序随之改变 → 同一配置两次 N=64 有 325/512 集步数抖动（±1–3 步）、4 集成功翻转（约 0.8%）。关闭 batching 在 **accel ckpt** 上逐集完全确定（同配置重复、跨并发均 0 差异）；但 **pr240** 在 batching off 下仍观察到 1 集 1 步的跨进程差异（GPU kernel 非确定归约）。要严格逐位复现，优先关闭 batching，必要时再固定 GPU/改用 fp32。
 15. **无 batching 时推理会阻塞 event loop → watchdog 误杀**：`_route_message` 同步调用 `predict_action`，N=16 时 ping 排在十几次推理后超过 15s，watchdog 判 hung 并重启（实测单次 2000 集触发 24 次重启、27 集缺失）。已把无 batching 的推理也放进 `run_in_executor`，让 loop 能及时回 ping；单测 `test_ping_is_responsive_while_inference_runs` 覆盖。
+
+16. **`episodes_per_chunk` 要按"集数 / 槽位"选，否则 unit 少时只用到少数几张卡**：coordinator 把 unit **按整卡 8 个一组打包**下发（不是每卡轮流撒 1 个），所以 **unit 数越少、实际用到的 GPU 越少**。实测（2026-11-03）：handover+lift_pot 共 100 集、`chunk=5` → 仅 20 unit → 全挤在 **3/8 张卡**上，5 张空转、38min 才跑 27 集。选择公式：
+    - `E = tasks × episodes_per_task`（总集数），`S = n_sims_per_server × n_servers`（总槽位）；
+    - **`chunk = clamp(ceil(E / (k·S)), 1, episodes_per_task)`**：`k=1` 求极致吞吐（import 每槽只摊一次、波数最少，但长短任务悬殊时 LPT 无法细粒度均衡 → 拖尾）；**`k=2~3` 让 unit 数到 S 的 2–3 倍、LPT 能把长任务摊开抗拖尾**，代价是多付 import。
+    - `E ≤ S` 时取 `chunk=1`（一波并行，import 并发只付 ~1 次 wall-clock）。注意 `chunk` 是**按 task** 切的，公式在各 task 长度相近、`tasks×episodes` 能整除 `S` 时最准。
+    - 反例：`chunk` 过大（如 `E/S` 向下取整）→ 每槽一个大 unit → 长任务槽拖尾；`chunk` 过小且 E≫S → import 成本吃满 CPU（50 个冷 import 把 load 打到 60+）。
 
 ---
 
