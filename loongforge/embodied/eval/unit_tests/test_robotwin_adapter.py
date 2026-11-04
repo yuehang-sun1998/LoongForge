@@ -579,6 +579,55 @@ def test_worker_script_skips_intra_chunk_render(tmp_path: pathlib.Path) -> None:
     assert "observation = TASK_ENV.get_obs()" in disabled
 
 
+def test_worker_script_early_stop_patch(tmp_path: pathlib.Path) -> None:
+    """The opt-in switch injects the check_stable early-stop + instrumentation."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    robotwin = tmp_path / "RoboTwin"
+    (robotwin / "script").mkdir(parents=True)
+    source = (
+        "import numpy as np\n"
+        "def eval_policy(task_name, TASK_ENV, args, model):\n"
+        "        pass\n"
+    )
+    (robotwin / "script" / "eval_policy.py").write_text(source, encoding="utf-8")
+
+    def run(enabled: bool) -> str:
+        args = argparse.Namespace(
+            worker_local_files=True,
+            robotwin_path=str(robotwin),
+            output_dir=str(tmp_path / f"out_{enabled}"),
+            ckpt_setting="test",
+            step_limit_override=None,
+            start_seed_override=None,
+            test_num_override=None,
+            disable_expert_check=False,
+            disable_eval_video_log=False,
+            seed_stride=1,
+            skip_intra_chunk_obs=False,
+            settle_early_stop=enabled,
+        )
+        return robotwin_runner._worker_eval_script(args).read_text(encoding="utf-8")
+
+    enabled = run(True)
+    assert "check_stable early-stop" in enabled
+    assert "settled_at_step" in enabled  # instrumentation
+    assert "_WINDOW, _CAP, _EPS" in enabled
+    assert "_BT._init_task_env_, _BT.check_stable = _patched_init, _patched_check" in enabled
+    # Regression: _poses/_settled_at are instance helpers; every call must pass
+    # self or check_stable raises on the first window (seen as repeated
+    # "error occurs !" with no instrumentation / stuck workers).
+    import re
+    assert "for _p, _q in zip(_poses(self), ref):" in enabled
+    assert "_ref = _poses(self)" in enabled
+    assert not re.search(r"(?<!self\.)_poses\(\)", enabled)
+    assert "_drift = _settled_at(self, _ref)" in enabled
+
+    disabled = run(False)
+    assert "check_stable early-stop" not in disabled
+    assert "settled_at_step" not in disabled
+
+
 def test_official_step_limit_lookup(tmp_path: pathlib.Path) -> None:
     """use_official_step_limits keeps per-task horizons from RoboTwin's YAML."""
     from loongforge.embodied.eval.orchestrator.runners import robotwin_runner

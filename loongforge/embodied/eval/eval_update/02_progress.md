@@ -1031,6 +1031,38 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
 
 **状态**：handover 是 50 任务里唯一未收口的单点；其余 47 一致、microwave/dustbin 是 step-limit 口径差（§2.40）。
 
+### 2.42 调度 spread 修复 + websocket keepalive 修复（2026-11-04）
+
+**调度 spread（§4 坑 #16 的修复落地）**：`coordinator._build_slots` 由"按 GPU 分组"改为 **sim-layer major 交错**（每层每 GPU 一槽）。配合 `free_slots.pop()`（LIFO）→ 前 `len(urls)` 次 dispatch 落在不同 GPU。实测（adjust_bottle×50、chunk=5 → 10 单元 < 64 槽，pre/post 同配置对照）：
+
+| | 单元 GPU 分布 | 用卡数 | worker-elapsed | 成功率 |
+|---|---|---|---|---|
+| pre-fix | GPU7×8 + GPU6×2 | 2 | 458s | 100% |
+| post-fix | 8 卡均摊（1–2/卡） | 8 | **228s** | 98% |
+
+→ **2.0×**，且仅对"单元 < 槽位"的作业生效；满载（单元≥槽位）槽集合不变、零影响。单测 `test_build_slots_dispatch_order_spreads_across_gpus`。
+
+**websocket keepalive（§4 坑 #17）**：sim 客户端长阻塞（check_stable ~195s / 长渲染 / 开环 chunk）回不了 server 的 20s keepalive ping → server 1011 断连（重连自愈但噪声+开销+偶发丢集）。修复 `ping_interval=None`。修复后验证 run（sched_fix）：**1011 = 0**。
+
+**scene-cache / restore 探索结论（不采用）**：曾实现"快照 check_stable 沉降态、restore 跳过第二次 setup"（注入 monkeypatch、RoboTwin 源码不动、`scene_cache_dir` 开关），**等价性验证失败**——restore（`set_pose`+置零速度）没有重建静止接触，物理一 step 物体微动 → adjust_bottle 从 96% 塌到 **25%**（失败全 `not_successful`、无 infra，确认是场景不等价而非通信）。**已整体撤掉**（runner 注入/helper 删除）。教训：`set_pose` 不等于静止平衡；要跳过第二次 `check_stable` 只能走 **"restore + 短重沉降"并验证等价** 或只跳**阶段 B 的 500 步稳定性判定**（该 seed 已在第一次 setup 验证过、确定性 → 无逻辑风险，约省一次 check_stable 的 20%），均未做、留待后续。
+
+### 2.43 check_stable 减步数实验：均正确但无吞吐收益（结论：步数不是瓶颈，2026-11-04）
+
+为实现过两个"减少 check_stable 步数"的注入式加速（`benchmark.skip_second_check_phase_b` / `benchmark.settle_early_stop`，均默认关、RoboTwin 源码不动）。**两者都验证为正确，但端到端几乎不提速**——这否定了"2000 步沉降是 setup 瓶颈"的旧假设（§2.38 曾按 2500 步 × ~70ms/步 推算，是猜的）。
+
+| 臂（adjust_bottle×50, expert-on, 官方 limit, co_locate N=8） | 成功率 | worker-elapsed |
+|---|---|---|
+| base（原版，无注入） | 96–98% | **228s** |
+| phase-B skip（第二次 setup 只跑 2000 步沉降、跳 500 步判定） | 98% | 228s（差异在噪声内） |
+| settle early-stop（每 100 步查位姿，静即停） | 96% | 228s（同上） |
+
+**关键实测**：
+- **instrumentation 证明 2000 步足够**：所有稳定 seed 的 `drift(step2000→2500)=0.000000m`；早停在**绝大多数场景 100 步**（最小窗口）即判定静止，极少数 200 步；个别慢沉降 seed（如 100000，`drift=9.65mm@2000`）不早停、落回官方判定并被**正确拒为 unstable**——兜底逻辑工作正常。
+- 但 **WALL 559/550/543s 三者几乎相同**：把沉降从 2000 步砍到 100 步，端到端只省 ~2%。**说明 setup 的 211s 不在"物理步数"上**，而在每步本身的成本（64 sim 并发下的 CPU 争抢/物理求解）或 setup 的其它环节（场景构建/URDF/专家 rollout）。§2.38 对 setup 的归因不准确，需按"每步成本 × 并发"重估。
+- 采样阶段还修掉两个注入 bug：`_poses`/`_settled_at` 是实例方法，注入文本里漏传 `self` → 每次 check_stable 抛 TypeError 被 eval 循环吞成 `error occurs !`、worker 空转。回归测试已加断言扫所有 `_poses(` 调用必须带 `self`。
+
+**处置**：两个开关保留（正确、默认关、有单测），文档标注"**已验证正确但无实测收益，不建议作为加速手段**"。真正的 setup 大头仍未归因（一次 8 卡计时实验因计时文件路径写错而失败，未重做）。
+
 
 
 ---
@@ -1176,6 +1208,9 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
     - **`chunk = clamp(ceil(E / (k·S)), 1, episodes_per_task)`**：`k=1` 求极致吞吐（import 每槽只摊一次、波数最少，但长短任务悬殊时 LPT 无法细粒度均衡 → 拖尾）；**`k=2~3` 让 unit 数到 S 的 2–3 倍、LPT 能把长任务摊开抗拖尾**，代价是多付 import。
     - `E ≤ S` 时取 `chunk=1`（一波并行，import 并发只付 ~1 次 wall-clock）。注意 `chunk` 是**按 task** 切的，公式在各 task 长度相近、`tasks×episodes` 能整除 `S` 时最准。
     - 反例：`chunk` 过大（如 `E/S` 向下取整）→ 每槽一个大 unit → 长任务槽拖尾；`chunk` 过小且 E≫S → import 成本吃满 CPU（50 个冷 import 把 load 打到 60+）。
+    - **调度 spread 修复（2026-11-04）**：`_build_slots` 改为 **sim-layer major 交错排列**（每层每 GPU 一个槽，不再按 GPU 分组），配合 `free_slots.pop()`（LIFO 从末尾取）→ 前 `len(urls)` 次 dispatch 落在**不同 GPU** 上 → 单元 < 槽位时也铺满所有卡。实测（10 unit, adjust_bottle×50）：**pre-fix 挤 GPU7×8+GPU6×2（2 卡）458s → post-fix 均摊 8 卡 228s，2.0×**；成功率等价。**满载（单元≥槽位）槽集合不变、零影响**。
+
+17. **sim 客户端长阻塞 → server 误判死连接（1011 keepalive ping timeout）**：`websockets` 服务端默认每 20s keepalive ping、20s 无 pong 判超时。RoboTwin worker（sim）会长时间阻塞在同步 C 代码（`check_stable` ~195s、长渲染、chunk 开环执行）里不理 socket → server 发 1011 关连接。多数情况下客户端下次推理会重连自愈，但带来日志噪声、重连开销、偶发丢集。**修复（2026-11-04）**：`rpc_server.py` 的 `serve(...)` 加 `ping_interval=None`（关掉 websocket 层 keepalive；连接存活由评测流程 + coordinator watchdog 负责）。注意与坑 #15 方向相反：#15 是 server 自身 event loop 被推理阻塞回不了 client 的 ping；本条是 client 被 sim 阻塞回不了 server 的 ping。
 
 ---
 

@@ -480,15 +480,33 @@ def test_separate_placement_rejects_gpu_overlap() -> None:
 def test_build_slots_co_locate_pins_worker_to_its_server_gpu() -> None:
     from loongforge.embodied.eval.orchestrator import coordinator as coord
 
+    # Sim-layer major: one slot per GPU per layer (not grouped by GPU).
     slots = coord._build_slots([0, 1], 2, [0, 1], "co_locate", ["ws://a", "ws://b"])
-    assert slots == [("ws://a", 0), ("ws://a", 0), ("ws://b", 1), ("ws://b", 1)]
+    assert slots == [("ws://a", 0), ("ws://b", 1), ("ws://a", 0), ("ws://b", 1)]
 
 
 def test_build_slots_separate_spreads_workers_over_sim_gpus() -> None:
     from loongforge.embodied.eval.orchestrator import coordinator as coord
 
     slots = coord._build_slots([0, 1], 2, [4, 5], "separate", ["ws://a", "ws://b"])
-    assert slots == [("ws://a", 4), ("ws://a", 5), ("ws://b", 4), ("ws://b", 5)]
+    assert slots == [("ws://a", 4), ("ws://b", 5), ("ws://a", 4), ("ws://b", 5)]
+
+
+def test_build_slots_dispatch_order_spreads_across_gpus() -> None:
+    """Popping free slots from the end must hit distinct GPUs first.
+
+    A job with fewer units than slots should use every card, not pack onto the
+    highest-numbered ones (regression for the episodes_per_chunk packing bug).
+    """
+    from loongforge.embodied.eval.orchestrator import coordinator as coord
+
+    g = 8
+    slots = coord._build_slots(list(range(g)), 8, list(range(g)), "co_locate",
+                               [f"ws://s{i}" for i in range(g)])
+    assert len(slots) == g * 8
+    # _run_batch does free_slots.pop() (from the end); inspect the first g pops.
+    first_g_gpus = [slots[-1 - i][1] for i in range(g)]
+    assert sorted(first_g_gpus) == list(range(g))  # one unit per GPU
 
 
 def test_gpu_vram_budget_rejects_too_many_sims() -> None:

@@ -235,13 +235,19 @@ def _build_slots(
     ``co_locate`` pins a server's workers to that server's GPU; ``separate``
     spreads all workers over ``sim_gpus`` while keeping the server URLs paired
     round-robin.
+
+    Slots are laid out **sim-layer major** (one slot per GPU, then the next
+    layer) rather than grouped by GPU. ``_run_batch`` pops free slots from the
+    end of the list, so this ordering makes the first ``len(urls)`` dispatches
+    land on distinct GPUs: a job with fewer units than slots still spreads
+    across every card instead of packing onto the highest-numbered ones. For a
+    full load (units >= slots) the slot *set* is unchanged, so throughput is
+    identical.
     """
     slots: List[tuple[str, int]] = []
-    sim_index = 0
-    for index, url in enumerate(urls):
-        for _ in range(n_per_server):
-            gpu = server_gpus[index] if mode == "co_locate" else sim_gpus[sim_index % len(sim_gpus)]
-            sim_index += 1
+    for layer in range(n_per_server):
+        for index, url in enumerate(urls):
+            gpu = server_gpus[index] if mode == "co_locate" else sim_gpus[(layer * len(urls) + index) % len(sim_gpus)]
             slots.append((url, gpu))
     return slots
 

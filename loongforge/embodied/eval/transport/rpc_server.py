@@ -57,6 +57,12 @@ class PolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            # Sim clients block for long synchronous stretches (RoboTwin's
+            # ~195s check_stable, long renders) and cannot answer the default
+            # 20s keepalive ping, so the server would drop the idle connection
+            # with 1011. Disable server-side keepalive; liveness is managed by
+            # the eval flow + coordinator watchdog, not by websocket pings.
+            ping_interval=None,
         ) as server:
             logger.info("PolicyServer listening on ws://%s:%s", self._host, self._port)
             # A non-empty ``batching`` block enables batching unless it says
