@@ -628,6 +628,66 @@ def test_worker_script_early_stop_patch(tmp_path: pathlib.Path) -> None:
     assert "settled_at_step" not in disabled
 
 
+def test_worker_script_offline_expert_check_modes(tmp_path: pathlib.Path) -> None:
+    """Seed-cache scan/consume rewrite only the worker script, never RoboTwin."""
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    robotwin = tmp_path / "RoboTwin"
+    (robotwin / "script").mkdir(parents=True)
+    source = (
+        "import numpy as np\n"
+        "def main(x):\n"
+        "    model = get_model(usr_args)\n"
+        "def eval_policy(task_name, TASK_ENV, args, model, st_seed, test_num=1):\n"
+        "    expert_check = True\n"
+        "    while succ_seed < test_num:\n"
+        '        render_freq = args["render_freq"]\n'
+        "        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)\n"
+        '        episode_info_list = [episode_info["info"]]\n'
+    )
+    (robotwin / "script" / "eval_policy.py").write_text(source, encoding="utf-8")
+
+    def gen(**kw) -> str:
+        args = argparse.Namespace(
+            worker_local_files=True,
+            robotwin_path=str(robotwin),
+            output_dir=str(tmp_path / f"out_{abs(hash(str(kw)))}"),
+            ckpt_setting="t",
+            step_limit_override=None,
+            start_seed_override=None,
+            test_num_override=None,
+            disable_expert_check=False,
+            disable_eval_video_log=True,
+            seed_stride=1,
+            skip_intra_chunk_obs=False,
+            settle_early_stop=False,
+            task_name="adjust_bottle",
+            **kw,
+        )
+        return robotwin_runner._worker_eval_script(args).read_text(encoding="utf-8")
+
+    scan = gen(offline_expert_check_scan=str(tmp_path / "cache"))
+    assert "_S_SCAN_DIR" in scan
+    assert "offline_expert_check scan: expert pass only" in scan  # get_model skipped
+    assert "_s_dump_scan(" in scan
+    assert "expert_check = False" not in scan
+
+    consume = gen(offline_expert_check=str(tmp_path / "cache"))
+    assert "_S_CACHE_PATH" in consume
+    assert "expert_check = False" in consume
+    assert "now_seed = _S_SEEDS[_idx]" in consume
+    assert "_idx = _S_OFFSET + succ_seed" in consume
+    assert "cache exhausted" in consume
+    assert "CACHE STALE" in consume
+
+    plain = gen()
+    assert "_S_SCAN_DIR" not in plain and "_S_CACHE_PATH" not in plain
+
+    # Every generated worker script must at least be syntactically valid.
+    for label, src in (("scan", scan), ("consume", consume), ("plain", plain)):
+        compile(src, f"<{label}>", "exec")
+
+
 def test_official_step_limit_lookup(tmp_path: pathlib.Path) -> None:
     """use_official_step_limits keeps per-task horizons from RoboTwin's YAML."""
     from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
@@ -672,3 +732,35 @@ def test_records_use_trace_length_for_early_success(tmp_path: pathlib.Path) -> N
     )
     assert len(records) == 1
     assert records[0]["steps"] == 37
+
+def test_merge_offline_expert_check_parts(tmp_path: pathlib.Path) -> None:
+    """Parts from residue-class scans merge, dedupe, sort and truncate."""
+    import pickle
+
+    from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    parts = {
+        0: [1000, 1004],
+        1: [1001, 1005],
+        2: [1002, 1006],
+        3: [1003],
+    }
+    for i, seeds in parts.items():
+        data = {
+            "schema": 1, "task": "adjust_bottle", "task_config": "demo_clean",
+            "n": len(seeds), "seeds": seeds,
+            "episode_info": {str(s): {"{A}": f"obj{s}"} for s in seeds},
+        }
+        (cache / f"adjust_bottle.part{i}.pkl").write_bytes(pickle.dumps(data))
+
+    merged = robotwin_runner.merge_offline_expert_check_scan(
+        {"benchmark": {"offline_expert_check_scan": str(cache),
+                       "offline_expert_check_scan_shards": 4,
+                       "episodes_per_task": 6}}
+    )
+    assert merged == {"adjust_bottle": 6}
+    out = pickle.loads((cache / "adjust_bottle.pkl").read_bytes())
+    assert out["seeds"] == [1000, 1001, 1002, 1003, 1004, 1005]
+    assert out["episode_info"]["1005"] == {"{A}": "obj1005"}

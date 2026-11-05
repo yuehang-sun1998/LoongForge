@@ -1133,6 +1133,58 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
 
 **适用性结论**：**只要我们的仿真环境长期固定**（同一台机、同一套 pin 死的版本/驱动/资产），离线种子缓存就成立——一次性扫描（5000 个有效 seed，64 并发、每 seed ~7–10s，约 **10–15 分钟**量级）换后续每次评测稳定省 ~20%，同时让评测输入固定、可复现。若环境会漂移，则需把"重扫/复核"计入流程。
 
+### 2.47 `offline_expert_check` 实现与实测（2026-11-05）
+
+**目标**：把 expert_check 的"筛选合格 seed"从**每次评测在线做**，变成**离线做一次、评测时直接复用**。RoboTwin 源码零改动，全部在 `robotwin_runner` 生成的 worker 脚本里注入（与 `skip_intra_chunk_obs` 同一机制）。
+
+**两个开关**
+
+| 开关 | 作用 |
+|---|---|
+| `benchmark.offline_expert_check_scan: <dir>` | 只跑官方专家分支（`setup_demo` + `play_once` + 官方录取判定），把每个合格 `(seed, episode_info["info"])` 写入 `<dir>/<task>.pkl`；**不跑策略**（跳过 `get_model`），且**不启动 policy server**（`server.disabled`） |
+| `benchmark.offline_expert_check_scan_shards: <k>` | 扫描分片数（默认 1）。k>1 时每个任务切成 k 个**残差类**（`start+i`、`seed_stride=k`、每个收 `ceil(N/k)` 个），各写 `<task>.part<i>.pkl`；顶层 run 结束后自动 **merge**（去重、升序、截断到 N）生成 `<task>.pkl` |
+| `benchmark.offline_expert_check: <dir>` | 消费 `<dir>/<task>.pkl`：`expert_check=False`，按**索引**取 seed 与 `episode_info`，每个 seed 只做 **1 次 `setup_demo` + 策略 rollout** |
+
+**与在线流程的差别**（每个合格 seed）
+
+| | 在线 | offline_expert_check |
+|---|---|---|
+| `setup_demo`（含 check_stable） | 2 次 | **1 次** |
+| 专家 rollout | 1 次 | **0 次** |
+| 被拒候选 seed 的浪费 | 每次评测都有 | **0**（扫描时一次性承担） |
+| 种子集 | 每次现算 | **固定，可复现** |
+
+**分片与失败语义（方案 A：不跳过）**
+- 缓存里的 seed 是**已验证稳定且可解**的；同环境下 `check_stable` 是确定性的，正常情况下不会再抛 `UnStableError`；
+- 消费端**纯索引分配**（`now_seed = cache[episode_offset + succ_seed]`），各分片互不重叠，**没有任何"跳过"**；
+- 若缓存 seed 真的抛 `UnStableError` → 打印 `CACHE STALE` 并 `SystemExit(3)` → 该 unit 失败、coordinator 按既有语义重试；重试仍失败则 `validation.ok=false`。**不静默换题**（跳过会跨分片撞 seed，且会悄悄改变评测口径）；
+- 缓存不足（`offset + test_num > len(seeds)`）显式报错，不 IndexError。
+
+**实测（adjust_bottle / open_microwave 各 50 集，co_locate N=8，官方 step limit，chunk=1）**
+
+| 任务 | 在线（expert_check 每集现场跑） | offline_expert_check | 加速 | 成功率 |
+|---|---|---|---|---|
+| adjust_bottle（400 步） | 260s / 11.55 ep/min | **204s / 14.71 ep/min**（复测 204s，两次一致） | **1.27×** | 98% → 100% |
+| open_microwave（1500 步） | 540s / 5.55 ep/min | **476s / 6.30 ep/min**（复测 **456s / 6.58 ep/min**） | **1.14–1.18×** | 76% → 78% / **82%**（复测） |
+
+> 复测（2026-11-05，简化消费逻辑后）：短 204s / 50-50 / ok=true；长 456s / 41-50（82%）/ ok=true。两次结果与首次一致，说明消费端"纯索引分配 + 异常即失败"的简化没有引入回归。
+
+- 与"直接关 expert_check"的 A/B（§2.44：1.20× / 1.26×）同量级 → 省下的正是专家预跑，无额外失真；
+- 一次性扫描：2 任务 × 50 seed ≈ 18 min（含模型加载）；全量 50 任务评测约 **2 次即可回本**。
+
+**已知限制**
+1. ~~扫描不能分片~~ **已支持（2026-11-05）**：`offline_expert_check_scan_shards: k` 把每个任务的候选 seed 空间按**残差类**切给 k 个 worker（`start+i`、stride=k），各写 `<task>.part<i>.pkl`；顶层 run 结束后自动 merge（去重、排序、截断到 N）。实测 2 任务 × 10 seed × 4 分片：`ok=true`、24/24 占位记录、merge 产出 `adjust_bottle`/`open_microwave` 各 10 个 seed、**0 个 policy server**、WALL 263s。注意**收益随 N 增长**：N 很小时每个分片的进程启动/warmup（~30–60s）会盖过并行收益；N=50 以上才明显（单分片 ~400s → 4 分片 ~200s）。
+2. **环境摘要未落地**：缓存尚未记录 commit/版本/GPU/驱动/资产哈希，也**未在启动时校验**。这是当前最大的正确性缺口（详见 §2.46 的前提），建议下一步补 `env_digest` + fail-loud 校验。
+3. ~~扫描仍会启动 policy server~~ **已修复（2026-11-05）**：不仅顶层 coordinator 不起 server，**unit 子进程也不再起**（`_shard_config` 在无 `external_url` 且处于 scan 模式时设 `server.disabled=true`，`_run_robotwin_once` 据此跳过 `ManagedServer`）。—— 之前只修了顶层，unit 仍会各自加载一份模型（全量 50 任务扫描会直接 OOM）。实测：**0 个 `policy_server*.log`**、GPU 无模型占用。注意 scan 判断只在**顶层 config**（带 `pools`）生效，避免 unit 递归编排。
+
+**k=1 与分片的关系（2026-11-05 统一）**
+
+- **不分片 = k=1 的特例**：planner 只要看到 `offline_expert_check_scan` 就走残差类分支（k 默认 1 → `start+0`、`stride=1`、`part=0`），因此 k=1 也会先写 `<task>.part0.pkl`、再由 merge 生成 `<task>.pkl` —— 与 k>1 **完全同一条代码路径**（此前 k=1 走老分支，`seed_stride = chunk = N`，修好"记录后按 stride 前进"后会变成跳着扫，属于同一处的隐患，已一并消除）。
+- 实测（2 任务 × 10 seed）：**k=1 → ok=true、20/20、WALL 236s**；**k=4 → ok=true、24/24、WALL 263s**。小 N 时 k=1 反而更快（每个分片都要付一次进程启动/warmup）。
+- **同一配置内 seed 不重复**：每个分片固定在各自残差类内前进（`start+i`，步长 k），merge 另有去重兜底。实测 k=4 的 4 个 part 共 12 条 → 去重 12 条、重复 **0**；merge 按排序截断到 N（12 → 10）。
+- **不同 k 之间 seed 集合可能不同（属预期，非 bug）**：每分片配额 `ceil(N/k)`，若某残差类有效 seed 偏多，其第 4 个会被截断，而别的类里数值更大的 seed 反而进入。实测 k=1 vs k=4：10 个里 **9 个相同**（adjust_bottle 差 `100016`/`100011`；open_microwave 差 `100008`/`100012`），`episode_info` 逐条一致。
+- **实践建议**：缓存生成后**固定 k**，不要在两次评测之间改变 k（否则选中的 seed 集合会变、可比性下降）。k 只影响**扫描耗时**与**选中哪 N 个有效 seed**，不影响评测语义（都是专家验证过的场景）。
+
 
 
 ---

@@ -232,29 +232,58 @@ def plan_robotwin(config: Dict[str, Any], total_workers: int) -> List[Shard]:
     # An explicit episode chunk keeps one worker process on the same task (helps
     # amortise RoboTwin's import cost); otherwise spread every task wide.
     chunk_override = int(benchmark.get("episodes_per_chunk") or 0)
-    per_task: List[List[Shard]] = []
-    for task in tasks:
-        chunk = chunk_override if chunk_override > 0 else chunk_size(episodes, total_workers)
-        ranges = list(_ranges(start, episodes, chunk))
-        seed_stride = len(ranges) * chunk
-        per_task.append(
-            [
-                {
-                    "id": f"{task}/{task_config}/seed={seed}-{seed + count - 1}",
-                    "overrides": {
-                        "benchmark": {
-                            "task_name": task,
-                            "task_config": task_config,
-                            "start_seed": seed,
-                            "test_num": count,
-                            "seed_stride": seed_stride,
-                        }
-                    },
-                    "expected": count,
-                }
-                for seed, count in ranges
-            ]
-        )
+    # Offline expert-check scan may be split across workers: each shard walks its
+    # own residue class of the candidate seed space (start+i, stride=k) and writes
+    # a part file; a merge step joins the parts afterwards.
+    scan_shards = int(benchmark.get("offline_expert_check_scan_shards") or 1)
+    # k=1 is the non-sharded case of the same scheme: one shard, stride 1.
+    if benchmark.get("offline_expert_check_scan"):
+        per_task = []
+        for task in tasks:
+            per_shard = -(-episodes // scan_shards)
+            per_task.append(
+                [
+                    {
+                        "id": f"{task}/{task_config}/scan-part{i}",
+                        "overrides": {
+                            "benchmark": {
+                                "task_name": task,
+                                "task_config": task_config,
+                                "start_seed": start + i,
+                                "test_num": per_shard,
+                                "seed_stride": scan_shards,
+                                "offline_expert_check_part": i,
+                            }
+                        },
+                        "expected": per_shard,
+                    }
+                    for i in range(scan_shards)
+                ]
+            )
+    else:
+        per_task = []
+        for task in tasks:
+            chunk = chunk_override if chunk_override > 0 else chunk_size(episodes, total_workers)
+            ranges = list(_ranges(start, episodes, chunk))
+            seed_stride = len(ranges) * chunk
+            per_task.append(
+                [
+                    {
+                        "id": f"{task}/{task_config}/seed={seed}-{seed + count - 1}",
+                        "overrides": {
+                            "benchmark": {
+                                "task_name": task,
+                                "task_config": task_config,
+                                "start_seed": seed,
+                                "test_num": count,
+                                "seed_stride": seed_stride,
+                            }
+                        },
+                        "expected": count,
+                    }
+                    for seed, count in ranges
+                ]
+            )
 
     # Dispatch is a FIFO queue, so the order below decides which tasks a wave
     # runs together. "task" (default) keeps the historical task-major order;

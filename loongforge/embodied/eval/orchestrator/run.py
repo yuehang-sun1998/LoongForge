@@ -225,6 +225,16 @@ def _run_robotwin_once(config: Dict[str, Any], config_path: str = "") -> Dict[st
     if not args.task_name:
         raise ValueError("task name must be set by benchmark.task_name in YAML")
 
+    if bool(server_cfg.get("disabled")):
+        # Offline expert-check scan: the worker never builds a client, so no
+        # policy server (and no model load) is needed at all.
+        returncode = robotwin_runner.run_evaluation(args)
+        result = {"benchmark": "robotwin", "returncode": int(returncode), "output_dir": args.output_dir}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if returncode != 0:
+            raise SystemExit(returncode)
+        return result
+
     server = ManagedServer(_server_args(config, config_path))
     try:
         server.start()
@@ -295,6 +305,13 @@ def main() -> None:
         from loongforge.embodied.eval.orchestrator.coordinator import run as run_coordinated
 
         result = run_coordinated(config, config_path)
+        bench_cfg = config.get("benchmark")
+        if isinstance(bench_cfg, dict) and bench_cfg.get("offline_expert_check_scan"):
+            # Sharded offline expert-check scans leave <task>.part<i>.pkl files;
+            # join them into the <task>.pkl the consume path reads.
+            from loongforge.embodied.eval.orchestrator.runners import robotwin_runner
+
+            robotwin_runner.merge_offline_expert_check_scan(config)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         incomplete = not (result.get("validation") or {}).get("ok", True)
         if incomplete or result.get("servers_given_up"):

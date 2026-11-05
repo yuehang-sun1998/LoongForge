@@ -378,3 +378,32 @@ def test_plan_robotwin_order_modes(tmp_path) -> None:
     }
     with pytest.raises(ValueError):
         plan_robotwin(config, 4)
+
+def test_plan_robotwin_scan_shards_interleave_candidates() -> None:
+    """Sharded scan: k shards per task, residue classes start+i / stride=k."""
+    from loongforge.embodied.eval.orchestrator import planning
+
+    config = {
+        "benchmark": {
+            "name": "robotwin",
+            "task_name": "adjust_bottle",
+            "task_config": "demo_clean",
+            "start_seed": 1000,
+            "episodes_per_task": 10,
+            "offline_expert_check_scan": "/tmp/cache",
+            "offline_expert_check_scan_shards": 4,
+        },
+        "env": {"robotwin_root": "/nonexistent"},
+    }
+    shards = planning.plan_robotwin(config, total_workers=64)
+    assert len(shards) == 4
+    seen = []
+    for i, shard in enumerate(shards):
+        b = shard["overrides"]["benchmark"]
+        assert b["offline_expert_check_part"] == i
+        assert b["start_seed"] == 1000 + i
+        assert b["seed_stride"] == 4
+        assert b["test_num"] == 3          # ceil(10 / 4)
+        assert shard["expected"] == 3
+        seen.append(b["start_seed"])
+    assert seen == [1000, 1001, 1002, 1003]

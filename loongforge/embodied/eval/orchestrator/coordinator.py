@@ -125,13 +125,19 @@ def _shard_config(
     run_cfg.setdefault("max_retries", DEFAULT_MAX_RETRIES)
     server_cfg = shard_cfg.setdefault("server", {})
     server_cfg["external_url"] = external_url
-    # Some runners (e.g. RoboTwin) build their client from server.host/server.port
-    # and ignore external_url, so derive both from the URL the coordinator assigned.
-    parsed = urlparse(external_url)
-    if parsed.hostname:
-        server_cfg["host"] = parsed.hostname
-    if parsed.port:
-        server_cfg["port"] = parsed.port
+    if external_url:
+        # Some runners (e.g. RoboTwin) build their client from server.host/server.port
+        # and ignore external_url, so derive both from the URL the coordinator assigned.
+        parsed = urlparse(external_url)
+        if parsed.hostname:
+            server_cfg["host"] = parsed.hostname
+        if parsed.port:
+            server_cfg["port"] = parsed.port
+    # external_url=None means "no policy server" (offline expert-check scan):
+    # the worker never builds a client, so host/port stay untouched -- and the
+    # unit must not start one either (a scan needs no model at all).
+    if not external_url and (shard_cfg.get("benchmark") or {}).get("offline_expert_check_scan"):
+        server_cfg["disabled"] = True
     return shard_cfg
 
 
@@ -575,9 +581,16 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
     base_args = apply_config(build_server_argparser().parse_args([]), config)
     base_args.config = config_path
 
+    # Offline expert-check scan needs no policy at all: skip starting servers
+    # (saves the model load of G servers and leaves the GPUs to the sims).
+    # Only the TOP-LEVEL config (which carries pools) runs serverless; a unit
+    # subprocess inherits the scan key but must still take the normal unit path.
+    scan_mode = bool(
+        (config.get("benchmark") or {}).get("offline_expert_check_scan")
+    ) and bool(config.get("pools"))
     port_base = int(os.environ.get("LOONGFORGE_COORD_PORT_BASE", str(DEFAULT_PORT_BASE)))
     servers = []
-    for index, gpu in enumerate(server_gpus):
+    for index, gpu in ([] if scan_mode else enumerate(server_gpus)):
         port = port_base + PORT_STRIDE * index
         health_port = port + 1
         server_log = str(output_dir / f"policy_server_{index}.log")
@@ -599,7 +612,11 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         server_args.server_log = server_log
         servers.append((start_server(server_args, _server_env(index, gpu)), server_args))
     urls = [f"ws://{args.host}:{args.port}" for _, args in servers]
-    slots = _build_slots(server_gpus, n_per_server, sim_gpus, placement, urls)
+    if scan_mode:
+        # One (no-server) slot per sim slot, pinned to the sim GPU.
+        slots = [(None, gpu) for gpu in sim_gpus for _ in range(n_per_server)]
+    else:
+        slots = _build_slots(server_gpus, n_per_server, sim_gpus, placement, urls)
 
     unit_timeout = _unit_timeout_sec(config, plan)
     all_shards: List[Shard] = list(plan)
@@ -619,8 +636,9 @@ def run(config: Dict[str, Any], config_path: str = "") -> Dict[str, Any]:
         for proc, args in servers:
             wait_healthz(f"http://{args.host}:{args.health_port}/healthz", args.server_start_timeout_sec, proc)
         started = time.time()  # worker wall only (exclude model load)
-        watchdog.start()
-        watchdog_started = True
+        if servers:
+            watchdog.start()
+            watchdog_started = True
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
