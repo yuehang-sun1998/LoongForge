@@ -407,3 +407,28 @@ def test_plan_robotwin_scan_shards_interleave_candidates() -> None:
         assert shard["expected"] == 3
         seen.append(b["start_seed"])
     assert seen == [1000, 1001, 1002, 1003]
+
+
+def test_plan_robotwin_consume_uses_cache_index_offset() -> None:
+    """Consume mode indexes the cache; a leftover start_seed must not shift it."""
+    from loongforge.embodied.eval.orchestrator import planning
+
+    config = {
+        "benchmark": {
+            "name": "robotwin",
+            "task_name": "adjust_bottle",
+            "task_config": "demo_clean",
+            "start_seed": 100000,          # a seed value; irrelevant for consume mode
+            "episodes_per_task": 8,
+            "episodes_per_chunk": 2,
+            "offline_expert_check": "/tmp/cache",
+        },
+        "env": {"robotwin_root": "/nonexistent"},
+    }
+    shards = planning.plan_robotwin(config, total_workers=4)
+    offsets = []
+    for shard in shards:
+        b = shard["overrides"]["benchmark"]
+        assert b["test_num"] == 2
+        offsets.append(b["offline_expert_check_offset"])
+    assert offsets == [0, 2, 4, 6]

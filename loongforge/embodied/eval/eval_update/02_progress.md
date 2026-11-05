@@ -1144,6 +1144,13 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
 | `benchmark.offline_expert_check_scan: <dir>` | 只跑官方专家分支（`setup_demo` + `play_once` + 官方录取判定），把每个合格 `(seed, episode_info["info"])` 写入 `<dir>/<task>.pkl`；**不跑策略**（跳过 `get_model`），且**不启动 policy server**（`server.disabled`） |
 | `benchmark.offline_expert_check_scan_shards: <k>` | 扫描分片数（默认 1）。k>1 时每个任务切成 k 个**残差类**（`start+i`、`seed_stride=k`、每个收 `ceil(N/k)` 个），各写 `<task>.part<i>.pkl`；顶层 run 结束后自动 **merge**（去重、升序、截断到 N）生成 `<task>.pkl` |
 | `benchmark.offline_expert_check: <dir>` | 消费 `<dir>/<task>.pkl`：`expert_check=False`，按**索引**取 seed 与 `episode_info`，每个 seed 只做 **1 次 `setup_demo` + 策略 rollout** |
+| `benchmark.offline_expert_check_offset: <i>` | 消费模式下该 unit 的**缓存起始下标**。由 planner 自动写入（`0, c, 2c, …`），**不要手填**。`start_seed` 始终只表示 seed 值，消费模式下不参与索引（2026-11-05 拆分，见下） |
+
+**`start_seed` 的两套语义已拆开（2026-11-05）**
+
+- 旧实现里消费模式把 `start_seed` 当**缓存下标**用（`_S_OFFSET = start_seed`），与它在在线模式里"seed 值"的语义冲突。实测踩坑：配置写 `start_seed: 100000` → 第 15 个 unit 去取 `cache[100014]`，立即 `cache exhausted`。
+- 现在 planner 在消费模式下把 range 起点固定为 0，并在每个 unit 的 override 里写 `offline_expert_check_offset`（0, c, 2c…）；runner 优先用它，只有缺这个 key 的旧 plan 才回退到 `start_seed`。
+- 因此消费模式下 `start_seed` 可以继续写真实 seed（如 100000），**不会再影响索引**。单测：`test_plan_robotwin_consume_uses_cache_index_offset`、`test_worker_script_offline_expert_check_modes`。
 
 **与在线流程的差别**（每个合格 seed）
 
@@ -1185,7 +1192,125 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
 - **不同 k 之间 seed 集合可能不同（属预期，非 bug）**：每分片配额 `ceil(N/k)`，若某残差类有效 seed 偏多，其第 4 个会被截断，而别的类里数值更大的 seed 反而进入。实测 k=1 vs k=4：10 个里 **9 个相同**（adjust_bottle 差 `100016`/`100011`；open_microwave 差 `100008`/`100012`），`episode_info` 逐条一致。
 - **实践建议**：缓存生成后**固定 k**，不要在两次评测之间改变 k（否则选中的 seed 集合会变、可比性下降）。k 只影响**扫描耗时**与**选中哪 N 个有效 seed**，不影响评测语义（都是专家验证过的场景）。
 
+### 2.48 `episodes_per_chunk` 的取值公式 + N 试跑口径（2026-11-05）
 
+**问题**：`episodes_per_chunk`（下称 `c`）此前只有经验值（单任务 50 集用 1、全量 50 任务×5 集用 3），没有可复用的判据。
+
+**模型**：设 `S = G × N`（并发 slot 数）、`E` 总集数、`A` 每个 worker 进程的一次性成本（torch/SAPIEN import + 首次 env 初始化，实测 ~100–130 s，§2.45）、`t̄` 单集耗时。import 按**波**付、不按集付：
+
+```
+T(c) ≈ (U / S) × (A + c × t̄) = (E / S) × (A / c) + (E / S) × t̄
+U = ceil(E / c)，且取 U ≥ S
+```
+
+> 用**流体比** `U / S` 而不是 `ceil(U / S)`：最后一个不满的波里，空闲 slot 会在别的 unit 结束时立即接下一个，实际 makespan 接近平均值，ceil 会系统性高估（bsp10 场景下两者差 1.48×）。
+
+**取最优**：`c* = max(1, floor(E / S))` —— 让 unit 数 ≈ slot 数，一波跑完、`A` 只付一次且没有空闲 slot。`c` 再大 → `U < S`，有 slot 闲置；`c` 再小 → 多波，每波重复付 `A`。
+
+**数据点核对**
+
+| 场景 | E | S | 公式 `c*` | 实际采用 | 备注 |
+|---|---|---|---|---|---|
+| 全量 50 任务 × 5 集 | 250 | 64 | 3（3.9 → 3/4 等价） | **3** | §2.39 全量验证 |
+| 单任务 × 50 集 @ N=8 | 50 | 64 | 1（E/S < 1） | **1** | §2.44 / §2.47 |
+| bsp10 A/B（c=1 vs c=3） | 211 | 70 | 3 | 1 vs 3 | 流体比预测 `3.01(A+t̄) / 1.01(A+3t̄) = 1.24`，**实测 1.25×**（6.58 → 8.21 ep/min） |
+
+第三个点是唯一有 A/B 对照的：模型在「多波 → 少波」区间量得准。（注意必须用流体比；用 ceil 会得到 0.84，方向都反了。）
+
+**三个修正**
+
+1. **异质任务留余量**：`c = floor(E / (2S))`，让 `U ≥ 2S`，LPT 才有回填空间；同构单任务不需要。
+2. **repair 粒度**：`c` 越大，一个 unit 失败重跑的成本越高（250 集全量：separate launched 127 vs co_locate 118）。
+3. **整除**：`c` 最后取成能整除 `episodes_per_task` 的值，避免多出一个短 unit（无害，但会让 `U` 比预期多 1）。
+
+> 推论：全量 50×5 场景 `c=4` 值得试（`U=63 ≤ 64`，理论上比 3 少半波），本次不动。
+
+**应用：N 试跑口径（Arm A 收尾后执行）**
+
+已定项**不再重扫**：`placement=co_locate`（§2.39，250 集终局对比 1502 s vs separate 1519/1986 s）、batching 关、`episodes_per_chunk` 按上式、`plan_order=lpt`、`sim_cpu_threads=1`、`chunk_execute_steps=30` + `skip_intra_chunk_obs`、fp32、`offline_expert_check` 开。**唯一变量：`N ∈ {6, 8, 10}`**。
+
+- 去掉 N=2/4：历史 cl4 → cl6 → cl8 吞吐 12.8 → 14.8 → 16.2 ep/min **仍在上升**，膝点只可能在 8 之上；真正要回答的是「N=8 是否已过膝点」
+- 口径：`E = 16N`（96 / 128 / 160 集），`c = floor(E / S) = 2` → `U = S`，一波跑完
+- **丢弃每个 slot 的第 1 集**（含首次 init，§2.45 首个进程 28.7 s）；用第 2 集的 `episode_time_sec` 求 `t̄_ep`，吞吐 ≈ `N / t̄_ep`（每卡）
+- **不要用 wall 算 ep/min**：2 集/slot 时 wall ≈ 最慢那个 slot，方差大；wall 只做交叉校验
+- N=10 资源（**2026-11-05 实测**）：峰值 **~58–60 GB/卡**（server 9.7 GB + 10 × ~4.8 GB/sim，`adjust_bottle`）。原估 69 GB 偏保守 ~15%：server 按 14 GB（旧口径含 fp32 瞬态副本，实际常驻 9.7 GB）、sim 按 5.5 GB（`blocks_ranking_rgb` 这类更重场景的边际）。80 GB 余 ~20 GB，**N=12 显存也够**（~67 GB），真正的墙会先到 CPU（每 sim 仅 1.6 个逻辑核，16 逻辑核/卡）
+- 成本：3 点 ≈ **27–30 min**（每点加载 ~290 s + 运行 3–5 min）；常驻复用见 T2-8（可降到 ~18 min），本轮先不动
+- 判定：N=10 与 N=8 差异 <5% → 膝点在 8，维持 N=8；N=10 明显更优 → 再用长任务抽验一次（短任务对 CPU 争用不敏感，可能高估 N 的收益）
+
+**N 扫描的两种口径（2026-11-05 实测，adjust_bottle）**
+
+用 worker `trace.json` 里每步的绝对时间戳拆「启动」与「rollout」：`rollout` = 最后一个 episode 首末步的时间差；`startup` = 最后 episode 首步时间 − unit 起点 − 该 rollout（含进程 import、SAPIEN/首次 env 初始化，以及前一个完整 episode）。
+
+| N | unit 墙钟（c=2） | 启动 | rollout / 集 | 含启动（每卡） | **去启动（每卡）** |
+|---|---|---|---|---|---|
+| 6 | 204.5 s | 167 s（±15） | 17.0 s（±3.2） | 3.52 ep/min | **21.1 ep/min** |
+| 8 | 266.6 s | 221 s（±21） | 20.8 s（±6.4） | 3.60 ep/min | **23.1 ep/min** |
+| 10 | 323.8 s | 275 s | 22.0 s | 3.71 ep/min | **27.3 ep/min** |
+| 12 | — | — | — | — | **取消**（环境移交，2026-11-05 20:30） |
+
+**配对比较（同一批 48 个 seed，按均值比而非逐 seed 比值）**
+
+| 对比 | rollout 均值比 | 稳态吞吐增益 |
+|---|---|---|
+| N=6 → 8 | 17.0 / 20.6 = 0.825 | **+10.0%** |
+| N=8 → 10 | 20.6 / 22.1 = 0.932 | **+16.5%** |
+| N=6 → 10 | 17.0 / 22.1 = 0.769 | **+28.2%** |
+
+- 校验：`startup + 2 × rollout` 与实测 unit 墙钟一致（N=6：201 vs 204.5；N=8：263 vs 266.6）
+- **两种口径结论不同**：含启动 N=6→8 只有 +2.3%、6→10 +5.4%；去掉启动后 6→10 **+20%**。原因是 c=2 的 unit 里启动占 80–85%，把 N 的差异稀释了
+- **膝点**：稳态口径下到 N=10 **仍未饱和**（6→8 +10%、8→10 +16.5%、6→10 +28%）；含启动口径下 N=8→10 只快 3%
+- **口径怎么选**：单任务 50 集这种「slot 数 ≥ 集数」的场景，启动无法避免（一波跑完，每个 unit 只付一次），按**含启动**口径；全量 50 任务 × 50 集（每个 slot 连续跑几十集）启动被摊薄，按**去启动**口径
+- 去启动口径**略偏乐观**：rollout 只算 episode 内的步进，不含每集 `setup_demo`（§2.45 实测后续集 ~1.06 s，量级 ~5%）
+- **推荐**：单任务评测维持 N=8（20 卡时无收益且多占 slot）；全量多任务可考虑 N=10（显存 ~60 GB 仍有余量），N=12 需要另测（CPU 1.33 核/sim 是下一道墙）
+- 推论：当前 `episodes_per_chunk=2` 的扫描本质上是「启动争用」曲线；要单独测稳态吞吐，需要让每个 unit 跑更多集（$c \ge 10$），见 T2-8 阶段 2 的 worker 常驻方案
+
+**Arm B 预期（修正）**：含 8-server 加载（~290 s），短任务 ~494 s（worker 204 s + 加载）、长任务 ~746 s（456 s + 加载）。§2.44 / §2.47 的 **1.27× / 1.18× 是同一份加速代码上 offline vs online 的比，不是对 Arm A（944c5ca）的比**；对 Arm A 的倍数必须等 Arm A 长任务收尾后按同口径计算，**不能用 1.18× 外推**。
+
+### 2.49 Arm A / Arm B 端到端对照：进度与预期（2026-11-05）
+
+**口径**：8 × A800，co_locate N=8，官方 per-task step limit，`adjust_bottle` / `open_microwave` 各 50 集，seed 100000 起，专家检查开（Arm B 走 offline cache）。Arm A = `944c5ca`（8 个独立进程 × 6–7 集，每卡 1 server）；Arm B = `7157bbe`（coordinator + chunk 执行）。
+
+| 臂 | 任务 | 状态 | 墙钟 | 每卡吞吐 | 成功率 | 相对 Arm A |
+|---|---|---|---|---|---|---|
+| A | adjust_bottle（短） | ✅ 完成 | **1040 s** | 2.88 ep/min | 48/50 = 96% | 1.00 |
+| A | open_microwave（长） | ✅ 完成 | **4984 s** | 0.60 ep/min | 32/50 = 64% | 1.00 |
+| B | adjust_bottle（短） | ⬜ 待跑 | 预期 ~494 s | ~6.07 ep/min | 100%（§2.47） | **~2.1×** |
+| B | open_microwave（长） | ⬜ 待跑 | 预期 ~746 s | ~4.02 ep/min | 82%（§2.47） | **~6.7×** |
+
+- Arm A 实测细节：长任务 50 集、mean episode 498.9 s（median 472.6、max 671.6），最慢 worker 累计 4701 s + 加载/init 283 s = 4984 s；短任务 mean episode ~87 s，最慢 worker 699 s + 341 s。
+- Arm B 两行是**投影值**（§2.44 / §2.47 实测 worker 阶段 + §2.44 的 8-server 加载 ~290 s），尚未用 `vanB_*.json` 实跑；实跑后回填。
+- 长短任务倍数差这么多不是异常：Arm B 每个 episode 只推理/渲染 50 次（chunk=30 + 边界渲染），而 Arm A 逐步渲染；episode 越长，省下的步数越多。
+- 两任务合计（等权）：`(1040 + 4984) / (494 + 746) ≈ 4.9×`。
+- ⚠️ **成功率有差异**：长任务 Arm A 64%（32/50）vs Arm B 82%（41/50），短任务 96% vs 100%。长任务差 9 集约 1.8σ（n=50，二项 SE ≈ 6.7%），暂不下结论；但 chunk 执行是否影响 open_microwave 这类多阶段任务，需要在 Arm B 实跑后用同一 seed 集逐集比对（不能只看总成功率）。
+- **不要用 §2.44 的 1.20–1.26× 或 §2.47 的 1.14–1.27× 对外表述**——那两个都是加速分支内部的单变量对照。
+
+**后续 ETA（从 19:02 起算，Arm A 已全部完成）**
+
+| 阶段 | 预计耗时 | 完成时刻 |
+|---|---|---|
+| N 扫描（N=6/8/10，`E=16N`、`c=2`） | 27–30 min | ~19:32 |
+| Arm B 短任务（50 集） | 8–10 min | ~19:42 |
+| Arm B 长任务（50 集） | 13–15 min | ~19:57 |
+| 汇总 + 回填本表 + 老板文档 | ~20 min | **~20:15** |
+
+### 2.50 环境移交快照（2026-11-05 20:30）
+
+**已完成**
+- `offline_expert_check` 消费模式的 `start_seed` 双语义拆分（新增 `benchmark.offline_expert_check_offset`，planner 自动写入；旧 plan 回退兼容）；单测 86 passed
+- N 扫描 N=6/8/10（8 卡、`E=16N`、`c=2`、adjust_bottle、seed 100000 起）：unit 墙钟 204.5 / 266.6 / 323.8 s，去启动稳态 21.1 / 23.1 / 27.3 ep/min/卡，成功率 95/96、124/128、159/160
+- 两种口径已写入 §2.48（含启动 vs 去启动），并注明全量场景应看去启动口径
+- 显存实测：N=10 峰值 ~58–60 GB（server 9.7 GB + ~4.8 GB/sim），N=12 显存可行（~67 GB）
+
+**未完成 / 下次接手**
+1. **N=12**：已取消（环境移交）。前置的 192-seed 扫描跑了约 5 min 后被中止，`/tmp/oec192` 不完整，需要重扫；配置已备好 `/tmp/vanN_scan192.json` + `/tmp/vanN12.json`
+2. **Arm B（`7157bbe`）短/长任务 50 集**：未跑。配置 `/tmp/vanB_short.json`、`/tmp/vanB_long.json` 已就绪，缓存 `/tmp/oec50`
+3. Arm A 已完成并落数：短 1040 s / 48-50，长 4984 s / 32-50（§2.49）。**最终 A/B 倍数尚未产出**——已有的只是投影（短 ~2.1×、长 ~6.7×），不能对外当实测定稿
+4. 长任务成功率差异（Arm A 64% vs §2.47 的 82%）尚未逐集核对
+
+**环境状态（移交时）**
+- 所有评测进程已停止，8 张卡 `nvidia-smi` 均为 0 MiB / 0%，无残留 server/worker
+- 分支 `feat/eval-orchestration-parallel`（`7157bbe` + 本次提交），未 push
+- 本次改动只涉及 5 个文件：`planning.py`、`robotwin_runner.py`、两个单测、本文件
 
 ---
 
@@ -1300,6 +1425,32 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
 - **未做**：coordinator 尚未自动生成快照（需先跑 CLI）。
 - **验证**：`03_testing.md` T-17（串行 vs 分片逐集首帧哈希、错集反证、retry/resume）。
 
+### T2-8 标定/试跑的 server 常驻复用【⬜ 待做】
+
+- **问题**：`calibrate.py` 的 GPU sweep 是**串行**的，每个 N 点自己起停一次 8-server 池 → 模型加载 ~290 s/点。N=6/8/10 三点里近 15 min 花在重复加载上，占整轮标定的一半。
+- **目标**：一次起 8 个 server，多个 N 点的 coordinator 依次复用（走 `external_url`），点间只重启 coordinator。
+- **改动**：
+  - `calibrate.py::_run_gpu_sweep` 增加 `--reuse-servers`：先起一池 server（每卡一个），`_point_config` 写 `external_url` 而不是 `servers`，跑完只停 coordinator；
+  - 顶层 pool 支持 external urls（unit 侧 `_shard_config(external_url=...)` 已支持，顶层 `coordinator()` 需同样接收）；
+  - 端口/健康检查/收尾清理在 sweep 层统一管理。
+- **验收**：同一配置跑 N=6/8/10，成功率与吞吐与逐点起停一致（差异在噪声内）；总 wall 从 ~30 min 降到 ~18 min；无残留 server 进程、端口不冲突。
+- **风险**：模型侧若有 per-client 状态（`loongforge_policy.py`），复用会串味，需先确认无状态；显存不随 N 变化（server 固定，slot 数是 coordinator 侧配置），风险可控。
+
+**阶段 2（同一任务的另一半）：sim worker 常驻 + 动态扩容【⬜ 待做，暂缓实现】**
+
+> 2026-11-05：方案已记录，用户决定**暂不实现**，等阶段 1 落地并验证后再评估。
+
+- **动机**：当前是「一个 unit 一个进程」，每个点 8N 个进程全部重新 import（~100 s）+ 首次 env init（~30 s）。N 从 6 → 8 时，前 6 个/卡的 sim 其实完全可以不销毁，只补 2 个。
+- **目标**：一个常驻 worker 进程池，unit 通过控制通道下发；N 变化时只 **扩容/缩容**（6/卡 → 8/卡 = 每卡新增 2 个，旧的不动）。
+- **改动**（比 server 常驻大得多，是调度路径改动）：
+  - runner 侧新增 worker daemon：一次 import + 一次 `Env` 创建，循环接收 `(task, seeds, episode_info)` 并调用现有 eval 逻辑；unit 之间做 env 状态复位（RoboTwin 本身支持一进程多集，基线就是 8 进程 × 6–7 集）
+  - coordinator 侧：pool 从「每 unit 起进程」改为「常驻 + 派发」，支持运行时 `scale(n)`；超时、hung、失败重试、崩溃重启语义要重新定义
+  - 观测：每 worker 的 episode 计数、内存增长（SAPIEN/cuRobo 跨集是否有泄漏）、单 worker 最长连续集数（需要回收阈值）
+- **收益**：每点省一次 import/init（wall 上约 100–130 s，三点约 5–6 min；叠加 server 常驻后整轮标定 ~10 min）；更重要的是消除「冷启动争用」——N=10 时 80 个进程同时 import 会放大高 N 的劣势，常驻后曲线更接近稳态
+- **风险**：① 跨集状态泄漏/显存增长，需要回收阈值与长跑验证；② 改变了测量口径（冷启动从每点付一次变成只付一次），历史 N 数据不能直接对比；③ 与「一 unit 一进程」的失败隔离相比，常驻进程崩一次会影响后续 unit，需要重启+重派逻辑
+- **验收**：同一配置下常驻池与逐 unit 起进程的 success/steps 逐集一致；N=6→8→10 原地扩容无残留、无 OOM；worker 连续跑 ≥50 集后内存增长在阈值内
+- **建议顺序**：先做 T2-8 阶段 1（server 常驻，改动小、收益确定），阶段 2 单独一个 PR，只在标定路径启用，生产评测保持「一 unit 一进程」的隔离语义。
+
 ### T3-1 server 侧 batcher 【阶段 3，暂缓】
 
 - **前置**：阶段 1/2 完成 + FastWAM 补 batch 契约（`modeling_fastwam.py:349`、`mot/fastwam.py::infer_action` 4 处）+ 批内噪声语义定义。
@@ -1407,5 +1558,5 @@ lpt        first wave: B A B A B A B A      # 慢任务全部第一波开始
 4. **N=48/80 补点**（可选）：确认膝点；N=80 需盯 CPU/内存。
 5. **`per_episode` 逐集参照**：用旧分支小网格自建，回答 rebase 是否改变 per_episode 行为（M2 原始记录未找到）。
 6. **GPU-sim / CALVIN**：环境具备后再补标定与评测。
-7. **GPU-sim 新 cadence 标定**：`skip_intra_chunk_obs` 下重扫 N（1/2/4/8）→ 重做 batching A/B → 成功率验证。
+7. **GPU-sim 新 cadence 标定**：`skip_intra_chunk_obs` 下重扫 N（**6/8/10**）→ 重做 batching A/B → 成功率验证。口径见 §2.48（`c=2`、每 slot 2 集丢第 1 集、`E=16N`）；placement 与 batching 已由 §2.39 定案，不再重扫。server 常驻复用见 T2-8。
 8. **RoboTwin 新入口迁移**（§2.33）：`fix/skip-intra-chunk-render` × XPolicyLab adapter（方案 B：adapter 做 ws 客户端）；先 1 GPU/1 sim/1 集 spike，再上 8 卡。

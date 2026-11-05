@@ -648,7 +648,7 @@ def test_worker_script_offline_expert_check_modes(tmp_path: pathlib.Path) -> Non
     (robotwin / "script" / "eval_policy.py").write_text(source, encoding="utf-8")
 
     def gen(**kw) -> str:
-        args = argparse.Namespace(
+        fields = dict(
             worker_local_files=True,
             robotwin_path=str(robotwin),
             output_dir=str(tmp_path / f"out_{abs(hash(str(kw)))}"),
@@ -662,8 +662,9 @@ def test_worker_script_offline_expert_check_modes(tmp_path: pathlib.Path) -> Non
             skip_intra_chunk_obs=False,
             settle_early_stop=False,
             task_name="adjust_bottle",
-            **kw,
         )
+        fields.update(kw)
+        args = argparse.Namespace(**fields)
         return robotwin_runner._worker_eval_script(args).read_text(encoding="utf-8")
 
     scan = gen(offline_expert_check_scan=str(tmp_path / "cache"))
@@ -679,6 +680,16 @@ def test_worker_script_offline_expert_check_modes(tmp_path: pathlib.Path) -> Non
     assert "_idx = _S_OFFSET + succ_seed" in consume
     assert "cache exhausted" in consume
     assert "CACHE STALE" in consume
+
+    # Consume mode uses the explicit cache index, not start_seed (which stays a
+    # seed value); a leftover start_seed=100000 must not shift the index.
+    consume_offset = gen(
+        offline_expert_check=str(tmp_path / "cache"),
+        start_seed_override=100000,
+        offline_expert_check_offset=4,
+    )
+    assert "    _S_OFFSET = 4\n" in consume_offset
+    assert "_S_OFFSET = 100000" not in consume_offset
 
     plain = gen()
     assert "_S_SCAN_DIR" not in plain and "_S_CACHE_PATH" not in plain

@@ -228,7 +228,14 @@ def plan_robotwin(config: Dict[str, Any], total_workers: int) -> List[Shard]:
         raise ValueError("robotwin planning needs benchmark.task_name or benchmark.tasks")
     task_config = str(benchmark.get("task_config") or "demo_clean")
     episodes = int(benchmark.get("episodes_per_task") or benchmark.get("test_num") or 1)
-    start = int(benchmark.get("episode_offset") or benchmark.get("start_seed") or 0)
+    # Consume mode takes its seeds from the cache, so start_seed (a seed value) no
+    # longer applies; shard ranges must start at cache index 0 instead of at
+    # whatever seed the caller configured.
+    consume_cache = bool(benchmark.get("offline_expert_check"))
+    start = int(
+        benchmark.get("episode_offset")
+        or (0 if consume_cache else benchmark.get("start_seed") or 0)
+    )
     # An explicit episode chunk keeps one worker process on the same task (helps
     # amortise RoboTwin's import cost); otherwise spread every task wide.
     chunk_override = int(benchmark.get("episodes_per_chunk") or 0)
@@ -277,6 +284,13 @@ def plan_robotwin(config: Dict[str, Any], total_workers: int) -> List[Shard]:
                                 "start_seed": seed,
                                 "test_num": count,
                                 "seed_stride": seed_stride,
+                                # Explicit cache index for consume mode; keeps
+                                # start_seed meaning a seed value everywhere.
+                                **(
+                                    {"offline_expert_check_offset": seed}
+                                    if consume_cache
+                                    else {}
+                                ),
                             }
                         },
                         "expected": count,

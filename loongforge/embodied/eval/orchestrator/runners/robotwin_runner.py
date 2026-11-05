@@ -338,7 +338,15 @@ def _worker_eval_script(args: argparse.Namespace) -> Optional[pathlib.Path]:
     if scan_dir or cache_dir:
         _task = str(getattr(args, "task_name", "task"))
         cache_path = str(pathlib.Path(str(cache_dir)) / f"{_task}.pkl") if cache_dir else None
-        offset = int(getattr(args, "start_seed_override", 0) or 0)
+        # Consume mode indexes the cache; that index is *not* a seed. Use the explicit
+        # offset the planner puts on each unit, and only fall back to start_seed for
+        # configs/plans produced before the key existed.
+        _raw_offset = getattr(args, "offline_expert_check_offset", None)
+        offset = (
+            int(_raw_offset)
+            if _raw_offset is not None
+            else int(getattr(args, "start_seed_override", 0) or 0)
+        )
         _raw_part = getattr(args, "offline_expert_check_part", None)
         _part_index = -1 if _raw_part is None else int(_raw_part)
         _scan_stride = int(getattr(args, "seed_stride", 1) or 1)
@@ -650,6 +658,7 @@ def _apply_config(args: argparse.Namespace, config: Dict[str, object]) -> argpar
         (benchmark, "time_setup", "time_setup"),
         (benchmark, "sim_cpu_threads", "sim_cpu_threads"),
         (benchmark, "offline_expert_check", "offline_expert_check"),
+        (benchmark, "offline_expert_check_offset", "offline_expert_check_offset"),
         (benchmark, "offline_expert_check_scan", "offline_expert_check_scan"),
         (benchmark, "offline_expert_check_part", "offline_expert_check_part"),
         (server, "chunk_execute_steps", "chunk_execute_steps"),
