@@ -149,6 +149,21 @@
   - 采集：`N{n}/out/coordinator_result.json`、`N{n}/timing.json.server*`（每 server 一份，按请求数加权聚合）、`N{n}/gpu_peak.json`（每卡显存峰值）。
   - 产物：`calibration_report/{report.json,report.md,env.json,cache.json}`；fallback N 写入 `pools.gpu_sim`，并带 `placement`。
   - 状态：入口与单测已完成，正式 N 扫描待跑。
+- **GPU-sim N 扫描（RoboTwin，2026-11-05/06，✅ 已完成）**：
+  - 口径：8 × A800、co_locate、`adjust_bottle`、官方 400 步、`offline_expert_check`、`E = 16N`、`c = 2`（每个 unit 2 集，一波跑完）
+  - 每点 unit 墙钟用 `trace.json` 的每步绝对时间戳拆成「启动」和「rollout」，两种口径都给：
+
+    | N | unit 墙钟 | 启动 | rollout/集 | 含启动（每卡） | 去启动（每卡） | 峰值显存 | 成功率 |
+    |---|---|---|---|---|---|---|---|
+    | 6 | 204.5 s | 167 s | 17.0 s | 3.52 ep/min | 21.1 ep/min | — | 95/96 |
+    | 8 | 266.6 s | 221 s | 20.8 s | 3.60 ep/min | 23.1 ep/min | — | 124/128 |
+    | 10 | 323.8 s | 275 s | 22.0 s | 3.71 ep/min | 27.3 ep/min | ~58–60 GB | 159/160 |
+    | 12 | 389.0 s | 341 s | 21.9 s | 3.70 ep/min | 32.9 ep/min | **74.7 GB** | 187/192 |
+
+  - 配对（同一批 seed 的均值比）：6→8 **+10.0%**、8→10 **+16.5%**、10→12 **+21.5%**（36 个共同 seed）
+  - **结论**：稳态吞吐到 **N=12 仍未出现平台**；但显存先到墙——N=12 峰值 74.7 GB（余 ~5 GB），按 ~5.4 GB/sim 外推 N=14/16 需 ~85/95 GB，**80 GB 卡的上限是 N=12**
+  - **口径提醒**：`c=2` 时启动占 unit 墙钟的 80–85%，含启动口径几乎不随 N 变化（+5%）；只有「每个 slot 连续跑很多集」的全量场景才应看去启动口径
+  - 详见 `02_progress.md` §2.48
 
 ### T-03 · 一行命令起 1+N（external server + 最小 coordinator）
 
@@ -211,6 +226,14 @@
 > - **长尾被吃掉**：libero_10 的 500 集在基线里 2 卡拖 91 min，M2 里用满 8 卡、在 56 min 总盘子内跑完（后 6 卡不再空转）。
 > - **分数对齐**：逐集比对，2000 集中仅 **16 集**不同，全在 `libero_object/task=6/episode=16..31`，且基线里**全由同一 worker 连续产出**、`failure_reason=episode_error`/`ConnectionClosedError`（websocket keepalive 超时、`steps=0`、**根本没跑**）。**剔除这 16 个 spurious 失败后两边一致（96.42% vs 96.45%）→ 模型行为逐集相同**。
 > - ⚠️ **retry 缺口（已修）**：`episode_error` 本就在 episode 级重试集合里（`libero_runner.py:505`），但 `--max-retries` **默认 0** → 基线没设就把它记成失败。已在 `coordinator._shard_config` 默认注入 `run.max_retries=2`（显式值优先）。
+
+> **RoboTwin 全量口径（2026-11-06，✅ 通过）**：5 任务 × 100 集 = 500 集，8 卡 co_locate **N=12**（96 slot）、`c=5`（100 unit，约 1.04 波）、官方 step limit、`offline_expert_check` 开。
+> - **总 wall = 1956 s（32.6 min）**，其中加载 309 s、worker 阶段 **1647 s**；`validation.ok=true`、`infra_failed=0`、**0 轮补跑、无 OOM**；成功率 **403/500 = 80.6%**。
+> - 吞吐：**18.2 集/min 聚合 ≈ 2.28 集/min/卡**（含加载 15.3 集/min）；显存峰值 **~60.7 GB/卡**。
+> - 每任务（unit 墙钟 / rollout / 成功率）：`adjust_bottle` 616.7 s / 34.1 s / 98-100；`grab_roller` 501.8 s / 23.8 s / 100-100；`open_microwave` 1067.2 s / 135.9 s / 91-100；`blocks_ranking_rgb` 1210.4 s / 120.7 s / 61-100；`stack_bowls_three` 1274.1 s / 136.0 s / 53-100。
+> - **vs 加速前（`944c5ca`，外推 ~21,000 s）≈ 10.7×**；**含 offline 扫描（+~750 s）≈ 7.8×**；缓存按 k 次评测摊销，k=10 时 ≈ 10.5×。
+> - 倍数分解：并发 ×12（96 vs 8 slot）× 单集效率 ~3.3 ≈ 39×，实际 ~11× —— 差额损失在启动（341 s/unit × 100）和长任务尾部（后半段 60 个长 unit 只占 96 slot 中的 60 个）。
+> - 详见 `02_progress.md` §2.51（含 baseline 为外推值的说明，±30%）。
 
 ### T-09 · 运行后覆盖校验 + 自动补跑
 
@@ -547,6 +570,15 @@
   - seed 稳定性重复实验：`100003` 连续 3 次 unstable（同一物体），`100001` 两次 stable → **同机可复现**。
   - 限制：2026-10-29 起 8 卡被他人训练任务占用 44–54GB/卡，N≥2 需等卡。
 - **结论**：🔄 显存基线与 8 卡放置验证完成；同卡 vs 异卡的 `t_infer` / wall-clock 对比待跑。
+
+- **数据（2026-11-03，co_locate vs separate 端到端终局对比，✅ 已定案）**：
+  - 口径：RoboTwin，50 clean 任务 × 5 集 = 250 集，官方 step limit，`plan_order=lpt`、`episodes_per_chunk=3`，8 × A800
+  - **co_locate N=8**：64 sim，1502 s，9.99 ep/min，150/250 = 60.0%，1 轮补跑，~57 GB/卡
+  - **separate 70 sim + batched server(200 ms)**：1519 s（复跑 1986 s），9.88 / 7.55 ep/min，152/250 = 60.8%，~56 GB（sim 卡）/ 14 GB（server 卡）
+  - 密度扫描（同口径）：cl4 12.8 / cl6 14.8 / cl8 16.2 ep/min；同密度（8/卡）下 separate 单卡只快 4%（2.11 vs 2.03 ep/min），但少一张 sim 卡 → 总量更低
+  - **结论**：✅ **推荐 co_locate**——端到端同速甚至更快、方差更小（separate 两轮 wall 差 31%）、运维最简单。separate 的单集优势（230 s vs 302 s，-24%）被 batched-server 瓶颈 + 补跑尾巴抵消
+  - ⚠️ `t_infer` 的 mean/p50/p95 对比仍未单独采集；端到端已足以支撑决策
+  - 详见 `02_progress.md` §2.39
 
 ### T-08 · 同 ckpt：大 batch vs 单卡多副本 【✅ 已结案】
 
