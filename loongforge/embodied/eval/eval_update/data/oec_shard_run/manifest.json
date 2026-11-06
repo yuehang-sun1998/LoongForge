@@ -1,0 +1,10 @@
+{
+  "run": "oec_shard_run",
+  "records": 24,
+  "n_sims_per_server": 8,
+  "n_units": 8,
+  "elapsed_sec": 259.0,
+  "ok": true,
+  "episodes": 24,
+  "success_rate": 1.0
+}

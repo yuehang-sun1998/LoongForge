@@ -1,0 +1,10 @@
+{
+  "run": "ab_gr_sp12",
+  "records": 84,
+  "n_sims_per_server": 84,
+  "n_units": 84,
+  "elapsed_sec": 650.1,
+  "ok": true,
+  "episodes": 84,
+  "success_rate": 1.0
+}

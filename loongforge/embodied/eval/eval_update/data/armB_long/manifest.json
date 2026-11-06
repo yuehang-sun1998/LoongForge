@@ -1,0 +1,12 @@
+{
+  "run": "armB_long",
+  "n_sims_per_server": 8,
+  "n_units": 50,
+  "elapsed_sec": 456.7,
+  "repair_rounds": 0,
+  "failed_units": [],
+  "ok": true,
+  "episodes": 50,
+  "success_rate": 0.76,
+  "records": 50
+}

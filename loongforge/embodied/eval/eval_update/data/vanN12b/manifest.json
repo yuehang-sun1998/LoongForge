@@ -1,0 +1,10 @@
+{
+  "run": "vanN12b",
+  "records": 192,
+  "n_sims_per_server": 12,
+  "n_units": 96,
+  "elapsed_sec": 456.4,
+  "ok": true,
+  "episodes": 192,
+  "success_rate": 0.9739583333333334
+}

@@ -1,0 +1,10 @@
+{
+  "run": "ab_adj50_h32",
+  "records": 50,
+  "n_sims_per_server": 4,
+  "n_units": 50,
+  "elapsed_sec": 292.1,
+  "ok": true,
+  "episodes": 50,
+  "success_rate": 0.4
+}

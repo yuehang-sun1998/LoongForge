@@ -1,0 +1,10 @@
+{
+  "run": "ab_bw_w2000",
+  "records": 32,
+  "n_sims_per_server": 4,
+  "n_units": 32,
+  "elapsed_sec": 178.8,
+  "ok": true,
+  "episodes": 32,
+  "success_rate": 0.0
+}

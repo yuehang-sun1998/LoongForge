@@ -1,0 +1,10 @@
+{
+  "run": "ab_gr_cl10",
+  "records": 80,
+  "n_sims_per_server": 10,
+  "n_units": 80,
+  "elapsed_sec": 648.9,
+  "ok": true,
+  "episodes": 80,
+  "success_rate": 1.0
+}

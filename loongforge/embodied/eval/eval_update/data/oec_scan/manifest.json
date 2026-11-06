@@ -1,0 +1,10 @@
+{
+  "run": "oec_scan",
+  "records": 100,
+  "n_sims_per_server": 8,
+  "n_units": 2,
+  "elapsed_sec": 817.1,
+  "ok": true,
+  "episodes": 100,
+  "success_rate": 1.0
+}

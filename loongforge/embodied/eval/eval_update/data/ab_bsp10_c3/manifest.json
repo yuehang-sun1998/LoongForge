@@ -1,0 +1,10 @@
+{
+  "run": "ab_bsp10_c3",
+  "records": 211,
+  "n_sims_per_server": 70,
+  "n_units": 70,
+  "elapsed_sec": 1542.4,
+  "ok": true,
+  "episodes": 210,
+  "success_rate": 0.3380952380952381
+}

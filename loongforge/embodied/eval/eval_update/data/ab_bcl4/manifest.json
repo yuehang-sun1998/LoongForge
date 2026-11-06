@@ -1,0 +1,10 @@
+{
+  "run": "ab_bcl4",
+  "records": 32,
+  "n_sims_per_server": 4,
+  "n_units": 32,
+  "elapsed_sec": 322.7,
+  "ok": true,
+  "episodes": 32,
+  "success_rate": 0.34375
+}

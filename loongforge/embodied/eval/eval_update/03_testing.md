@@ -163,6 +163,7 @@
   - 配对（同一批 seed 的均值比）：6→8 **+10.0%**、8→10 **+16.5%**、10→12 **+21.5%**（36 个共同 seed）
   - **结论**：稳态吞吐到 **N=12 仍未出现平台**；但显存先到墙——N=12 峰值 74.7 GB（余 ~5 GB），按 ~5.4 GB/sim 外推 N=14/16 需 ~85/95 GB，**80 GB 卡的上限是 N=12**
   - **口径提醒**：`c=2` 时启动占 unit 墙钟的 80–85%，含启动口径几乎不随 N 变化（+5%）；只有「每个 slot 连续跑很多集」的全量场景才应看去启动口径
+  - 原始数据：`eval_update/data/nsweep_N6..N12`；缓存：`data/cache_oec160` / `cache_oec256`
   - 详见 `02_progress.md` §2.48
 
 ### T-03 · 一行命令起 1+N（external server + 最小 coordinator）
@@ -233,6 +234,7 @@
 > - 每任务（unit 墙钟 / rollout / 成功率）：`adjust_bottle` 616.7 s / 34.1 s / 98-100；`grab_roller` 501.8 s / 23.8 s / 100-100；`open_microwave` 1067.2 s / 135.9 s / 91-100；`blocks_ranking_rgb` 1210.4 s / 120.7 s / 61-100；`stack_bowls_three` 1274.1 s / 136.0 s / 53-100。
 > - **vs 加速前（`944c5ca`，外推 ~21,000 s）≈ 10.7×**；**含 offline 扫描（+~750 s）≈ 7.8×**；缓存按 k 次评测摊销，k=10 时 ≈ 10.5×。
 > - 倍数分解：并发 ×12（96 vs 8 slot）× 单集效率 ~3.3 ≈ 39×，实际 ~11× —— 差额损失在启动（341 s/unit × 100）和长任务尾部（后半段 60 个长 unit 只占 96 slot 中的 60 个）。
+> - 原始数据：`eval_update/data/5task_N12`（513 条记录，去重 500）+ `data/cache_oec5`
 > - 详见 `02_progress.md` §2.51（含 baseline 为外推值的说明，±30%）。
 
 ### T-09 · 运行后覆盖校验 + 自动补跑
@@ -578,6 +580,7 @@
   - 密度扫描（同口径）：cl4 12.8 / cl6 14.8 / cl8 16.2 ep/min；同密度（8/卡）下 separate 单卡只快 4%（2.11 vs 2.03 ep/min），但少一张 sim 卡 → 总量更低
   - **结论**：✅ **推荐 co_locate**——端到端同速甚至更快、方差更小（separate 两轮 wall 差 31%）、运维最简单。separate 的单集优势（230 s vs 302 s，-24%）被 batched-server 瓶颈 + 补跑尾巴抵消
   - ⚠️ `t_infer` 的 mean/p50/p95 对比仍未单独采集；端到端已足以支撑决策
+  - 原始数据：`eval_update/data/` 尚未收录该轮（如需可补 `t8_colo` / `t8_sep` 的 `results.jsonl`）
   - 详见 `02_progress.md` §2.39
 
 ### T-08 · 同 ckpt：大 batch vs 单卡多副本 【✅ 已结案】
@@ -609,5 +612,6 @@
 
 - 每个用例跑完，**当场**把数据与结论填进对应用例；不要另开散落文件。
 - 数据建议同时存原始文件（`results.jsonl`、`utilization.memory`/`dmon` 序列）到 `eval_update/data/<用例ID>/`，本文只留摘要 + 路径。
+- **已落库（2026-11-06）**：`eval_update/data/` 下现有 `armA_*` / `armB_*`（T-05 的 A/B）、`nsweep_N6..N12`（T-02）、`5task_N12`（T-05 全量）、`cache_oec160/oec256/oec5`（T-02/§2.47 的 seed 缓存）。每个目录含 `results.jsonl` + `coordinator_result.json` + `manifest.json`，索引见 `data/README.md`。`artifacts/`（trace、视频）体积大，未入库。
 - 结论必须包含：**是否达到通过标准**、**关键数字**、**与基线的对比**、**已知偏差/异常**。
 - 若某次测试推翻了方案假设（例如 GPU-sim 同卡 `t_infer` 显著变长），**先更新 `01_architecture.md` 的风险栏**，再继续。

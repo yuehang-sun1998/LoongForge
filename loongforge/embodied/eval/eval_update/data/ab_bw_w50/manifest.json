@@ -1,0 +1,10 @@
+{
+  "run": "ab_bw_w50",
+  "records": 32,
+  "n_sims_per_server": 4,
+  "n_units": 32,
+  "elapsed_sec": 166.9,
+  "ok": true,
+  "episodes": 32,
+  "success_rate": 0.125
+}

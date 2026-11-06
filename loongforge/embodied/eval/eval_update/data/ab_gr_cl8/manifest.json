@@ -1,0 +1,10 @@
+{
+  "run": "ab_gr_cl8",
+  "records": 64,
+  "n_sims_per_server": 8,
+  "n_units": 64,
+  "elapsed_sec": 333.0,
+  "ok": true,
+  "episodes": 64,
+  "success_rate": 1.0
+}

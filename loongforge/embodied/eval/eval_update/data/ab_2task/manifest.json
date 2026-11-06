@@ -1,0 +1,10 @@
+{
+  "run": "ab_2task",
+  "records": 4,
+  "n_sims_per_server": 4,
+  "n_units": 4,
+  "elapsed_sec": 183.3,
+  "ok": true,
+  "episodes": 4,
+  "success_rate": 0.25
+}

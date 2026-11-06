@@ -1,0 +1,55 @@
+{
+  "benchmark": "robotwin",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "sim_gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "placement": "co_locate",
+  "n_sims_per_server": 6,
+  "concurrency": 48,
+  "n_units": 48,
+  "n_units_launched": 48,
+  "repair_rounds": 0,
+  "unit_timeout_sec": 7560.0,
+  "failed_units": [],
+  "server_restarts": 0,
+  "servers_given_up": [],
+  "elapsed_sec": 210.8,
+  "output_dir": "/tmp/ab_gr_cl6/out",
+  "validation": {
+    "ok": true,
+    "expected": 48,
+    "actual": 48,
+    "records": 48,
+    "missing": 0,
+    "duplicates": 0,
+    "unexpected": 0,
+    "unkeyed": 0,
+    "successes": 48,
+    "success_rate": 1.0,
+    "failures": {},
+    "infra_failed": 0,
+    "duplicate_examples": []
+  },
+  "summary": {
+    "n_episodes": 48,
+    "successes": 48,
+    "success_rate": 1.0
+  }
+}

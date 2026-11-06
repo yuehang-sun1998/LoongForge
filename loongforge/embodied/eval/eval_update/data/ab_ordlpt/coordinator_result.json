@@ -1,0 +1,57 @@
+{
+  "benchmark": "robotwin",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "sim_gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "placement": "co_locate",
+  "n_sims_per_server": 1,
+  "concurrency": 8,
+  "n_units": 12,
+  "n_units_launched": 12,
+  "repair_rounds": 0,
+  "unit_timeout_sec": 7560.0,
+  "failed_units": [],
+  "server_restarts": 0,
+  "servers_given_up": [],
+  "elapsed_sec": 275.9,
+  "output_dir": "/tmp/ab_ordlpt/out",
+  "validation": {
+    "ok": true,
+    "expected": 12,
+    "actual": 12,
+    "records": 12,
+    "missing": 0,
+    "duplicates": 0,
+    "unexpected": 0,
+    "unkeyed": 0,
+    "successes": 8,
+    "success_rate": 0.6666666666666666,
+    "failures": {
+      "not_successful": 4
+    },
+    "infra_failed": 0,
+    "duplicate_examples": []
+  },
+  "summary": {
+    "n_episodes": 12,
+    "successes": 8,
+    "success_rate": 0.6666666666666666
+  }
+}

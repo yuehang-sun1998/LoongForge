@@ -1,0 +1,12 @@
+{
+  "run": "5task_N12",
+  "n_sims_per_server": 12,
+  "n_units": 100,
+  "elapsed_sec": 1647.3,
+  "repair_rounds": 0,
+  "failed_units": [],
+  "ok": true,
+  "episodes": 500,
+  "success_rate": 0.806,
+  "records": 513
+}

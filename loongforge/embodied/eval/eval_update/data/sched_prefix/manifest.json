@@ -1,0 +1,10 @@
+{
+  "run": "sched_prefix",
+  "records": 50,
+  "n_sims_per_server": 8,
+  "n_units": 10,
+  "elapsed_sec": 458.0,
+  "ok": true,
+  "episodes": 50,
+  "success_rate": 1.0
+}

@@ -1,0 +1,10 @@
+{
+  "run": "vanN6",
+  "records": 96,
+  "n_sims_per_server": 6,
+  "n_units": 48,
+  "elapsed_sec": 243.8,
+  "ok": true,
+  "episodes": 96,
+  "success_rate": 0.9895833333333334
+}

@@ -1,0 +1,10 @@
+{
+  "run": "t8_colo",
+  "records": 250,
+  "n_sims_per_server": 8,
+  "n_units": 100,
+  "elapsed_sec": 1501.9,
+  "ok": true,
+  "episodes": 250,
+  "success_rate": 0.6
+}

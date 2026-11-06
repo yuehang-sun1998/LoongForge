@@ -1,0 +1,77 @@
+{
+  "benchmark": "robotwin",
+  "gpus": [
+    0
+  ],
+  "sim_gpus": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "placement": "separate",
+  "n_sims_per_server": 70,
+  "concurrency": 70,
+  "n_units": 100,
+  "n_units_launched": 127,
+  "repair_rounds": 1,
+  "unit_timeout_sec": 21960.0,
+  "failed_units": [
+    27,
+    34,
+    31,
+    45,
+    41,
+    20,
+    25,
+    10,
+    62,
+    28,
+    37,
+    2,
+    44,
+    30,
+    51,
+    42,
+    53,
+    23,
+    0,
+    14,
+    49,
+    17,
+    61,
+    38,
+    54,
+    59,
+    68
+  ],
+  "server_restarts": 0,
+  "servers_given_up": [],
+  "elapsed_sec": 1986.3,
+  "output_dir": "/tmp/t8_sep_rerun/out",
+  "validation": {
+    "ok": true,
+    "expected": 250,
+    "actual": 250,
+    "records": 260,
+    "missing": 0,
+    "duplicates": 0,
+    "unexpected": 0,
+    "unkeyed": 0,
+    "successes": 149,
+    "success_rate": 0.596,
+    "failures": {
+      "not_successful": 101
+    },
+    "infra_failed": 0,
+    "duplicate_examples": []
+  },
+  "summary": {
+    "n_episodes": 250,
+    "successes": 149,
+    "success_rate": 0.596
+  }
+}

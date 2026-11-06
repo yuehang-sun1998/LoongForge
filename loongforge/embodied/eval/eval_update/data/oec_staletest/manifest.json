@@ -1,0 +1,10 @@
+{
+  "run": "oec_staletest",
+  "records": 1,
+  "n_sims_per_server": 8,
+  "n_units": 2,
+  "elapsed_sec": 266.9,
+  "ok": false,
+  "episodes": 1,
+  "success_rate": 1.0
+}

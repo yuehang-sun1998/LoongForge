@@ -1,0 +1,10 @@
+{
+  "run": "oec_k1_run",
+  "records": 20,
+  "n_sims_per_server": 8,
+  "n_units": 2,
+  "elapsed_sec": 231.0,
+  "ok": true,
+  "episodes": 20,
+  "success_rate": 1.0
+}

@@ -1,0 +1,10 @@
+{"episode_id": "robotwin/open_microwave/demo_clean/scan=0", "episode_time_sec": 182.14719462394714, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/open_microwave/demo_clean/scan=1", "episode_time_sec": 182.14719462394714, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/open_microwave/demo_clean/scan=2", "episode_time_sec": 182.14719462394714, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/open_microwave/demo_clean/scan=3", "episode_time_sec": 182.14719462394714, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/open_microwave/demo_clean/scan=4", "episode_time_sec": 182.14719462394714, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/adjust_bottle/demo_clean/scan=0", "episode_time_sec": 149.4484202861786, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/adjust_bottle/demo_clean/scan=1", "episode_time_sec": 149.4484202861786, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/adjust_bottle/demo_clean/scan=2", "episode_time_sec": 149.4484202861786, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/adjust_bottle/demo_clean/scan=3", "episode_time_sec": 149.4484202861786, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}
+{"episode_id": "robotwin/adjust_bottle/demo_clean/scan=4", "episode_time_sec": 149.4484202861786, "failure_reason": null, "n_episodes": 1, "scan": true, "seed": null, "success": true, "success_rate": 1.0}

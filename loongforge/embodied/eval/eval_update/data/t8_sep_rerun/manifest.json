@@ -1,0 +1,10 @@
+{
+  "run": "t8_sep_rerun",
+  "records": 260,
+  "n_sims_per_server": 70,
+  "n_units": 100,
+  "elapsed_sec": 1986.3,
+  "ok": true,
+  "episodes": 250,
+  "success_rate": 0.596
+}

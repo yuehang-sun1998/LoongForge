@@ -1,0 +1,10 @@
+{
+  "run": "ab_newckpt",
+  "records": 100,
+  "n_sims_per_server": 4,
+  "n_units": 100,
+  "elapsed_sec": 510.0,
+  "ok": true,
+  "episodes": 100,
+  "success_rate": 0.91
+}

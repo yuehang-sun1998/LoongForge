@@ -1,0 +1,12 @@
+{
+  "run": "nsweep_N12",
+  "n_sims_per_server": 12,
+  "n_units": 96,
+  "elapsed_sec": 456.4,
+  "repair_rounds": 0,
+  "failed_units": [],
+  "ok": true,
+  "episodes": 192,
+  "success_rate": 0.9739583333333334,
+  "records": 192
+}

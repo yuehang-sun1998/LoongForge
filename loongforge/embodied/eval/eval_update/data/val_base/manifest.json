@@ -1,0 +1,10 @@
+{
+  "run": "val_base",
+  "records": 50,
+  "n_sims_per_server": 8,
+  "n_units": 50,
+  "elapsed_sec": 279.4,
+  "ok": true,
+  "episodes": 50,
+  "success_rate": 0.96
+}

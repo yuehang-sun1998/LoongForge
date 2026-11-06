@@ -1,0 +1,57 @@
+{
+  "benchmark": "robotwin",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "sim_gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "placement": "co_locate",
+  "n_sims_per_server": 12,
+  "concurrency": 96,
+  "n_units": 96,
+  "n_units_launched": 96,
+  "repair_rounds": 0,
+  "unit_timeout_sec": 14760.0,
+  "failed_units": [],
+  "server_restarts": 0,
+  "servers_given_up": [],
+  "elapsed_sec": 456.4,
+  "output_dir": "/tmp/vanN12b/out",
+  "validation": {
+    "ok": true,
+    "expected": 192,
+    "actual": 192,
+    "records": 192,
+    "missing": 0,
+    "duplicates": 0,
+    "unexpected": 0,
+    "unkeyed": 0,
+    "successes": 187,
+    "success_rate": 0.9739583333333334,
+    "failures": {
+      "not_successful": 5
+    },
+    "infra_failed": 0,
+    "duplicate_examples": []
+  },
+  "summary": {
+    "n_episodes": 192,
+    "successes": 187,
+    "success_rate": 0.9739583333333334
+  }
+}

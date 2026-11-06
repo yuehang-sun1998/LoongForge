@@ -1,0 +1,10 @@
+{
+  "run": "ab_bcl6",
+  "records": 48,
+  "n_sims_per_server": 6,
+  "n_units": 48,
+  "elapsed_sec": 415.0,
+  "ok": true,
+  "episodes": 48,
+  "success_rate": 0.3958333333333333
+}

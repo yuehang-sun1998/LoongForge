@@ -1,0 +1,10 @@
+{
+  "run": "ab_50x1b",
+  "records": 50,
+  "n_sims_per_server": 4,
+  "n_units": 50,
+  "elapsed_sec": 398.9,
+  "ok": true,
+  "episodes": 50,
+  "success_rate": 0.6
+}

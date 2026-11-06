@@ -1,0 +1,10 @@
+{
+  "run": "ab_sep1b",
+  "records": 56,
+  "n_sims_per_server": 56,
+  "n_units": 56,
+  "elapsed_sec": 257.7,
+  "ok": true,
+  "episodes": 56,
+  "success_rate": 0.0
+}

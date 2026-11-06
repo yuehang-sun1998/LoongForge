@@ -1,0 +1,10 @@
+{
+  "run": "ab_gr_cl6",
+  "records": 48,
+  "n_sims_per_server": 6,
+  "n_units": 48,
+  "elapsed_sec": 210.8,
+  "ok": true,
+  "episodes": 48,
+  "success_rate": 1.0
+}

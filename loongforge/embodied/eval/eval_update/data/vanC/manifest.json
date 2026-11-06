@@ -1,0 +1,10 @@
+{
+  "run": "vanC",
+  "records": 513,
+  "n_sims_per_server": 12,
+  "n_units": 100,
+  "elapsed_sec": 1647.3,
+  "ok": true,
+  "episodes": 500,
+  "success_rate": 0.806
+}

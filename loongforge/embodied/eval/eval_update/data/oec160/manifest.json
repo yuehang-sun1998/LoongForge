@@ -1,0 +1,10 @@
+{
+  "run": "oec160",
+  "records": 160,
+  "n_sims_per_server": 8,
+  "n_units": 16,
+  "elapsed_sec": 610.1,
+  "ok": true,
+  "episodes": 160,
+  "success_rate": 1.0
+}
