@@ -87,9 +87,15 @@ def main() -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to eval YAML config file")
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--health-port", type=int, default=None)
     cli = parser.parse_args()
 
     server_args, raw_model_dict = parse_eval_server_config(cli.config)
+    if cli.port is not None:
+        server_args.port = cli.port
+    if cli.health_port is not None:
+        server_args.health_port = cli.health_port
 
     if server_args.loongforge_root:
         os.chdir(server_args.loongforge_root)

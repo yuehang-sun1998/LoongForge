@@ -137,6 +137,29 @@ timeouts:
   per_episode_sec: 900
 ```
 
+可选的 Jev shadow 决策模块可以直接追加到同一 YAML。默认关闭时不会创建
+网络连接，也不会改变主策略动作：
+
+```yaml
+shadow:
+  enabled: false
+  mode: shadow
+  endpoint: https://openrouter.ai/api/alpha/decisions
+  model: ~typesafe/jev-latest
+  api_key_env: OPENROUTER_API_KEY
+  timeout_sec: 5
+  sample_every_n_steps: 1
+  fail_open: true
+  log_actions: true
+```
+
+启用后，模块会把当前 canonical 状态、主策略动作和环境动作发送给
+`shadow.endpoint`，并将返回的结构化判断写入每步 trace。当前实现只做
+shadow 观测，第一阶段只观察 `continue` / `replan`，不会改写 `env_action`、
+清除 action cache，也不会引入 recovery。
+HTTP 请求使用 OpenRouter Jev 决策接口的 `state` / `model` / `questions`
+结构；返回的 `answers`、模型版本、provider 和 usage 会写入 shadow trace。
+
 ### 3.2 字段说明
 
 | 字段 | 含义 |

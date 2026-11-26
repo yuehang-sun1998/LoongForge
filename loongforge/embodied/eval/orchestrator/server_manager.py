@@ -11,7 +11,15 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, Request, build_opener
+
+
+_DIRECT_OPENER = build_opener(ProxyHandler({}))
+
+
+def _direct_urlopen(url: str, timeout: float):
+    """Open a local health endpoint without inheriting external proxies."""
+    return _DIRECT_OPENER.open(Request(url), timeout=timeout)
 
 
 class ManagedServer:
@@ -39,7 +47,7 @@ class ManagedServer:
             self.start()
             return
         try:
-            with urlopen(self.health_url, timeout=2) as response:
+            with _direct_urlopen(self.health_url, timeout=2) as response:
                 if response.status == 200:
                     return
         except Exception:
@@ -75,7 +83,7 @@ def wait_healthz(url: str, timeout_sec: float, process: subprocess.Popen | None)
         if process is not None and process.poll() is not None:
             raise RuntimeError(f"Policy server exited before healthy: {process.returncode}")
         try:
-            with urlopen(url, timeout=2) as response:
+            with _direct_urlopen(url, timeout=2) as response:
                 if response.status == 200:
                     return
         except Exception as exc:
@@ -123,6 +131,12 @@ def start_server(args: argparse.Namespace) -> subprocess.Popen:
     loongforge_root = Path(args.loongforge_root).resolve() if args.loongforge_root else eval_root.parent
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{loongforge_root}:{eval_root}:{env.get('PYTHONPATH', '')}"
+    no_proxy_values = [env.get("NO_PROXY", ""), env.get("no_proxy", ""), "127.0.0.1", "localhost"]
+    no_proxy = ",".join(
+        dict.fromkeys(item.strip() for value in no_proxy_values for item in value.split(",") if item.strip())
+    )
+    env["NO_PROXY"] = no_proxy
+    env["no_proxy"] = no_proxy
     apply_runtime_env(args, env)
     ensure_libero_config(args)
 
@@ -133,6 +147,10 @@ def start_server(args: argparse.Namespace) -> subprocess.Popen:
             "loongforge.embodied.eval.servers.loongforge_server",
             "--config",
             args.config,
+            "--port",
+            str(args.port),
+            "--health-port",
+            str(args.health_port),
         ]
     elif args.server_kind == "mock":
         command = [

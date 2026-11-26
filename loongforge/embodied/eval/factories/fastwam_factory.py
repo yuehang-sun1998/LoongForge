@@ -160,6 +160,8 @@ class FastWAMModelFactory:
                 images, instructions, state=state, dataset_stats=dataset_stats
             )
             # predict_action returns [B, H, 7]; index 0 is batch, not horizon.
+            if kwargs.get("capture_full_chunk", False):
+                model._jev_full_chunk = result.copy()
             if _chunk_execute_steps > 0 and getattr(result, "ndim", 0) >= 2:
                 if result.ndim == 3 and result.shape[1] > _chunk_execute_steps:
                     result = result[:, :_chunk_execute_steps]

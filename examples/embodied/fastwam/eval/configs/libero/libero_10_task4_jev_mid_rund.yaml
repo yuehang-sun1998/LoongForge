@@ -1,0 +1,74 @@
+benchmark:
+  name: libero
+  suite: libero_10
+  max_tasks: 0
+  task_ids: [4]
+  episodes_per_task: 50
+  max_steps: 700
+  num_steps_wait: 30
+  continuous_gripper: false
+  prefer_controller_ee: true
+  env_seed_mode: per_task
+  controller_force_update: false
+model:
+  backend: loongforge
+  model_type: fastwam
+  name: fastwam-libero-10-task4-jev-mid-rund
+  backbone_variant: wan22_5b
+  dtype: bfloat16
+  variant: uncond
+  load_text_encoder: true
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+  redirect_common_files: false
+  action_dim: 7
+  action_horizon: 32
+  proprio_dim: 8
+  action_infer_mode: first_frame
+  num_inference_steps: 10
+  sigma_shift: 5.0
+  num_video_frames: 9
+  noise_seed: 42
+  camera_layout: horizontal2
+  norm_mode: min/max
+  model_id: Wan-AI/Wan2.2-TI2V-5B
+  tokenizer_model_id: /mnt/cfs/sunyuehang/Wan-AI/Wan2.2-TI2V-5B
+server:
+  host: 127.0.0.1
+  port: 12654
+  health_port: 12655
+  python: /usr/bin/python3
+  start_timeout_sec: 1800
+  ckpt_path: /mnt/cfs/sunyuehang/runs/loongforge_libero_all_20k_fixorder_d_imgpad/release/loongforge_libero_all_20k_fixorder_d_imgpad_steps20000_mot.pt
+  dataset_statistics_path: /mnt/cfs/sunyuehang/runs/libero_uncond_2cam224_1e-4/2026-09-07_15-37-54/dataset_stats.json
+  loongforge_root: /workspace/Loong-Forge-clean
+  tokenizer_path: /mnt/cfs/sunyuehang/Wan-AI/Wan2.2-TI2V-5B/google/umt5-xxl
+  use_bf16: true
+  chunk_execute_steps: 0
+env:
+  eval_root: /workspace/Loong-Forge-clean/loongforge/embodied/eval
+  libero_config_path: /mnt/cfs/sunyuehang/runs/loongforge_libero_all_20k/eval_configs/libero_config
+  mujoco_gl: osmesa
+  pyopengl_platform: osmesa
+  ld_library_path: ""
+run:
+  output_dir: /mnt/cfs/sunyuehang/evaluate_results/loongforge_jev_task4_50_mid_rund
+  seed: 42
+  save_trace: true
+  save_replay: true
+  timestamped_output: false
+shadow:
+  enabled: true
+  mode: active
+  endpoint: https://openrouter.ai/api/alpha/decisions
+  model: ~typesafe/jev-latest
+  api_key_env: OPENROUTER_API_KEY
+  timeout_sec: 30
+  sample_every_n_steps: 10
+  sample_offset: 5
+  fail_open: true
+  log_actions: true
+timeouts:
+  policy_call_ms: 600000
+  per_step_sec: 600
+  per_episode_sec: 1800

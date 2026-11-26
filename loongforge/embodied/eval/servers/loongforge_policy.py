@@ -40,6 +40,7 @@ class GenericPredictActionPolicy:
         self._model = model
         self._dataset_stats = self._load_dataset_stats(dataset_statistics_path)
         self._chunk_cache: Dict[str, tuple[int, np.ndarray]] = {}
+        self._jev_chunks = {}
         self._request_id_prefix = request_id_prefix
         self._episode_kwargs = self._supported_episode_kwargs(model)
         self._metadata = {
@@ -77,6 +78,7 @@ class GenericPredictActionPolicy:
     def reset(self, episode_id: str) -> Dict[str, Any]:
         """Reset action cache for an episode."""
         self._chunk_cache.pop(episode_id, None)
+        self._jev_chunks.pop(episode_id, None)
         return {"episode_id": episode_id}
 
     def predict_action(
@@ -99,6 +101,7 @@ class GenericPredictActionPolicy:
         """
         disable_action_cache = bool(kwargs.pop("disable_action_cache", False))
         return_action_chunk = bool(kwargs.pop("return_action_chunk", False))
+        include_context = bool(kwargs.pop("include_chunk_context", False))
         cache_entry = None if disable_action_cache else self._chunk_cache.get(episode_id)
         if cache_entry is not None:
             chunk_index, chunk = cache_entry
@@ -109,6 +112,8 @@ class GenericPredictActionPolicy:
                     "actions": chunk if return_action_chunk else chunk[chunk_index : chunk_index + 1],
                     "inference_latency_ms": None,
                     "request_id": self._request_id(episode_id, episode_step),
+                    **({"chunk_context": self._chunk_context(episode_id, chunk, chunk_index)}
+                       if include_context else {}),
                 }
 
         start_time = time.perf_counter()
@@ -123,16 +128,33 @@ class GenericPredictActionPolicy:
             state=state,
             dataset_stats=self._dataset_stats,
             action_dim=int(self._metadata["action_dim"]),
+            **({"capture_full_chunk": True} if include_context else {}),
             **{k: episode_kwargs[k] for k in self._episode_kwargs},
             **kwargs,
         )
         inference_latency_ms = (time.perf_counter() - start_time) * 1000.0
+        if include_context:
+            full = getattr(self._model, "_jev_full_chunk", chunk)
+            self._jev_chunks[episode_id] = np.asarray(full).reshape(-1, chunk.shape[-1]).copy()
         if not disable_action_cache:
             self._chunk_cache[episode_id] = (0, chunk)
         return {
             "actions": chunk if return_action_chunk else chunk[0:1],
             "inference_latency_ms": inference_latency_ms,
             "request_id": self._request_id(episode_id, episode_step),
+            **({"chunk_context": self._chunk_context(episode_id, chunk, 0)}
+               if include_context else {}),
+        }
+
+    def _chunk_context(self, episode_id, chunk, index):
+        return {
+            "full_model_chunk": self._jev_chunks.get(episode_id, chunk),
+            "execution_window": chunk,
+            "current_index_zero_based": index,
+            "executed_before_current": index,
+            "remaining_including_current": len(chunk) - index,
+            "remaining_after_current": len(chunk) - index - 1,
+            "stage": "model unnormalized output before action decoder",
         }
 
     def _request_id(self, episode_id: str, episode_step: int) -> str:

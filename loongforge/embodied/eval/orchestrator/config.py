@@ -165,10 +165,13 @@ CONFIG_MAPPING = {
     "benchmark.suite": "task_suite_name",
     "benchmark.max_tasks": "max_tasks",
     "benchmark.task_ids": "task_ids",
+    "benchmark.episode_ids": "episode_ids",
     "benchmark.episodes_per_task": "episodes_per_task",
     "benchmark.num_steps_wait": "num_steps_wait",
     "benchmark.max_steps": "max_steps",
     "benchmark.continuous_gripper": "continuous_gripper",
+    "benchmark.env_seed_mode": "env_seed_mode",
+    "benchmark.controller_force_update": "controller_force_update",
     # False -> proprio reads obs['robot0_eef_pos']/quat (official FastWAM
     # convention); True -> prefer the OSC controller's ee_pos/ee_ori_mat
     # (X-VLA client convention).

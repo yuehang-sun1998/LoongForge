@@ -31,28 +31,41 @@ class PolicyClient:
 
     def _wait_for_server(self, timeout: float) -> Tuple[websockets.sync.client.ClientConnection, Dict[str, Any]]:
         """Run _wait_for_server."""
-        for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
-            os.environ.pop(key, None)
+        proxy_keys = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+        saved_proxies = {key: os.environ.get(key) for key in proxy_keys}
+        try:
+            # The policy server is local. Do not let a corporate HTTP proxy
+            # intercept this WebSocket connection, but restore the variables
+            # before returning so optional external sidecars (e.g. Jev) can
+            # still use the configured proxy in the same evaluator process.
+            for key in proxy_keys:
+                os.environ.pop(key, None)
 
-        start_time = time.time()
-        while True:
-            if time.time() - start_time > timeout:
-                raise TimeoutError(f"Failed to connect to server within {timeout} seconds")
-            try:
-                conn = websockets.sync.client.connect(
-                    self._uri,
-                    compression=None,
-                    max_size=None,
-                    open_timeout=30,
-                )
-                metadata = msgpack_numpy.unpackb(conn.recv())
-                if metadata.get("protocol_version") != PROTOCOL_VERSION:
-                    raise RuntimeError(
-                        f"protocol_version mismatch: {metadata.get('protocol_version')} != {PROTOCOL_VERSION}"
+            start_time = time.time()
+            while True:
+                if time.time() - start_time > timeout:
+                    raise TimeoutError(f"Failed to connect to server within {timeout} seconds")
+                try:
+                    conn = websockets.sync.client.connect(
+                        self._uri,
+                        compression=None,
+                        max_size=None,
+                        open_timeout=30,
                     )
-                return conn, metadata
-            except ConnectionRefusedError:
-                time.sleep(1)
+                    metadata = msgpack_numpy.unpackb(conn.recv())
+                    if metadata.get("protocol_version") != PROTOCOL_VERSION:
+                        raise RuntimeError(
+                            f"protocol_version mismatch: {metadata.get('protocol_version')} != {PROTOCOL_VERSION}"
+                        )
+                    return conn, metadata
+                except ConnectionRefusedError:
+                    time.sleep(1)
+        finally:
+            for key, value in saved_proxies.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def close(self) -> None:
         """Run close."""

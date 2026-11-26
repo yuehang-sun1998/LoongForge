@@ -38,6 +38,7 @@ from loongforge.embodied.eval.orchestrator.runners import _common
 from loongforge.embodied.eval.orchestrator.runners._common import StepTimeoutError, alarm_timeout, avg as _avg
 from loongforge.embodied.eval.payload_builders import PayloadBuilder
 from loongforge.embodied.eval.protocol import PROTOCOL_VERSION
+from loongforge.embodied.eval.shadow import ShadowDecisionModule, build_shadow_module
 from loongforge.embodied.eval.transport import PolicyClient
 
 INFERENCE_CONFIG: dict = {}
@@ -74,6 +75,32 @@ def _get_libero_env(task, resolution: int, seed: int):
     )
     env.seed(seed)
     return env, task.language
+
+
+_ENV_CACHE: Dict[str, Any] = {"key": None, "env": None, "np_seeded": False}
+
+
+def _get_cached_env(task, resolution: int, seed: int):
+    """Reuse one seeded environment per task, matching the official harness."""
+    key = (str(getattr(task, "language", task)), int(resolution), int(seed))
+    if _ENV_CACHE.get("key") != key:
+        close_cached_env()
+        env, _ = _get_libero_env(task, resolution, seed)
+        _ENV_CACHE["key"] = key
+        _ENV_CACHE["env"] = env
+    return _ENV_CACHE["env"]
+
+
+def close_cached_env() -> None:
+    """Close the per-task environment cache."""
+    env = _ENV_CACHE.get("env")
+    if env is not None:
+        try:
+            env.close()
+        finally:
+            _ENV_CACHE["env"] = None
+            _ENV_CACHE["key"] = None
+            _ENV_CACHE["np_seeded"] = False
 
 
 def _extract_primary_frame(obs: Dict[str, Any]) -> np.ndarray:
@@ -204,6 +231,7 @@ def _classify_exception(exc: Exception) -> str:
 def run_episode(
     *,
     client: PolicyClient,
+    shadow: Optional[ShadowDecisionModule] = None,
     adapter: LiberoAdapter,
     payload_builder: PayloadBuilder,
     action_decoder: ActionDecoder,
@@ -216,8 +244,15 @@ def run_episode(
     args: argparse.Namespace,
 ) -> Dict[str, Any]:
     """Run run_episode."""
-    episode_seed = int(args.seed) + task_id * 1000 + episode_idx
-    np.random.seed(episode_seed)
+    env_seed_mode = str(getattr(args, "env_seed_mode", "per_episode"))
+    if env_seed_mode == "per_task":
+        episode_seed = int(args.seed)
+        if not _ENV_CACHE.get("np_seeded"):
+            np.random.seed(episode_seed)
+            _ENV_CACHE["np_seeded"] = True
+    else:
+        episode_seed = int(args.seed) + task_id * 1000 + episode_idx
+        np.random.seed(episode_seed)
 
     task_description = task.language
     episode_id = f"libero/{task_suite_name}/task={task_id}/episode={episode_idx}"
@@ -229,12 +264,21 @@ def run_episode(
     e2e_latencies: List[Optional[float]] = []
     episode_start = time.time()
     env = None
+    scene_observer = None
+    if shadow is not None and shadow.enabled and shadow.config.enriched_inputs:
+        from loongforge.embodied.eval.libero_scene import LiberoSceneObserver
+        scene_observer = LiberoSceneObserver()
 
     try:
         with alarm_timeout(args.per_episode_timeout_sec, EpisodeTimeoutError):
-            env, task_description = _get_libero_env(task, _render_resolution(args), episode_seed)
+            if env_seed_mode == "per_task":
+                env = _get_cached_env(task, _render_resolution(args), episode_seed)
+            else:
+                env, task_description = _get_libero_env(task, _render_resolution(args), episode_seed)
             reset_start = time.time()
             client.reset(episode_id)
+            if shadow is not None:
+                shadow.reset(episode_id)
             payload_builder.reset(episode_id)
             action_decoder.reset()
             env.reset()
@@ -243,8 +287,12 @@ def run_episode(
             # refresh ee_pos/ee_ori_mat inside step(); force a sync so the first
             # observation does not mix the pre-reset controller pose with the
             # init-state quaternion.
-            for robot in env.env.robots:
-                robot.controller.update(force=True)
+            force_controller_update = bool(getattr(args, "controller_force_update", False))
+            if os.environ.get("LIBERO_CONTROLLER_FORCE_UPDATE") == "1":
+                force_controller_update = True
+            if force_controller_update:
+                for robot in env.env.robots:
+                    robot.controller.update(force=True)
             reset_time_sec = time.time() - reset_start
 
             # Explicit benchmark.max_steps takes priority over the suite
@@ -293,6 +341,7 @@ def run_episode(
                 request_start = time.perf_counter()
                 with alarm_timeout(args.policy_call_timeout_ms / 1000.0, TimeoutError):
                     response = client.predict_action(
+                        **({"include_chunk_context": True} if scene_observer is not None else {}),
                         **_build_rpc_payload(
                             payload_builder,
                             canonical_obs,
@@ -325,23 +374,43 @@ def run_episode(
                 # delta models (pi05) keep the OSC default use_delta=True.
                 flat_action = processed[0]
                 env_action = adapter.action_from_canonical({"actions": flat_action})
+                shadow_record = None
+                if scene_observer is not None:
+                    ctx["jev_scene"] = scene_observer.collect(env, episode_step)
+                    scene_observer.record_action(env_action)
+                if shadow is not None:
+                    shadow_record = shadow.observe(
+                        canonical_obs=canonical_obs,
+                        ctx=ctx,
+                        primary_response=data,
+                        primary_action=flat_action,
+                        env_action=env_action,
+                    )
+                    if shadow.active and shadow.requests_replan(shadow_record):
+                        # The current action is still executed.  Resetting the
+                        # policy cache makes the next step request a fresh
+                        # action chunk.  No recovery or action override is
+                        # introduced by this optional gate.
+                        client.reset(episode_id)
+                        shadow_record["enforced"] = "replan_cache_reset"
                 obs, reward, done, info = _env_step(env, env_action, args.per_step_timeout_sec)
                 steps += 1
 
                 if args.save_trace:
-                    trace.append(
-                        {
-                            "step": episode_step,
-                            "request_id": data.get("request_id"),
-                            "raw_action": flat_action.tolist(),
-                            "env_action": env_action,
-                            "inference_latency_ms": inference_latency_ms,
-                            "e2e_latency_ms": e2e_latency_ms,
-                            "chunk_cache_hit": inference_latency_ms is None,
-                            "done": bool(done),
-                            "success": bool(info.get("success", False)),
-                        }
-                    )
+                    trace_record = {
+                        "step": episode_step,
+                        "request_id": data.get("request_id"),
+                        "raw_action": flat_action.tolist(),
+                        "env_action": env_action,
+                        "inference_latency_ms": inference_latency_ms,
+                        "e2e_latency_ms": e2e_latency_ms,
+                        "chunk_cache_hit": inference_latency_ms is None,
+                        "done": bool(done),
+                        "success": bool(info.get("success", False)),
+                    }
+                    if shadow_record is not None:
+                        trace_record["shadow"] = shadow_record
+                    trace.append(trace_record)
 
                 if done or bool(info.get("success", False)):
                     break
@@ -375,7 +444,7 @@ def run_episode(
             trace_path=trace_path,
         )
     finally:
-        if env is not None:
+        if env is not None and env_seed_mode != "per_task":
             env.close()
 
     success = bool(info.get("success", done))
@@ -431,6 +500,7 @@ def run_batch(args: argparse.Namespace) -> Dict[str, Any]:
     """Run run_batch."""
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    close_cached_env()
 
     from libero.libero import benchmark
 
@@ -460,6 +530,14 @@ def run_batch(args: argparse.Namespace) -> Dict[str, Any]:
         prefer_controller_ee=getattr(args, "prefer_controller_ee", True),
     )
     payload_builder, action_decoder_key, action_decoder = _common.build_policy_stack(args, adapter)
+    shadow = build_shadow_module(getattr(args, "raw_config", None))
+    if shadow.enabled:
+        logging.info(
+            "shadow decision module enabled: mode=%s endpoint=%s sample_every_n_steps=%s",
+            shadow.config.mode,
+            shadow.config.endpoint or "<unset>",
+            shadow.config.sample_every_n_steps,
+        )
     logging.info(
         "libero runner: model_type=%s action_encoding=%s adapter.action_space=%s decoder_key=%s",
         type(payload_builder).__name__,
@@ -479,7 +557,17 @@ def run_batch(args: argparse.Namespace) -> Dict[str, Any]:
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
             n_episodes = min(args.episodes_per_task, len(initial_states))
-            for episode_idx in range(n_episodes):
+            configured_episode_ids = getattr(args, "episode_ids", None)
+            episode_ids = (
+                [int(index) for index in configured_episode_ids]
+                if configured_episode_ids is not None
+                else list(range(n_episodes))
+            )
+            if any(index < 0 or index >= n_episodes for index in episode_ids):
+                raise ValueError(
+                    f"episode_ids must be within [0, {n_episodes}); got {episode_ids}"
+                )
+            for episode_idx in episode_ids:
                 key = ("libero", args.task_suite_name, task_id, episode_idx)
                 if key in completed:
                     continue
@@ -489,6 +577,7 @@ def run_batch(args: argparse.Namespace) -> Dict[str, Any]:
                         server_manager.ensure_running()
                     record = run_episode(
                         client=client,
+                        shadow=shadow,
                         adapter=adapter,
                         payload_builder=payload_builder,
                         action_decoder=action_decoder,
@@ -520,6 +609,8 @@ def run_batch(args: argparse.Namespace) -> Dict[str, Any]:
                 print(json.dumps(record, ensure_ascii=False), flush=True)
     finally:
         client.close()
+        shadow.close()
+        close_cached_env()
 
     all_records = existing_records + new_records
     write_summary_csv(summary_path, all_records)
@@ -593,6 +684,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--min-episodes-per-task", type=int, default=1)
     parser.add_argument("--continuous-gripper", action="store_true", default=False,
                         help="Pass raw gripper value directly to LIBERO without binarization")
+    parser.add_argument("--env-seed-mode", choices=("per_episode", "per_task"), default="per_episode")
+    parser.add_argument("--controller-force-update", action="store_true", default=False)
     parser.add_argument(
         "--control-mode",
         default="auto",
